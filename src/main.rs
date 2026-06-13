@@ -1126,10 +1126,12 @@ fn main() {
             d_rt.clear_background(Color::new(31, 31, 31, 255));
 
             let fps = 1.0 / d_rt.get_frame_time();
+            // Offset by canvas_offset so the FPS text stays at a fixed screen position
+            // after the render_texture is shifted by -canvas_offset during final blit.
             d_rt.draw_text(
                 format!("FPS: {:.2}", fps).as_str(),
-                10,
-                10,
+                10 + canvas_offset_x,
+                10 + canvas_offset_y,
                 20,
                 Color::WHITE,
             );
