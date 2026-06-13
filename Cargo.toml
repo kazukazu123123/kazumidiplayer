@@ -1,0 +1,12 @@
+[package]
+name = "kazumidiplayer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libloading = "0.9.0"
+raylib = "5.5.1"
+
+kazumidiparser = { version = "0.1.0", path = "../SelfMadeLibraries/kazumidiparser" }
+rustc-hash = "2"
+rfd = "0.17.2"
