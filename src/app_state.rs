@@ -1,9 +1,7 @@
 use crate::blur_requester::BlurRequester;
-use crate::note_texture_generator::NoteTextureGenerator;
 use crate::overlay_manager::OverlayManager;
 use crate::player::{PlayerCommand, PlayerFeedback, PlayerState, PlayerHandle};
 use crate::shaking::ShakeState;
-use crate::texture_manager::NoteTextureManager;
 use crate::ui_components::piano_keyboard;
 use crate::utils::get_note_color_by_track_channel;
 use crate::window_manager::{self, InputEvent};
@@ -19,20 +17,9 @@ pub enum AppOverlay {
 }
 
 pub struct AppState {
-    // --- Display & Texture ---
-    pub chunk_display_height: f32,
-    pub current_texture_count: usize,
-    pub max_texture_count: usize,
-    pub note_textures_enabled: bool,
-    pub prev_note_textures_enabled: bool,
-    pub note_textures_animation: f32,
-    pub texture_height: usize,
-
     // --- Player State ---
     pub current_progress: Option<(u16, u16)>,
     pub is_dragging_seek: bool,
-    pub last_update_position_ns: u64,
-    pub texture_manager: NoteTextureManager,
     pub last_state: PlayerState,
     pub is_loading: bool,
     pub is_tick_based: bool,
@@ -52,16 +39,8 @@ pub struct AppState {
     pub pitch_bend_override_enabled: bool,
     pub pitch_bend_override_animation: f32,
     pub pitch_bend_multiplier: u8, // 1-127 (semitones)
-    pub texture_worker_count: usize,
-    pub prev_texture_worker_count: usize,
     pub unlimited_output_enabled: bool,
     pub unlimited_output_animation: f32,
-
-    // --- Hover / Thumbnail ---
-    pub hover_timer: f32,
-    pub hover_fade_t: f32,
-    pub hover_preview_ns: Option<u64>,
-    pub show_thumbnail: bool,
 
     // --- UI (non-editor) ---
     pub last_input_event: Option<InputEvent>,
@@ -69,7 +48,6 @@ pub struct AppState {
     pub settings_scrollbar_dragging: bool,
     pub settings_scrollbar_drag_start_y: f32,
     pub settings_scrollbar_drag_start_scroll: f32,
-    pub settings_texture_height_slider_dragging: bool,
     pub settings_pb_multiplier_slider_dragging: bool,
 
     // --- Editor ---
@@ -123,49 +101,12 @@ fn calculate_tick_map(data: &kazumidiparser::MIDIPlayerData) -> Vec<(u64, u32, u
     tick_map
 }
 
-fn draw_piano_notes(
-    d: &mut impl RaylibDraw,
-    texture: &Texture2D,
-    regions: &[(f32, f32)],
-    window_x: f32,
-    src_y: f32,
-    src_h: f32,
-    dest_y: f32,
-    dest_h: f32,
-    black_keys: bool,
-) {
-    for note in 0..128u8 {
-        if piano_keyboard::is_black_key(note) == black_keys {
-            let (nx, nw) = regions[note as usize];
-            d.draw_texture_pro(
-                texture,
-                Rectangle::new(note as f32, src_y, 1.0, src_h),
-                Rectangle::new(window_x + nx, dest_y, nw, dest_h),
-                Vector2::new(0.0, 0.0),
-                0.0,
-                Color::WHITE,
-            );
-        }
-    }
-}
-
 impl AppState {
     pub fn new() -> Self {
         Self {
-            // --- Display & Texture ---
-            chunk_display_height: 100.0,
-            current_texture_count: 0,
-            max_texture_count: 0,
-            note_textures_enabled: true,
-            prev_note_textures_enabled: true,
-            note_textures_animation: 1.0,
-            texture_height: 16384,
-
             // --- Player State ---
             current_progress: None,
             is_dragging_seek: false,
-            last_update_position_ns: 0,
-            texture_manager: NoteTextureManager::new(),
             last_state: PlayerState::Stopped,
             is_loading: false,
             is_tick_based: false,
@@ -185,16 +126,8 @@ impl AppState {
             pitch_bend_override_enabled: false,
             pitch_bend_override_animation: 0.0,
             pitch_bend_multiplier: 12, // default 12 semitones
-            texture_worker_count: 1,
-            prev_texture_worker_count: 1,
             unlimited_output_enabled: false,
             unlimited_output_animation: 0.0,
-
-            // --- Hover / Thumbnail ---
-            hover_timer: 0.0,
-            hover_fade_t: 0.0,
-            hover_preview_ns: None,
-            show_thumbnail: false,
 
             // --- UI (non-editor) ---
             last_input_event: None,
@@ -202,7 +135,6 @@ impl AppState {
             settings_scrollbar_dragging: false,
             settings_scrollbar_drag_start_y: 0.0,
             settings_scrollbar_drag_start_scroll: 0.0,
-            settings_texture_height_slider_dragging: false,
             settings_pb_multiplier_slider_dragging: false,
 
             // --- Editor ---
@@ -243,7 +175,6 @@ impl AppState {
         &mut self,
         feedback: PlayerFeedback,
         engine: &PlayerHandle,
-        texture_generator: &NoteTextureGenerator,
         tx_commands: &std::sync::mpsc::Sender<PlayerCommand>,
     ) {
         match feedback {
@@ -261,24 +192,10 @@ impl AppState {
                 self.current_progress = None;
                 self.is_dragging_seek = false;
                 self.last_seek_sent_ns = None;
-                self.last_update_position_ns = 0;
-                self.current_texture_count = 0;
-                self.max_texture_count = 0;
-                self.texture_manager.clear();
-                texture_generator.cancel_all();
-                self.hover_timer = 0.0;
-                self.hover_fade_t = 0.0;
-                self.show_thumbnail = false;
-                self.hover_preview_ns = None;
 
                 if let Some(midi_data) = engine.get_midi_data() {
                     self.tick_map = Some(calculate_tick_map(&midi_data));
                     self.midi_data = Some(midi_data.clone());
-                    if self.note_textures_enabled {
-                        texture_generator.send(
-                            crate::note_texture_generator::TextureGenCommand::UpdateData(midi_data),
-                        );
-                    }
                 } else {
                     self.midi_data = None;
                     self.tick_map = None;
@@ -298,22 +215,12 @@ impl AppState {
         &mut self,
         path: &str,
         tx_commands: &mpsc::Sender<PlayerCommand>,
-        texture_generator: &NoteTextureGenerator,
     ) {
         self.is_loading = true;
-        self.texture_manager.clear();
         self.is_dragging_seek = false;
         self.last_seek_sent_ns = None;
-        self.last_update_position_ns = 0;
         self.current_progress = None;
-        self.current_texture_count = 0;
-        self.max_texture_count = 0;
         self.midi_data = None;
-        self.hover_timer = 0.0;
-        self.hover_fade_t = 0.0;
-        self.show_thumbnail = false;
-        self.hover_preview_ns = None;
-        texture_generator.cancel_all();
         tx_commands.send(PlayerCommand::LoadFile(path.to_string())).ok();
     }
 
@@ -327,26 +234,21 @@ impl AppState {
         &mut self,
         new_position_ns: u64,
         engine: &PlayerHandle,
-        texture_generator: &NoteTextureGenerator,
     ) {
         engine.send(PlayerCommand::Seek(new_position_ns));
-        texture_generator.update_position(new_position_ns);
     }
 
-    pub fn start_seeking(&mut self, preview_ns: u64, engine: &PlayerHandle, texture_generator: &NoteTextureGenerator) {
+    pub fn start_seeking(&mut self, preview_ns: u64, engine: &PlayerHandle) {
         self.is_dragging_seek = true;
         self.last_seek_sent_ns = Some(preview_ns);
         engine.send(PlayerCommand::Seek(preview_ns));
-        texture_generator.update_position(preview_ns);
     }
 
     pub fn update_seek_preview(
         &mut self,
         seek_ns: u64,
         engine: &PlayerHandle,
-        texture_generator: &NoteTextureGenerator,
     ) {
-        texture_generator.update_position(seek_ns);
         // Only send Seek to the engine when the position changes meaningfully
         // to avoid flooding the player with seek commands every frame.
         let should_seek = match self.last_seek_sent_ns {
@@ -364,217 +266,12 @@ impl AppState {
         self.last_seek_sent_ns = None;
     }
 
-    pub fn adjust_zoom_by_wheel(&mut self, wheel: f32) {
-        let factor = 1.2f32;
-        if wheel > 0.0 {
-            self.chunk_display_height *= factor.powf(wheel);
-        } else if wheel < 0.0 {
-            self.chunk_display_height /= factor.powf(-wheel);
-        }
-        self.chunk_display_height = self.chunk_display_height.clamp(1.0, 20000.0);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn iterate_tempo_map_segments(
-        &self,
-        map: &[(u64, u32, u64)],
-        start_time_ns: u64,
-        end_time_ns: u64,
-        display_pos_val: f64,
-        pixels_per_ns: f64,
-        playhead_y: f32,
-        chunk_duration_ns: f64,
-        tex_h: f32,
-        mut draw_slice: impl FnMut(f32, f32, f32, f32),
-    ) {
-        let mut map_idx = map.partition_point(|(t, _, _)| *t <= start_time_ns);
-        if map_idx > 0 {
-            map_idx -= 1;
-        }
-
-        let mut current_t = start_time_ns;
-        while current_t < end_time_ns {
-            let (seg_start, seg_tempo, seg_accum_w) = map[map_idx];
-            let next_change_t =
-                map.get(map_idx + 1).map(|m| m.0).unwrap_or(u64::MAX);
-            let slice_end_t = end_time_ns.min(next_change_t);
-
-            if slice_end_t > current_t {
-                let duration = slice_end_t - current_t;
-                let scale = BASE_TEMPO as f64 / seg_tempo as f64;
-                let weighted_duration = (duration as f64 * scale) as u64;
-
-                let w_start_abs = seg_accum_w
-                    + ((current_t - seg_start) as f64 * scale) as u64;
-                let val_until_slice = w_start_abs as f64 - display_pos_val;
-                let dist_to_playhead = (val_until_slice * pixels_per_ns) as f32;
-
-                let slice_height =
-                    (weighted_duration as f64 * pixels_per_ns) as f32;
-                let slice_y = playhead_y - dist_to_playhead - slice_height;
-
-                let norm_start =
-                    (current_t - start_time_ns) as f64 / chunk_duration_ns;
-                let norm_end =
-                    (slice_end_t - start_time_ns) as f64 / chunk_duration_ns;
-
-                let src_y = tex_h * (1.0 - norm_end as f32);
-                let src_h = (tex_h * (1.0 - norm_start as f32)) - src_y;
-
-                draw_slice(src_y, src_h, slice_y, slice_height);
-            }
-
-            current_t = slice_end_t;
-            if current_t >= next_change_t && map_idx + 1 < map.len() {
-                map_idx += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    pub fn draw_piano_roll(
-        &self,
-        d: &mut impl RaylibDraw,
-        window: &window_manager::Window,
-        playback_position_ns: u64,
-        texture_generator: &NoteTextureGenerator,
-        origin_x: f32,
-        origin_y: f32,
-    ) {
-        if self.texture_manager.len() == 0 {
-            return;
-        }
-
-        let window_x = origin_x;
-        let window_y = origin_y;
-        let mut window_height =
-            (window.rectangle.height - window.get_window_titlebar_height()) as f32;
-
-        if self.integrate_keyboard {
-            window_height -= 80.0;
-        }
-
-        let window_display_width = window.rectangle.width as f32;
-        let regions = piano_keyboard::get_keyboard_note_regions(window_display_width);
-        let window_playhead_y = window_y + window_height;
-        let display_position_ns = playback_position_ns;
-
-        let chunk_duration_ns = texture_generator.get_chunk_duration_ns() as f64;
-        let pixels_per_ns = self.chunk_display_height as f64 / chunk_duration_ns;
-
-        let display_pos_val = if self.is_tick_based {
-            self.get_weighted_time(display_position_ns) as f64
-        } else {
-            display_position_ns as f64
-        };
-
-        let textures = self.texture_manager.as_slice();
-
-        let start_idx = textures.partition_point(|(_, start, _)| {
-            let end_time = *start + chunk_duration_ns as u64;
-            if self.is_tick_based {
-                (self.get_weighted_time(end_time) as f64) < display_pos_val
-            } else {
-                (*start as f64 + chunk_duration_ns) < display_pos_val
-            }
-        });
-
-        for i in start_idx..textures.len() {
-            let (texture, start_time_ns, _) = &textures[i];
-            let end_time_ns = *start_time_ns + chunk_duration_ns as u64;
-
-            if self.is_tick_based {
-                if let Some(map) = &self.tick_map {
-                    let w_start_chunk = self.get_weighted_time(*start_time_ns) as f64;
-                    let w_end_chunk = self.get_weighted_time(end_time_ns) as f64;
-
-                    let dist_start = (w_start_chunk - display_pos_val) * pixels_per_ns;
-                    let dist_end = (w_end_chunk - display_pos_val) * pixels_per_ns;
-
-                    let chunk_y_bottom = window_playhead_y - dist_start as f32;
-                    let chunk_y_top = window_playhead_y - dist_end as f32;
-
-                    if chunk_y_bottom < window_y {
-                        break;
-                    }
-                    if chunk_y_top > window_playhead_y {
-                        continue;
-                    }
-
-                    self.iterate_tempo_map_segments(
-                        map,
-                        *start_time_ns,
-                        end_time_ns,
-                        display_pos_val,
-                        pixels_per_ns,
-                        window_playhead_y,
-                        chunk_duration_ns,
-                        texture.height as f32,
-                        |src_y, src_h, slice_y, slice_height| {
-                            draw_piano_notes(
-                                d, texture, &regions, window_x, src_y, src_h, slice_y,
-                                slice_height, false,
-                            );
-                            draw_piano_notes(
-                                d, texture, &regions, window_x, src_y, src_h, slice_y,
-                                slice_height, true,
-                            );
-                        },
-                    );
-                }
-            } else {
-                let start_val = *start_time_ns as f64;
-                let end_val = end_time_ns as f64;
-                let duration_val = end_val - start_val;
-                let current_chunk_height = (duration_val * pixels_per_ns) as f32;
-                let val_until_chunk_start = start_val - display_pos_val;
-                let distance_to_playhead = (val_until_chunk_start * pixels_per_ns) as f32;
-                let texture_y =
-                    window_playhead_y - distance_to_playhead - current_chunk_height;
-
-                if texture_y + current_chunk_height < window_y {
-                    break;
-                }
-                if texture_y > window_playhead_y {
-                    continue;
-                }
-
-                let tex_h = texture.height as f32;
-                draw_piano_notes(
-                    d,
-                    texture,
-                    &regions,
-                    window_x,
-                    0.0,
-                    tex_h,
-                    texture_y,
-                    current_chunk_height,
-                    false,
-                );
-                draw_piano_notes(
-                    d,
-                    texture,
-                    &regions,
-                    window_x,
-                    0.0,
-                    tex_h,
-                    texture_y,
-                    current_chunk_height,
-                    true,
-                );
-            }
-        }
-    }
-
     pub fn draw_keyboard(
         &mut self,
         d: &mut impl RaylibDraw,
         window: &window_manager::Window,
-        playback_position_ns: u64,
         keyboard_shader: &mut Shader,
         layout_texture: &Texture2D,
-        note_texture_generator: &NoteTextureGenerator,
         override_rect: Option<Rectangle>,
     ) {
         let (wx, wy, ww, wh) = if let Some(r) = override_rect {
@@ -587,50 +284,13 @@ impl AppState {
             (x, y, w, h)
         };
 
-        let display_position_ns = playback_position_ns;
-        let chunk_duration_ns = note_texture_generator.get_chunk_duration_ns() as f64;
-        let textures = self.texture_manager.as_slice();
-
-        let target_texture_idx =
-            textures.partition_point(|(_, start, _)| *start + chunk_duration_ns as u64 <= display_position_ns);
-
-        let loc_hit = keyboard_shader.get_shader_location("hit_data_texture");
         let loc_playback_y = keyboard_shader.get_shader_location("playback_y");
         let loc_valid = keyboard_shader.get_shader_location("is_texture_valid");
         let loc_kb_mode = keyboard_shader.get_shader_location("u_kb_mode");
 
-        let mut is_shader_ready = false;
-        let mut hit_texture: Option<&Texture2D> = None;
-        let mut playback_y_value: f32 = 0.0;
-
-        if target_texture_idx < textures.len() {
-            let (tex, start_ns, _) = &textures[target_texture_idx];
-            if display_position_ns >= *start_ns && display_position_ns < *start_ns + chunk_duration_ns as u64 {
-                let relative_ns = display_position_ns - start_ns;
-                let normalized_time = relative_ns as f64 / chunk_duration_ns;
-                playback_y_value = 1.0 - normalized_time as f32;
-                hit_texture = Some(tex);
-                is_shader_ready = true;
-            }
-        }
-
-        if is_shader_ready {
-            keyboard_shader.set_shader_value(loc_valid, 1.0f32);
-            keyboard_shader.set_shader_value(loc_playback_y, playback_y_value);
-            if let Some(tex) = hit_texture {
-                // Safety: rlActiveTextureSlot/rlEnableTexture are raylib FFI calls that
-                // manipulate OpenGL state. tex.id is a valid GL texture from raylib.
-                unsafe {
-                    raylib::ffi::rlActiveTextureSlot(1);
-                    raylib::ffi::rlEnableTexture(tex.id);
-                }
-                keyboard_shader.set_shader_value(loc_hit, 1i32);
-            }
-        } else {
-            keyboard_shader.set_shader_value(loc_valid, 0.0f32);
-            keyboard_shader.set_shader_value(loc_playback_y, 0.0f32);
-        }
-
+        // No note data is available; render the static keyboard layout only.
+        keyboard_shader.set_shader_value(loc_valid, 0.0f32);
+        keyboard_shader.set_shader_value(loc_playback_y, 0.0f32);
         keyboard_shader.set_shader_value(loc_kb_mode, 1.0f32);
 
         {
@@ -652,14 +312,6 @@ impl AppState {
 
         keyboard_shader.set_shader_value(loc_kb_mode, 0.0f32);
         keyboard_shader.set_shader_value(loc_valid, 0.0f32);
-
-        // Safety: raylib FFI calls to unbind the texture from texture slot 1
-        // and restore active slot to 0.
-        unsafe {
-            raylib::ffi::rlActiveTextureSlot(1);
-            raylib::ffi::rlDisableTexture();
-            raylib::ffi::rlActiveTextureSlot(0);
-        }
     }
 
     pub fn draw_keyboard_channels(
@@ -749,142 +401,5 @@ impl AppState {
                 }
             }
         }
-    }
-
-    pub fn draw_thumbnail(
-        &self,
-        d: &mut impl RaylibDraw,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        position_ns: u64,
-        texture_generator: &NoteTextureGenerator,
-    ) {
-        let alpha = (self.hover_fade_t * 255.0) as u8;
-        if alpha == 0 {
-            return;
-        }
-
-        let border_thickness = 2.0;
-        d.draw_rectangle(
-            x as i32,
-            y as i32,
-            width as i32,
-            height as i32,
-            Color::new(20, 20, 20, (alpha as f32 * 0.94) as u8),
-        );
-
-        if self.texture_manager.len() > 0 {
-            let thumb_zoom = 50.0;
-            let chunk_duration_ns = texture_generator.get_chunk_duration_ns() as f64;
-            let pixels_per_ns = thumb_zoom as f64 / chunk_duration_ns;
-
-            let display_pos_val = if self.is_tick_based {
-                self.get_weighted_time(position_ns) as f64
-            } else {
-                position_ns as f64
-            };
-
-            let playhead_y = y + height;
-
-            {
-                let mut d_scissor = d.begin_scissor_mode(
-                    (x + border_thickness) as i32,
-                    (y + border_thickness) as i32,
-                    (width - border_thickness * 2.0) as i32,
-                    (height - border_thickness * 2.0) as i32,
-                );
-
-                let textures = self.texture_manager.as_slice();
-
-                let tint = Color::new(255, 255, 255, alpha);
-
-                for i in 0..textures.len() {
-                    let (texture, start_time_ns, _end_time_ns) = &textures[i];
-                    let end_time_ns = *start_time_ns + chunk_duration_ns as u64;
-
-                    if self.is_tick_based {
-                        if let Some(map) = &self.tick_map {
-                            let w_start_chunk = self.get_weighted_time(*start_time_ns) as f64;
-                            let w_end_chunk = self.get_weighted_time(end_time_ns) as f64;
-
-                            let dist_start = (w_start_chunk - display_pos_val) * pixels_per_ns;
-                            let dist_end = (w_end_chunk - display_pos_val) * pixels_per_ns;
-
-                            let chunk_y_bottom = playhead_y - dist_start as f32;
-                            let chunk_y_top = playhead_y - dist_end as f32;
-
-                            if chunk_y_bottom < y {
-                                break;
-                            }
-                            if chunk_y_top > playhead_y {
-                                continue;
-                            }
-
-                            self.iterate_tempo_map_segments(
-                                map,
-                                *start_time_ns,
-                                end_time_ns,
-                                display_pos_val,
-                                pixels_per_ns,
-                                playhead_y,
-                                chunk_duration_ns,
-                                texture.height as f32,
-                                |src_y, src_h, slice_y, slice_height| {
-                                    d_scissor.draw_texture_pro(
-                                        texture,
-                                        Rectangle::new(0.0, src_y, texture.width as f32, src_h),
-                                        Rectangle::new(x, slice_y, width, slice_height),
-                                        Vector2::new(0.0, 0.0),
-                                        0.0,
-                                        tint,
-                                    );
-                                },
-                            );
-                        }
-                    } else {
-                        let start_val = *start_time_ns as f64;
-                        let end_val = end_time_ns as f64;
-                        let duration_val = end_val - start_val;
-                        let current_chunk_height = (duration_val * pixels_per_ns) as f32;
-                        let val_until_chunk_start = start_val - display_pos_val;
-                        let distance_to_playhead = (val_until_chunk_start * pixels_per_ns) as f32;
-                        let texture_y = playhead_y - distance_to_playhead - current_chunk_height;
-
-                        if texture_y + current_chunk_height < y {
-                            break;
-                        }
-                        if texture_y > playhead_y {
-                            continue;
-                        }
-
-                        d_scissor.draw_texture_pro(
-                            texture,
-                            Rectangle::new(0.0, 0.0, texture.width as f32, texture.height as f32),
-                            Rectangle::new(x, texture_y, width, current_chunk_height),
-                            Vector2::new(0.0, 0.0),
-                            0.0,
-                            tint,
-                        );
-                    }
-                }
-            }
-        }
-
-        d.draw_rectangle_lines_ex(
-            Rectangle::new(x, y, width, height),
-            border_thickness,
-            Color::new(0, 120, 215, alpha),
-        );
-
-        let time_text = crate::utils::format_time(position_ns);
-        d.draw_text(
-            &time_text,
-            x as i32 + 5,
-            y as i32 + 5,
-            16,
-            Color::new(255, 255, 255, alpha),
-        );
     }
 }

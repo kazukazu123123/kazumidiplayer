@@ -7,19 +7,13 @@ use crate::window_manager::InputEvent;
 use raylib::prelude::*;
 use std::sync::mpsc::Sender;
 
-use crate::note_texture_generator::ChunkStatus;
-
 pub fn draw_progress_bar(
     d: &mut impl RaylibDraw,
     playback_position_ns: u64,
     weighted_position_ns: u64,
     total_weighted_ns: u64,
-    current_texture_count: usize,
-    max_texture_count: usize,
     bar_x: f32,
     bar_y: f32,
-    _bar_w: f32,
-    texture_text_width: Option<i32>,
 ) {
     let display_position_ns = playback_position_ns;
     let time_text = format_time(display_position_ns);
@@ -27,19 +21,6 @@ pub fn draw_progress_bar(
     let combined_text = format!("{}  [{}]", time_text, measure_text);
 
     d.draw_text(&combined_text, bar_x as i32, bar_y as i32, 20, Color::WHITE);
-
-    if max_texture_count > 0 {
-        let texture_text = format!("Textures: {}/{}", current_texture_count, max_texture_count);
-        if let Some(width) = texture_text_width {
-            d.draw_text(
-                &texture_text,
-                (bar_x + _bar_w) as i32 - width,
-                bar_y as i32 + 2,
-                16,
-                Color::LIME,
-            );
-        }
-    }
 }
 
 pub fn draw_seek_bar(
@@ -52,9 +33,6 @@ pub fn draw_seek_bar(
     is_midi_loaded: bool,
     playback_position_ns: u64,
     duration_ns: u64,
-    _current_texture_count: usize,
-    max_texture_count: usize,
-    chunk_statuses: &[ChunkStatus],
     input_event: Option<InputEvent>,
 ) -> bool {
     let seek_bar_bg_color = if is_loading {
@@ -66,25 +44,7 @@ pub fn draw_seek_bar(
     d.draw_rectangle(x as i32, y as i32, w as i32, h as i32, seek_bar_bg_color);
 
     if is_midi_loaded && !is_loading {
-        // Layer 1: Texture generation progress (Bottom) - Segmented
-        if max_texture_count > 0 && !chunk_statuses.is_empty() {
-            let chunk_w = w / max_texture_count as f32;
-            for (i, status) in chunk_statuses.iter().enumerate() {
-                let color = match status {
-                    ChunkStatus::Done => Color::new(0, 82, 172, 255), // Dark Blue
-                    ChunkStatus::InProgress => Color::new(100, 149, 237, 255), // Cornflower Blue
-                    ChunkStatus::Todo => continue,
-                };
-
-                let cx = x + (i as f32 * chunk_w);
-                // Use a slightly smaller width if it's not the last chunk to show separation,
-                // or just draw it full width for a continuous look if preferred.
-                // Let's draw it full width for now, but the logic is here.
-                d.draw_rectangle(cx as i32, y as i32, chunk_w.ceil() as i32, h as i32, color);
-            }
-        }
-
-        // Layer 2: Playback progress (Top)
+        // Playback progress
         let current_position_ns = playback_position_ns;
         let fill = ((current_position_ns as f32 / duration_ns as f32) * w) as i32;
         d.draw_rectangle(x as i32, y as i32, fill, h as i32, Color::GREEN);
@@ -245,19 +205,14 @@ pub fn draw_settings_overlay(
     mouse_wheel: f32,
     autoplay_on_load: &mut bool,
     autoplay_animation: f32,
-    note_textures_enabled: &mut bool,
-    note_textures_animation: f32,
     pitch_bend_override: &mut bool,
     pitch_bend_override_animation: f32,
     pitch_bend_multiplier: &mut u8,
     unlimited_output: &mut bool,
     unlimited_output_animation: f32,
-    texture_height: &mut usize,
-    texture_worker_count: &mut usize,
     scrollbar_dragging: &mut bool,
     scrollbar_drag_start_y: &mut f32,
     scrollbar_drag_start_scroll: &mut f32,
-    texture_height_slider_dragging: &mut bool,
     pb_multiplier_slider_dragging: &mut bool,
 ) -> bool {
     // Ease-out cubic: 1 - (1 - t)^3
@@ -307,9 +262,6 @@ pub fn draw_settings_overlay(
     measure_layout.next(18.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
-    measure_layout.next(30.0);
-    measure_layout.next(30.0);
-    measure_layout.next(38.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
@@ -463,69 +415,6 @@ pub fn draw_settings_overlay(
                 }
             }
 
-            // Debug Texture Toggle
-            let y = layout.next(30.0);
-            let debug_tex_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
-            if is_visible(debug_tex_rect.y, debug_tex_rect.height) {
-                if draw_toggle(
-                    &mut d_scissor,
-                    debug_tex_rect,
-                    "Texture Enabled",
-                    note_textures_animation,
-                    true,
-                    eased_t,
-                    click_pos,
-                    Some(mouse_world_pos),
-                ) {
-                    *note_textures_enabled = !*note_textures_enabled;
-                }
-            }
-
-            // Texture Height Slider
-            let y = layout.next(38.0);
-            if is_visible(sy(y), 38.0) {
-                let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
-                let label = format!("Texture Height: {}", *texture_height);
-                d_scissor.draw_text_ex(
-                    &font,
-                    &label,
-                    Vector2::new(slider_rect.x, sy(y)),
-                    16.0,
-                    1.0,
-                    text_color,
-                );
-                d_scissor.draw_rectangle(
-                    slider_rect.x as i32,
-                    (slider_rect.y + 8.0) as i32,
-                    slider_rect.width as i32,
-                    4,
-                    Color::new(80, 80, 80, (255.0 * eased_t) as u8),
-                );
-                let t = ((*texture_height as f32 / 512.0).log2() / 5.0).clamp(0.0, 1.0);
-                let thumb_x = slider_rect.x + t * slider_rect.width;
-                let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
-
-                // Start drag on click
-                if let Some(cp) = click_pos {
-                    if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
-                        *texture_height_slider_dragging = true;
-                    }
-                }
-
-                // Ongoing drag: value follows the mouse even outside the slider rect
-                if *texture_height_slider_dragging {
-                    if is_mouse_down {
-                        let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
-                        let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
-                        let exp = (new_t * 5.0).round() as u32;
-                        *texture_height = (512 * 2usize.pow(exp)).clamp(512, 16384);
-                    } else {
-                        *texture_height_slider_dragging = false;
-                    }
-                }
-            }
-
             // Autoplay on Load Toggle
             let y = layout.next(30.0);
             let autoplay_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
@@ -541,47 +430,6 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *autoplay_on_load = !*autoplay_on_load;
-                }
-            }
-
-            // Texture Worker Count
-            let y = layout.next(30.0);
-            if is_visible(sy(y), 30.0) {
-                let max_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-                let label = format!("Texture Workers: {}", *texture_worker_count);
-                d_scissor.draw_text_ex(
-                    &font,
-                    &label,
-                    Vector2::new(20.0, sy(y)),
-                    16.0,
-                    1.0,
-                    text_color,
-                );
-                let minus_rect = Rectangle::new(200.0, sy(y), 30.0, 24.0);
-                let plus_rect = Rectangle::new(240.0, sy(y), 30.0, 24.0);
-                if draw_button(
-                    &mut d_scissor,
-                    minus_rect,
-                    "-",
-                    16,
-                    *texture_worker_count > 1,
-                    eased_t,
-                    click_pos,
-                    Some(mouse_world_pos),
-                ) {
-                    *texture_worker_count = texture_worker_count.saturating_sub(1).max(1);
-                }
-                if draw_button(
-                    &mut d_scissor,
-                    plus_rect,
-                    "+",
-                    16,
-                    *texture_worker_count < max_workers,
-                    eased_t,
-                    click_pos,
-                    Some(mouse_world_pos),
-                ) {
-                    *texture_worker_count = (*texture_worker_count + 1).min(max_workers);
                 }
             }
 

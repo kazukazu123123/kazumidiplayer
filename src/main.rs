@@ -1,21 +1,17 @@
 mod app_state;
 mod blur_requester;
 mod kazumidiparser_cursor;
-mod kazumidiparser_note_extractor;
 mod kdmapi;
 mod midi_parser_worker;
-mod note_texture_generator;
 mod overlay_manager;
 mod player;
 mod shaking;
-mod texture_manager;
 mod ui;
 mod ui_components;
 mod utils;
 mod window_manager;
 
 use app_state::AppState;
-use note_texture_generator::NoteTextureGenerator;
 use player::{PlayerCommand, PlayerFeedback, PlayerState, PlayerHandle};
 use raylib::prelude::*;
 use std::sync::mpsc;
@@ -145,8 +141,6 @@ fn main() {
     let (tx_feedback_to_main, rx_feedback_from_player) = mpsc::channel::<PlayerFeedback>();
     let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, stream);
 
-    let mut texture_generator = NoteTextureGenerator::spawn(app_state.texture_worker_count);
-
     let mut render_texture = rl
         .load_render_texture(
             &thread,
@@ -249,13 +243,13 @@ fn main() {
         }
 
         while let Ok(feedback) = rx_feedback_from_player.try_recv() {
-            app_state.handle_player_feedback(feedback, &engine, &texture_generator, &tx_commands_to_player);
+            app_state.handle_player_feedback(feedback, &engine, &tx_commands_to_player);
         }
 
         if rl.is_file_dropped() {
             let dropped_files = rl.load_dropped_files();
             if let Some(path) = dropped_files.paths().first() {
-                app_state.handle_file_drop(path, &tx_commands_to_player, &texture_generator);
+                app_state.handle_file_drop(path, &tx_commands_to_player);
             }
         }
 
@@ -274,52 +268,10 @@ fn main() {
             duration_ns = 0;
         }
 
-        if is_midi_loaded && !is_loading {
-            let display_position = playback_position_ns;
-
-            if app_state.note_textures_enabled {
-                let pos_change = display_position.abs_diff(app_state.last_update_position_ns);
-                if pos_change > 10_00_000 {
-                    texture_generator.update_position(display_position);
-                    app_state.last_update_position_ns = display_position;
-                }
-
-                // Receive and upload all available textures to GPU immediately
-                while let Some(mut chunk) = texture_generator.try_recv_texture() {
-                    app_state
-                        .texture_manager
-                        .upload_texture(&mut chunk, &mut rl, &thread);
-                }
-
-                app_state.current_texture_count = texture_generator.get_current_texture_count();
-                app_state.max_texture_count = texture_generator.get_max_chunks();
-            } else {
-                // Note textures disabled: cancel generation and free existing textures
-                texture_generator.cancel_all();
-                if app_state.texture_manager.len() > 0 {
-                    app_state.texture_manager.clear();
-                }
-                app_state.current_texture_count = 0;
-                app_state.max_texture_count = 0;
-            }
-        }
-
         // Update layout when integration setting changes
         if app_state.integrate_keyboard != last_integrate_keyboard {
             current_layout_width = -1; // Force layout update
             last_integrate_keyboard = app_state.integrate_keyboard;
-        }
-
-        // Restart texture generator if worker count changed
-        if app_state.texture_worker_count != app_state.prev_texture_worker_count {
-            texture_generator.cancel_all();
-            texture_generator = NoteTextureGenerator::spawn(app_state.texture_worker_count);
-            app_state.prev_texture_worker_count = app_state.texture_worker_count;
-            if let Some(midi_data) = app_state.midi_data.clone() {
-                texture_generator.send(
-                    crate::note_texture_generator::TextureGenCommand::UpdateData(midi_data),
-                );
-            }
         }
 
         // Limit dt to prevent physics explosion on lag (max 100ms)
@@ -330,7 +282,6 @@ fn main() {
         animate_toggle(app_state.is_tick_based, &mut app_state.tick_based_animation, dt, anim_speed);
         animate_toggle(app_state.shake_enabled, &mut app_state.shake_animation, dt, anim_speed);
         animate_toggle(app_state.integrate_keyboard, &mut app_state.keyboard_animation, dt, anim_speed);
-        animate_toggle(app_state.note_textures_enabled, &mut app_state.note_textures_animation, dt, anim_speed);
         animate_toggle(app_state.autoplay_on_load, &mut app_state.autoplay_animation, dt, anim_speed);
         animate_toggle(app_state.pitch_bend_override_enabled, &mut app_state.pitch_bend_override_animation, dt, anim_speed);
         animate_toggle(app_state.unlimited_output_enabled, &mut app_state.unlimited_output_animation, dt, anim_speed);
@@ -461,24 +412,10 @@ fn main() {
 
         let wheel = rl.get_mouse_wheel_move();
 
-        if !app_state.overlay_manager.blocks_input() {
-            if wheel != 0.0 {
-                app_state.adjust_zoom_by_wheel(wheel);
-            }
-        }
-
         // Handle keyboard shortcuts only when overlay is completely closed
         if !app_state.overlay_manager.blocks_input()
             && app_state.overlay_manager.get_fade_t() == 0.0
         {
-            if rl.is_key_down(KeyboardKey::KEY_UP) {
-                app_state.adjust_zoom_by_wheel(1.2 * rl.get_frame_time() * 10.0);
-            }
-
-            if rl.is_key_down(KeyboardKey::KEY_DOWN) {
-                app_state.adjust_zoom_by_wheel(-1.2 * rl.get_frame_time() * 10.0);
-            }
-
             if is_midi_loaded && !is_loading {
                 if rl.is_key_pressed(KeyboardKey::KEY_SPACE) {
                     if st == PlayerState::Playing {
@@ -495,11 +432,11 @@ fn main() {
                 let base_pos = playback_position_ns;
                 if rl.is_key_pressed(KeyboardKey::KEY_RIGHT) {
                     let new_pos = (base_pos + jump_ns).min(duration_ns);
-                    app_state.handle_keyboard_seek(new_pos, &engine, &texture_generator);
+                    app_state.handle_keyboard_seek(new_pos, &engine);
                 }
                 if rl.is_key_pressed(KeyboardKey::KEY_LEFT) {
                     let new_pos = base_pos.saturating_sub(jump_ns);
-                    app_state.handle_keyboard_seek(new_pos, &engine, &texture_generator);
+                    app_state.handle_keyboard_seek(new_pos, &engine);
                 }
             }
         }
@@ -512,7 +449,7 @@ fn main() {
                 .pick_file()
             {
                 let path_str = path.to_string_lossy().to_string();
-                app_state.handle_file_drop(&path_str, &tx_commands_to_player, &texture_generator);
+                app_state.handle_file_drop(&path_str, &tx_commands_to_player);
             }
         }
 
@@ -742,7 +679,6 @@ fn main() {
         }
 
         let mut d = rl.begin_drawing(&thread);
-        let mut thumbnail_draw_info: Option<(f32, f32, f32, f32, u64)> = None;
 
         // Phase 1: Render each window (frame + titlebar + content) into its private RT.
         for &wid in &window_ids {
@@ -845,41 +781,17 @@ fn main() {
 
                     match wid {
                         id if id == piano_roll_window_handle => {
-                            if app_state.note_textures_enabled {
-                                let required_chunks = if is_midi_loaded {
-                                    ((duration_ns as f64
-                                        / texture_generator.get_chunk_duration_ns() as f64)
-                                        .ceil() as usize)
-                                        .max(1)
-                                } else {
-                                    0
-                                };
-
-                                if texture_generator.get_max_chunks() != required_chunks {
-                                    texture_generator.set_max_chunks(required_chunks);
-                                }
-
-                                app_state.draw_piano_roll(
-                                    &mut d_scissor,
-                                    window,
-                                    playback_position_ns,
-                                    &texture_generator,
-                                    cx,
-                                    cy,
-                                );
-                            }
+                            // Piano roll is intentionally empty (note rendering removed).
 
                             // Draw integrated keyboard if enabled
-                            if app_state.integrate_keyboard && app_state.note_textures_enabled {
+                            if app_state.integrate_keyboard {
                                 let keyboard_rect =
                                     Rectangle::new(cx, cy + ch - 80.0, cw, 80.0);
                                 app_state.draw_keyboard(
                                     &mut d_scissor,
                                     window,
-                                    playback_position_ns,
                                     &mut piano_keyboard_shader,
                                     &keyboard_layout_texture,
-                                    &texture_generator,
                                     Some(keyboard_rect),
                                 );
                             }
@@ -943,34 +855,19 @@ fn main() {
                                 app_state.get_weighted_time(playback_position_ns);
                             let total_weighted = app_state.get_weighted_time(duration_ns);
 
-                            let texture_text_width = if app_state.max_texture_count > 0 {
-                                let texture_text = format!(
-                                    "Textures: {}/{}",
-                                    app_state.current_texture_count, app_state.max_texture_count
-                                );
-                                Some(d_scissor.measure_text(&texture_text, 16))
-                            } else {
-                                None
-                            };
-
                             ui::draw_progress_bar(
                                 &mut d_scissor,
                                 playback_position_ns,
                                 weighted_pos,
                                 total_weighted,
-                                app_state.current_texture_count,
-                                app_state.max_texture_count,
                                 cx + 10.0,
                                 cy + 10.0,
-                                cw - 20.0,
-                                texture_text_width,
                             );
 
                             let seek_x = cx + 10.0;
                             let seek_y = cy + 40.0;
                             let seek_w = cw - 20.0;
                             let seek_h = 20.0;
-                            let chunk_statuses = texture_generator.get_chunks_status();
                             if ui::draw_seek_bar(
                                 &mut d_scissor,
                                 seek_x,
@@ -981,50 +878,13 @@ fn main() {
                                 is_midi_loaded,
                                 playback_position_ns,
                                 duration_ns,
-                                app_state.current_texture_count,
-                                app_state.max_texture_count,
-                                &*chunk_statuses,
                                 current_event,
                             ) {
                                 let clamped_mouse_x =
                                     local_mouse.x.clamp(seek_x, seek_x + seek_w);
                                 let t = (clamped_mouse_x - seek_x) / seek_w;
                                 let seek_ns = (t * duration_ns as f32) as u64;
-                                app_state.start_seeking(seek_ns, &engine, &texture_generator);
-                            }
-
-                            // Hover logic for thumbnail
-                            let is_hovering_seek = active_window_id
-                                == Some(controls_window_handle)
-                                && local_mouse.x >= seek_x
-                                && local_mouse.x < seek_x + seek_w
-                                && local_mouse.y >= seek_y
-                                && local_mouse.y < seek_y + seek_h
-                                && !app_state.overlay_manager.blocks_input()
-                                && is_midi_loaded;
-
-                            if is_hovering_seek {
-                                let t = (local_mouse.x - seek_x) / seek_w;
-                                let hover_ns = (t * duration_ns as f32) as u64;
-                                app_state.hover_preview_ns = Some(hover_ns);
-
-                                app_state.hover_timer += dt;
-                                if app_state.hover_timer >= 0.3 {
-                                    app_state.show_thumbnail = true;
-                                }
-                            } else {
-                                app_state.hover_timer = 0.0;
-                                app_state.show_thumbnail = false;
-                            }
-
-                            // Update fade timer
-                            let fade_speed = 5.0; // seconds to full fade
-                            if app_state.show_thumbnail {
-                                app_state.hover_fade_t =
-                                    (app_state.hover_fade_t + dt * fade_speed).min(1.0);
-                            } else {
-                                app_state.hover_fade_t =
-                                    (app_state.hover_fade_t - dt * fade_speed).max(0.0);
+                                app_state.start_seeking(seek_ns, &engine);
                             }
 
                             ui::draw_media_controls(
@@ -1041,28 +901,6 @@ fn main() {
                                 ui_mouse_pos,
                             );
 
-                            if app_state.hover_fade_t > 0.0 {
-                                if let Some(preview_ns) = app_state.hover_preview_ns {
-                                    let thumb_w = 160.0;
-                                    let thumb_h = 100.0;
-                                    let thumb_x_c = (local_mouse.x - thumb_w / 2.0)
-                                        .clamp(cx, cx + cw - thumb_w);
-                                    let thumb_y_c = cy + 40.0 - thumb_h - 10.0; // Above the seek bar
-
-                                    thumbnail_draw_info = Some((
-                                        thumb_x_c
-                                            + (window.rectangle.left() - bt) as f32
-                                            + canvas_offset_x as f32,
-                                        thumb_y_c
-                                            + (window.rectangle.top() - bt) as f32
-                                            + canvas_offset_y as f32,
-                                        thumb_w,
-                                        thumb_h,
-                                        preview_ns,
-                                    ));
-                                }
-                            }
-
                             // Drag handling does not draw, so it can stay inside the scissor block.
                             if app_state.is_dragging_seek
                                 && !app_state.overlay_manager.is_active()
@@ -1078,7 +916,6 @@ fn main() {
                                     app_state.update_seek_preview(
                                         seek_ns,
                                         &engine,
-                                        &texture_generator,
                                     );
                                 }
 
@@ -1092,17 +929,13 @@ fn main() {
                         id if id == piano_keyboard_window_handle
                             && !app_state.integrate_keyboard =>
                         {
-                            if app_state.note_textures_enabled {
-                                app_state.draw_keyboard(
-                                    &mut d_scissor,
-                                    window,
-                                    playback_position_ns,
-                                    &mut piano_keyboard_shader,
-                                    &keyboard_layout_texture,
-                                    &texture_generator,
-                                    Some(Rectangle::new(cx, cy, cw, ch)),
-                                );
-                            }
+                            app_state.draw_keyboard(
+                                &mut d_scissor,
+                                window,
+                                &mut piano_keyboard_shader,
+                                &keyboard_layout_texture,
+                                Some(Rectangle::new(cx, cy, cw, ch)),
+                            );
                         }
                         id if id == piano_keyboard_channel_window_handle => {
                             let active_notes = engine.get_active_notes();
@@ -1205,16 +1038,6 @@ fn main() {
             }
         }
 
-        // Phase 3: Thumbnail (drawn after all windows are composited)
-        {
-            let mut d_rt = d.begin_texture_mode(&thread, &mut render_texture);
-            if app_state.note_textures_enabled {
-                if let Some((x, y, w, h, ns)) = thumbnail_draw_info {
-                    app_state.draw_thumbnail(&mut d_rt, x, y, w, h, ns, &texture_generator);
-                }
-            }
-        }
-
         // Phase 4: Blur request for overlays
         if app_state.overlay_manager.blocks_input() {
             let eased_t = 1.0 - (1.0 - app_state.overlay_manager.get_fade_t()).powi(2);
@@ -1305,8 +1128,6 @@ fn main() {
                     app_state::AppOverlay::Settings => {
                         let prev_pb_override = app_state.pitch_bend_override_enabled;
                         let prev_pb_multiplier = app_state.pitch_bend_multiplier;
-                        let prev_texture_height = app_state.texture_height;
-                        let prev_note_textures_enabled = app_state.note_textures_enabled;
                         let prev_unlimited_output = app_state.unlimited_output_enabled;
                         if ui::draw_settings_overlay(
                             d,
@@ -1326,19 +1147,14 @@ fn main() {
                             wheel,
                             &mut app_state.autoplay_on_load,
                             app_state.autoplay_animation,
-                            &mut app_state.note_textures_enabled,
-                            app_state.note_textures_animation,
                             &mut app_state.pitch_bend_override_enabled,
                             app_state.pitch_bend_override_animation,
                             &mut app_state.pitch_bend_multiplier,
                             &mut app_state.unlimited_output_enabled,
                             app_state.unlimited_output_animation,
-                            &mut app_state.texture_height,
-                            &mut app_state.texture_worker_count,
                             &mut app_state.settings_scrollbar_dragging,
                             &mut app_state.settings_scrollbar_drag_start_y,
                             &mut app_state.settings_scrollbar_drag_start_scroll,
-                            &mut app_state.settings_texture_height_slider_dragging,
                             &mut app_state.settings_pb_multiplier_slider_dragging,
                         ) {
                             close_requested = true;
@@ -1351,21 +1167,6 @@ fn main() {
                         }
                         if app_state.unlimited_output_enabled != prev_unlimited_output {
                             engine.set_unlimited_output(app_state.unlimited_output_enabled);
-                        }
-
-                        if app_state.texture_height != prev_texture_height {
-                            texture_generator.set_texture_height(app_state.texture_height);
-                        }
-
-                        if app_state.note_textures_enabled != prev_note_textures_enabled {
-                            if app_state.note_textures_enabled {
-                                if let Some(midi_data) = app_state.midi_data.clone() {
-                                    texture_generator.send(
-                                        crate::note_texture_generator::TextureGenCommand::UpdateData(midi_data),
-                                    );
-                                }
-                            }
-                            app_state.prev_note_textures_enabled = app_state.note_textures_enabled;
                         }
 
                         window_manager.set_window_visible(
