@@ -4,6 +4,7 @@ mod kazumidiparser_cursor;
 mod kdmapi;
 mod midi_parser_worker;
 mod overlay_manager;
+mod piano_roll;
 mod player;
 mod shaking;
 mod ui;
@@ -220,6 +221,14 @@ fn main() {
     let mut current_layout_height = 80;
     let mut last_integrate_keyboard = app_state.integrate_keyboard;
 
+    // Background generator for piano-roll draw data. `roll_req_*` track the
+    // coverage we last asked for, so we only re-request when the cached chunk no
+    // longer spans the visible window (advanced past it, seeked back, new file).
+    let mut piano_roll_worker = piano_roll::PianoRollWorker::new();
+    // The chunk covers the whole MIDI (tick 0 -> end), so it only needs to be
+    // regenerated when the file itself changes; seeks and stops reuse it.
+    let mut piano_roll_req_data: Option<std::sync::Arc<kazumidiparser::MIDIPlayerData>> = None;
+
     while !rl.window_should_close() {
         if rl.is_window_resized() {
             render_texture = rl
@@ -411,6 +420,16 @@ fn main() {
         }
 
         let wheel = rl.get_mouse_wheel_move();
+
+        // Push the debug scan-delay knob to the worker.
+        piano_roll_worker.set_scan_delay_ms(app_state.scan_delay_ms);
+
+        // Mouse-wheel anywhere (when no overlay is open) adjusts note scroll speed.
+        // Multiplicative steps give smooth, symmetric zoom in/out; clamped.
+        if wheel != 0.0 && !app_state.overlay_manager.blocks_input() {
+            app_state.note_speed =
+                (app_state.note_speed * 1.1_f32.powf(wheel)).clamp(0.1, 12.0);
+        }
 
         // Handle keyboard shortcuts only when overlay is completely closed
         if !app_state.overlay_manager.blocks_input()
@@ -781,7 +800,57 @@ fn main() {
 
                     match wid {
                         id if id == piano_roll_window_handle => {
-                            // Piano roll is intentionally empty (note rendering removed).
+                            // Reserve the bottom strip for the integrated keyboard.
+                            let keyboard_h = if app_state.integrate_keyboard { 80.0 } else { 0.0 };
+                            let roll_h = (ch - keyboard_h).max(0.0);
+
+                            if roll_h > 0.0 {
+                                if let Some(data) = engine.get_midi_data() {
+                                    // Safety: as_ptr() yields a valid pointer to the C MIDI
+                                    // struct, kept alive by the Arc for this call.
+                                    let parser_data = unsafe { &*data.as_ptr() };
+
+                                    // Generate once from the very start of the MIDI to its
+                                    // end, and only regenerate when the file itself changes.
+                                    // Because the whole tick range is covered, seeks and stops
+                                    // never need a regeneration. The worker's scan frontier
+                                    // (read in the draw) drives the bottom-to-top reveal.
+                                    let data_changed = match &piano_roll_req_data {
+                                        Some(d) => !std::sync::Arc::ptr_eq(d, &data),
+                                        None => true,
+                                    };
+                                    if data_changed {
+                                        // Cancel any in-flight scan and regenerate from tick 0
+                                        // to the end. `top_tick` is the priority target so the
+                                        // visible window shows at once.
+                                        let top_tick = piano_roll::future_tick(
+                                            parser_data,
+                                            playback_position_ns,
+                                            app_state.is_tick_based,
+                                            app_state.note_speed,
+                                            roll_h,
+                                        )
+                                        .min(parser_data.max_tick);
+                                        piano_roll_worker.regenerate(data.clone(), 0, top_tick);
+                                        piano_roll_req_data = Some(data.clone());
+                                    }
+
+                                    let roll_area = Rectangle::new(cx, cy, cw, roll_h);
+                                    // Render every frame from the (possibly still
+                                    // generating) chunk via CPU rasterization.
+                                    piano_roll_worker.with_chunk(|chunk| {
+                                        piano_roll::draw_piano_roll_chunk(
+                                            &mut d_scissor,
+                                            parser_data,
+                                            playback_position_ns,
+                                            roll_area,
+                                            app_state.is_tick_based,
+                                            app_state.note_speed,
+                                            chunk,
+                                        );
+                                    });
+                                }
+                            }
 
                             // Draw integrated keyboard if enabled
                             if app_state.integrate_keyboard {
@@ -868,6 +937,16 @@ fn main() {
                             let seek_y = cy + 40.0;
                             let seek_w = cw - 20.0;
                             let seek_h = 20.0;
+                            // Note-generation progress over the whole MIDI.
+                            let gen_frac = if is_midi_loaded && !is_loading {
+                                engine.get_midi_data().map(|data| {
+                                    // Safety: as_ptr() valid for this call.
+                                    let max_tick = unsafe { (*data.as_ptr()).max_tick };
+                                    piano_roll_worker.gen_progress(max_tick).0
+                                })
+                            } else {
+                                None
+                            };
                             if ui::draw_seek_bar(
                                 &mut d_scissor,
                                 seek_x,
@@ -879,6 +958,7 @@ fn main() {
                                 playback_position_ns,
                                 duration_ns,
                                 current_event,
+                                gen_frac,
                             ) {
                                 let clamped_mouse_x =
                                     local_mouse.x.clamp(seek_x, seek_x + seek_w);
@@ -1156,6 +1236,8 @@ fn main() {
                             &mut app_state.settings_scrollbar_drag_start_y,
                             &mut app_state.settings_scrollbar_drag_start_scroll,
                             &mut app_state.settings_pb_multiplier_slider_dragging,
+                            &mut app_state.scan_delay_ms,
+                            &mut app_state.settings_scan_delay_slider_dragging,
                         ) {
                             close_requested = true;
                         }
@@ -1216,4 +1298,8 @@ fn main() {
             app_state.overlay_manager.close();
         }
     }
+
+    // Stop and join the piano-roll worker before teardown, so it is never
+    // force-killed mid-allocation (which can deadlock process exit on Windows).
+    piano_roll_worker.shutdown();
 }

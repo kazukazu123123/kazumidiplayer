@@ -23,6 +23,11 @@ pub struct AppState {
     pub last_state: PlayerState,
     pub is_loading: bool,
     pub is_tick_based: bool,
+    /// Piano-roll scroll speed multiplier (higher = notes move faster, shorter
+    /// visible window). Adjusted with the mouse wheel over the piano roll.
+    pub note_speed: f32,
+    /// Debug: artificial piano-roll scan delay in milliseconds (slider-controlled).
+    pub scan_delay_ms: u32,
     pub tick_map: Option<Vec<(u64, u32, u64)>>,
     pub midi_data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub last_seek_sent_ns: Option<u64>,
@@ -49,6 +54,7 @@ pub struct AppState {
     pub settings_scrollbar_drag_start_y: f32,
     pub settings_scrollbar_drag_start_scroll: f32,
     pub settings_pb_multiplier_slider_dragging: bool,
+    pub settings_scan_delay_slider_dragging: bool,
 
     // --- Editor ---
     pub editor_text: String,
@@ -110,6 +116,8 @@ impl AppState {
             last_state: PlayerState::Stopped,
             is_loading: false,
             is_tick_based: false,
+            note_speed: 1.0,
+            scan_delay_ms: 0,
             tick_map: None,
             midi_data: None,
             last_seek_sent_ns: None,
@@ -136,6 +144,7 @@ impl AppState {
             settings_scrollbar_drag_start_y: 0.0,
             settings_scrollbar_drag_start_scroll: 0.0,
             settings_pb_multiplier_slider_dragging: false,
+            settings_scan_delay_slider_dragging: false,
 
             // --- Editor ---
             editor_text: String::new(),

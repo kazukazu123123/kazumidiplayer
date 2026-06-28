@@ -270,6 +270,94 @@ pub unsafe fn seek_track_cursor(
     cursor
 }
 
+/// Like `seek_track_cursor`, but also reports the notes still held at
+/// `target_tick`, as `(start_tick, channel)` per key. Notes whose note-on lies
+/// before the keyframe used for the jump are not detected (rare), so very long
+/// notes spanning a keyframe boundary may be missed.
+///
+/// # Safety
+/// Same requirements as `seek_track_cursor`.
+pub unsafe fn seek_track_cursor_with_held(
+    data: &KazuMIDIParserData,
+    track_idx: u16,
+    target_tick: u32,
+) -> (TrackCursor, [Option<(u32, u8)>; 128]) {
+    let mut held: [Option<(u32, u8)>; 128] = [None; 128];
+
+    let mut cursor = match unsafe { init_track_cursor(data, track_idx) } {
+        Some(c) => c,
+        None => {
+            return (
+                TrackCursor {
+                    track_index: track_idx,
+                    p: std::ptr::null(),
+                    end: std::ptr::null(),
+                    abs_tick: 0,
+                    running_status: 0,
+                    status: 0,
+                    param1: 0,
+                    param2: 0,
+                    is_tempo: false,
+                    tempo_val: 0,
+                    has_event: false,
+                    skip_next_delta: false,
+                },
+                held,
+            );
+        }
+    };
+
+    if cursor.p.is_null() {
+        return (cursor, held);
+    }
+
+    unsafe {
+        let kc = *data.keyframe_counts.add(track_idx as usize);
+        if kc > 0 {
+            let kf_ptr = *data.keyframes.add(track_idx as usize);
+            let mut best = 0;
+            for j in 0..kc {
+                let kf = &*kf_ptr.add(j);
+                if kf.abs_tick <= target_tick {
+                    best = j;
+                } else {
+                    break;
+                }
+            }
+            let best_kf = &*kf_ptr.add(best);
+            let track_start_offset = *data.track_index.add(track_idx as usize);
+            cursor.p = data.raw.add(track_start_offset + best_kf.raw_offset);
+            cursor.abs_tick = best_kf.abs_tick;
+            cursor.running_status = best_kf.running_status;
+            cursor.skip_next_delta = true;
+        }
+
+        // Walk to the target, tracking note on/off so we know what is held.
+        while cursor_next(&mut cursor) {
+            if cursor.is_tempo {
+                continue;
+            }
+            if cursor.abs_tick >= target_tick {
+                break;
+            }
+            let msg_type = cursor.status & 0xF0;
+            let key = cursor.param1 as usize;
+            if key < 128 {
+                if msg_type == 0x90 && cursor.param2 > 0 {
+                    held[key] = Some((cursor.abs_tick, cursor.status & 0x0F));
+                } else if msg_type == 0x80 || (msg_type == 0x90 && cursor.param2 == 0) {
+                    held[key] = None;
+                }
+            }
+        }
+        if cursor.abs_tick < target_tick {
+            cursor.has_event = false;
+        }
+    }
+
+    (cursor, held)
+}
+
 #[inline]
 pub fn tick_to_ns(data: &KazuMIDIParserData, tick: u32) -> u64 {
     if data.tempo_count == 0 {

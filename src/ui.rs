@@ -34,6 +34,9 @@ pub fn draw_seek_bar(
     playback_position_ns: u64,
     duration_ns: u64,
     input_event: Option<InputEvent>,
+    // Note-generation progress (furthest generated tick / whole MIDI), 0..1.
+    // Drawn as a colored span under the playback fill so the scan is visible.
+    gen_frac: Option<f32>,
 ) -> bool {
     let seek_bar_bg_color = if is_loading {
         Color::DARKGRAY
@@ -44,6 +47,20 @@ pub fn draw_seek_bar(
     d.draw_rectangle(x as i32, y as i32, w as i32, h as i32, seek_bar_bg_color);
 
     if is_midi_loaded && !is_loading {
+        // Note-generation span, under the playback fill.
+        if let Some(frac) = gen_frac {
+            crate::ui_components::progress_bar::draw_progress_bar(
+                d,
+                x,
+                y,
+                w,
+                h,
+                &[(0.0, frac, Color::new(70, 90, 150, 255))],
+                None,
+                Color::new(0, 0, 0, 0),
+            );
+        }
+
         // Playback progress
         let current_position_ns = playback_position_ns;
         let fill = ((current_position_ns as f32 / duration_ns as f32) * w) as i32;
@@ -178,9 +195,8 @@ pub fn draw_loading_overlay(
                 bar_y,
                 bar_w,
                 bar_h,
-                progress_value,
+                &[(0.0, progress_value, Color::new(0, 120, 215, (255.0 * eased_t) as u8))],
                 Some(&progress_text),
-                Color::new(0, 120, 215, (255.0 * eased_t) as u8),
                 Color::new(80, 80, 80, (255.0 * eased_t) as u8),
             );
         }
@@ -214,6 +230,8 @@ pub fn draw_settings_overlay(
     scrollbar_drag_start_y: &mut f32,
     scrollbar_drag_start_scroll: &mut f32,
     pb_multiplier_slider_dragging: &mut bool,
+    scan_delay_ms: &mut u32,
+    scan_delay_slider_dragging: &mut bool,
 ) -> bool {
     // Ease-out cubic: 1 - (1 - t)^3
     let eased_t = 1.0 - (1.0 - alpha_factor).powi(3);
@@ -269,6 +287,7 @@ pub fn draw_settings_overlay(
     if *pitch_bend_override {
         measure_layout.next(38.0);
     }
+    measure_layout.next(38.0); // Scan Delay slider (debug)
     let content_height = measure_layout.content_height(20.0);
     let max_scroll = f32::max(content_height - viewport_height, 0.0);
 
@@ -516,6 +535,51 @@ pub fn draw_settings_overlay(
                             *pitch_bend_multiplier = (new_t * 126.0 + 1.0).round() as u8;
                         } else {
                             *pb_multiplier_slider_dragging = false;
+                        }
+                    }
+                }
+            }
+
+            // Scan Delay slider (debug): artificially slow the piano-roll scan.
+            const SCAN_DELAY_MAX: f32 = 1000.0; // milliseconds
+            {
+                let y = layout.next(38.0);
+                if is_visible(sy(y), 38.0) {
+                    let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
+                    let label = format!("Scan Delay: {} ms", *scan_delay_ms);
+                    d_scissor.draw_text_ex(
+                        &font,
+                        &label,
+                        Vector2::new(slider_rect.x, sy(y)),
+                        16.0,
+                        1.0,
+                        text_color,
+                    );
+                    d_scissor.draw_rectangle(
+                        slider_rect.x as i32,
+                        (slider_rect.y + 8.0) as i32,
+                        slider_rect.width as i32,
+                        4,
+                        Color::new(80, 80, 80, (255.0 * eased_t) as u8),
+                    );
+                    let t = (*scan_delay_ms as f32 / SCAN_DELAY_MAX).clamp(0.0, 1.0);
+                    let thumb_x = slider_rect.x + t * slider_rect.width;
+                    let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
+                    d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
+
+                    if let Some(cp) = click_pos {
+                        if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
+                            *scan_delay_slider_dragging = true;
+                        }
+                    }
+
+                    if *scan_delay_slider_dragging {
+                        if is_mouse_down {
+                            let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
+                            let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
+                            *scan_delay_ms = (new_t * SCAN_DELAY_MAX).round() as u32;
+                        } else {
+                            *scan_delay_slider_dragging = false;
                         }
                     }
                 }
