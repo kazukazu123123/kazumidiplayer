@@ -12,7 +12,7 @@ use crate::kazumidiparser_cursor::{
     cursor_next, ns_to_tick, seek_track_cursor_with_held, tick_to_ns, TrackCursor,
 };
 use crate::ui_components::piano_keyboard::get_keyboard_note_regions;
-use crate::utils::get_note_color_by_track_channel;
+use crate::utils::get_note_color_by_index;
 
 /// How much of the future is visible, when the vertical axis is time based.
 const VISIBLE_SPAN_NS: u64 = 3_000_000_000; // 3 seconds
@@ -31,15 +31,20 @@ const REFERENCE_HEIGHT: f32 = 150.0;
 const OPEN_END: u32 = u32::MAX;
 
 /// A single note rectangle in tick space (resolved to pixels at draw time).
-/// `track`/`channel` drive the per-voice color. `end_tick == OPEN_END` means the
-/// note is still being held (note-off not scanned yet).
+/// `color` is the palette index for the per-voice color (see
+/// `utils::note_color_index`). `end_tick == OPEN_END` means the note is still being
+/// held (note-off not scanned yet).
+///
+/// Packed to 9 bytes (vs 12 with the full track/channel + a redundant note byte)
+/// to keep dense-MIDI buckets small; the key is the bucket index, so it isn't
+/// stored per note. Fields are only ever read/written by value, never by
+/// reference, which is sound for `repr(packed)`.
 #[derive(Clone, Copy)]
+#[repr(packed)]
 pub struct RollNote {
-    pub note: u8,
     pub start_tick: u32,
     pub end_tick: u32,
-    pub track: u16,
-    pub channel: u8,
+    pub color: u8,
 }
 
 /// Generated piano-roll draw data (start of MIDI -> end), filled in progressively
@@ -292,8 +297,9 @@ fn run_scan(
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
 
     // Pending appends and end-patches, flushed together on publish (appends first,
-    // so a patch can target a note appended in the same batch).
-    let mut batch: Vec<RollNote> = Vec::new();
+    // so a patch can target a note appended in the same batch). The `u8` is the
+    // destination key (bucket index); it routes the note but isn't stored per note.
+    let mut batch: Vec<(u8, RollNote)> = Vec::new();
     let mut patches: Vec<(u8, u32, u32)> = Vec::new();
 
     for ti in 0..num_tracks {
@@ -305,13 +311,14 @@ fn run_scan(
             if let Some((s, ch)) = slot {
                 let idx = appended[key];
                 appended[key] += 1;
-                batch.push(RollNote {
-                    note: key as u8,
-                    start_tick: *s,
-                    end_tick: OPEN_END,
-                    track: ti as u16,
-                    channel: *ch,
-                });
+                batch.push((
+                    key as u8,
+                    RollNote {
+                        start_tick: *s,
+                        end_tick: OPEN_END,
+                        color: crate::utils::note_color_index(ti as u16, *ch),
+                    },
+                ));
                 pending[ti][key] = Some(idx);
             }
         }
@@ -329,7 +336,7 @@ fn run_scan(
 
     // Flush queued appends + patches and advance the frontier. Returns false if a
     // newer generation took over (caller should abandon the scan).
-    let publish = |batch: &mut Vec<RollNote>,
+    let publish = |batch: &mut Vec<(u8, RollNote)>,
                    patches: &mut Vec<(u8, u32, u32)>,
                    frontier: u32|
      -> bool {
@@ -337,8 +344,8 @@ fn run_scan(
         if g.generation != generation {
             return false;
         }
-        for n in batch.drain(..) {
-            g.notes_by_key[n.note as usize].push(n);
+        for (key, n) in batch.drain(..) {
+            g.notes_by_key[key as usize].push(n);
         }
         for (key, idx, end) in patches.drain(..) {
             if let Some(slot) = g.notes_by_key[key as usize].get_mut(idx as usize) {
@@ -423,13 +430,14 @@ fn run_scan(
                     }
                     let idx = appended[key];
                     appended[key] += 1;
-                    batch.push(RollNote {
-                        note: key as u8,
-                        start_tick: tick,
-                        end_tick: OPEN_END,
-                        track: ti as u16,
-                        channel,
-                    });
+                    batch.push((
+                        key as u8,
+                        RollNote {
+                            start_tick: tick,
+                            end_tick: OPEN_END,
+                            color: crate::utils::note_color_index(ti as u16, channel),
+                        },
+                    ));
                     pending[ti][key] = Some(idx);
                 } else if msg_type == 0x80 || (msg_type == 0x90 && cur.param2 == 0) {
                     if let Some(idx) = pending[ti][key].take() {
@@ -476,8 +484,8 @@ fn run_scan(
         if g.generation != generation {
             return;
         }
-        for n in batch.drain(..) {
-            g.notes_by_key[n.note as usize].push(n);
+        for (key, n) in batch.drain(..) {
+            g.notes_by_key[key as usize].push(n);
         }
         for (key, idx, end) in patches.drain(..) {
             if let Some(slot) = g.notes_by_key[key as usize].get_mut(idx as usize) {
@@ -612,8 +620,12 @@ pub fn draw_piano_roll_chunk(
             if n.end_tick < current_tick {
                 continue;
             }
-            let s = n.start_tick.max(current_tick);
-            let e = n.end_tick.min(effective_top);
+            // Copy out of the packed struct by value before use.
+            let start_tick = n.start_tick;
+            let end_tick = n.end_tick;
+            let color = n.color;
+            let s = start_tick.max(current_tick);
+            let e = end_tick.min(effective_top);
             if e <= s {
                 continue;
             }
@@ -623,7 +635,7 @@ pub fn draw_piano_roll_chunk(
                 &mut col,
                 y_top,
                 y_bottom,
-                pack(get_note_color_by_track_channel(n.track, n.channel)),
+                pack(get_note_color_by_index(color)),
             );
         }
 

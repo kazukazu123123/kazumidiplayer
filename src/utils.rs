@@ -5,14 +5,18 @@ pub fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// Get note color based on track + channel
-pub fn get_note_color_by_track_channel(track_index: u16, channel: u8) -> (u8, u8, u8) {
+// Fold a (track, channel) pair into a single 0..255 color-palette index. This is
+// all the color depends on, so it can be stored as one byte per note instead of
+// keeping the full track (u16) + channel (u8).
+pub fn note_color_index(track_index: u16, channel: u8) -> u8 {
     // 256-color palette (16 tracks x 16 channels = 256 combinations)
     let track_idx = if track_index == u16::MAX { 0 } else { track_index as usize };
-    let channel_idx = channel as usize;
+    ((track_idx * 16 + channel as usize) % 256) as u8
+}
 
-    // Generate hash value to create a unique color
-    let combined_index = (track_idx * 16 + channel_idx) % 256;
+// Get note color from a palette index (see `note_color_index`).
+pub fn get_note_color_by_index(index: u8) -> (u8, u8, u8) {
+    let combined_index = index as usize;
 
     // Generate color in HSV color space (vary hue)
     let hue = (combined_index as f32 * 360.0 / 256.0) % 360.0;
@@ -20,6 +24,11 @@ pub fn get_note_color_by_track_channel(track_index: u16, channel: u8) -> (u8, u8
     let value = 0.8 + ((combined_index % 2) as f32 * 0.15);
 
     hsv_to_rgb(hue, saturation, value)
+}
+
+// Get note color based on track + channel.
+pub fn get_note_color_by_track_channel(track_index: u16, channel: u8) -> (u8, u8, u8) {
+    get_note_color_by_index(note_color_index(track_index, channel))
 }
 
 // Convert HSV to RGB

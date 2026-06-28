@@ -473,20 +473,21 @@ fn main() {
                         // one with the latest start: that is the note drawn on top in
                         // the piano roll (later notes overwrite earlier ones), so the
                         // key shows the same color as the topmost overlapping note.
-                        let mut chosen: Option<&piano_roll::RollNote> = None;
+                        let mut chosen: Option<u8> = None;
                         let mut i = lo;
                         while let Some(n) = bucket.get(i) {
-                            if n.start_tick > current_tick {
+                            // Copy out of the packed struct by value.
+                            let start_tick = n.start_tick;
+                            if start_tick > current_tick {
                                 break;
                             }
                             if n.end_tick > current_tick {
-                                chosen = Some(n);
+                                chosen = Some(n.color);
                             }
                             i += 1;
                         }
-                        if let Some(n) = chosen {
-                            let (r, g, b) =
-                                utils::get_note_color_by_track_channel(n.track, n.channel);
+                        if let Some(color) = chosen {
+                            let (r, g, b) = utils::get_note_color_by_index(color);
                             let o = note * 4;
                             hit_pixels[o] = r;
                             hit_pixels[o + 1] = g;
