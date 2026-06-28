@@ -228,6 +228,8 @@ fn main() {
     // The chunk covers the whole MIDI (tick 0 -> end), so it only needs to be
     // regenerated when the file itself changes; seeks and stops reuse it.
     let mut piano_roll_req_data: Option<std::sync::Arc<kazumidiparser::MIDIPlayerData>> = None;
+    // Per-key forward-scan cursors for the draw, persisted across frames.
+    let mut piano_roll_draw_state = piano_roll::PianoRollDrawState::new();
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -847,6 +849,7 @@ fn main() {
                                             app_state.is_tick_based,
                                             app_state.note_speed,
                                             chunk,
+                                            &mut piano_roll_draw_state,
                                         );
                                     });
                                 }

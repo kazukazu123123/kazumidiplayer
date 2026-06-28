@@ -67,6 +67,33 @@ impl Default for RollChunk {
     }
 }
 
+/// Per-key forward cursor for the draw, kept across frames. Each `cursor[key]` is
+/// the lowest bucket index from which notes can still be visible; it advances past
+/// notes that have fully ended so the draw doesn't re-scan the whole (possibly
+/// huge) bucket from index 0 every frame. Reset on rewind or when the chunk is
+/// regenerated (a new file changes the buckets/indices).
+pub struct PianoRollDrawState {
+    cursor: [u32; 128],
+    last_current_tick: u32,
+    last_generation: u64,
+}
+
+impl Default for PianoRollDrawState {
+    fn default() -> Self {
+        Self {
+            cursor: [0; 128],
+            last_current_tick: 0,
+            last_generation: u64::MAX,
+        }
+    }
+}
+
+impl PianoRollDrawState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 struct RollRequest {
     data: Arc<MIDIPlayerData>,
     start_tick: u32,
@@ -475,8 +502,18 @@ pub fn draw_piano_roll_chunk(
     is_tick_based: bool,
     note_speed: f32,
     chunk: &RollChunk,
+    state: &mut PianoRollDrawState,
 ) {
     let current_tick = ns_to_tick(data, playback_position_ns);
+
+    // Reset the per-key forward cursors on rewind or when the chunk was rebuilt
+    // (new file -> different buckets/indices); otherwise they only advance.
+    if current_tick < state.last_current_tick || chunk.generation != state.last_generation {
+        state.cursor = [0; 128];
+    }
+    state.last_current_tick = current_tick;
+    state.last_generation = chunk.generation;
+
     let speed = note_speed.max(0.01);
     let bottom = area.y + area.height;
     let height = area.height;
@@ -552,13 +589,26 @@ pub fn draw_piano_roll_chunk(
             *slot = 0;
         }
 
-        for n in bucket {
+        // Advance this key's forward cursor past notes that have fully ended, so we
+        // start scanning near the currently-visible range instead of from index 0.
+        // We stop at the first note still alive (end >= now); every note before it
+        // has ended, so none are visible and skipping them is safe (long notes are
+        // preserved because their end keeps them alive). The cursor only moves
+        // forward, so this is amortized cheap across frames.
+        let mut lo = state.cursor[note] as usize;
+        while lo < bucket.len() && bucket[lo].end_tick < current_tick {
+            lo += 1;
+        }
+        state.cursor[note] = lo as u32;
+
+        for n in &bucket[lo..] {
             // The bucket is start-sorted, so once a note starts above the view the
             // rest do too.
             if n.start_tick > effective_top {
                 break;
             }
-            // Held notes carry OPEN_END; clamping below grows them to the frontier.
+            // A short note after a long one may still be past; skip it. Held notes
+            // carry OPEN_END; clamping below grows them to the frontier.
             if n.end_tick < current_tick {
                 continue;
             }
