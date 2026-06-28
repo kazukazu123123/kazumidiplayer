@@ -281,6 +281,7 @@ impl AppState {
         window: &window_manager::Window,
         keyboard_shader: &mut Shader,
         layout_texture: &Texture2D,
+        hit_texture: &Texture2D,
         override_rect: Option<Rectangle>,
     ) {
         let (wx, wy, ww, wh) = if let Some(r) = override_rect {
@@ -293,14 +294,25 @@ impl AppState {
             (x, y, w, h)
         };
 
+        let loc_hit = keyboard_shader.get_shader_location("hit_data_texture");
         let loc_playback_y = keyboard_shader.get_shader_location("playback_y");
         let loc_valid = keyboard_shader.get_shader_location("is_texture_valid");
         let loc_kb_mode = keyboard_shader.get_shader_location("u_kb_mode");
 
-        // No note data is available; render the static keyboard layout only.
-        keyboard_shader.set_shader_value(loc_valid, 0.0f32);
+        // Feed the per-key hit texture so the shader lights up sounding keys. The
+        // texture is 128x1, so the sampled row (`playback_y`) is always 0. The hit
+        // sampler must live on texture unit 1; binding it via the manual rlgl slot
+        // calls below avoids clobbering texture0 (the layout) bound by the draw.
+        keyboard_shader.set_shader_value(loc_valid, 1.0f32);
         keyboard_shader.set_shader_value(loc_playback_y, 0.0f32);
         keyboard_shader.set_shader_value(loc_kb_mode, 1.0f32);
+        // Safety: rlgl FFI that manipulate the active GL texture slot. `hit_texture.id`
+        // is a valid GL texture owned by raylib for the duration of this call.
+        unsafe {
+            raylib::ffi::rlActiveTextureSlot(1);
+            raylib::ffi::rlEnableTexture(hit_texture.id);
+        }
+        keyboard_shader.set_shader_value(loc_hit, 1i32);
 
         {
             let mut d_shader = d.begin_shader_mode(keyboard_shader);
@@ -321,6 +333,14 @@ impl AppState {
 
         keyboard_shader.set_shader_value(loc_kb_mode, 0.0f32);
         keyboard_shader.set_shader_value(loc_valid, 0.0f32);
+
+        // Safety: unbind the hit texture from slot 1 and restore the active slot to
+        // 0 so subsequent draws are unaffected.
+        unsafe {
+            raylib::ffi::rlActiveTextureSlot(1);
+            raylib::ffi::rlDisableTexture();
+            raylib::ffi::rlActiveTextureSlot(0);
+        }
     }
 
     pub fn draw_keyboard_channels(

@@ -141,6 +141,10 @@ impl PlayerHandle {
             let duration_clone = duration_ns_for_thread;
             let current_parse_cancellation_token_clone = current_parse_cancellation_token_for_thread;
             let active_notes_clone = active_notes_for_thread;
+            // Per-key count of currently-held note-ons (across all tracks/channels).
+            // A key clears only when this drops to 0, so overlapping notes on the
+            // same key (unisons/doublings) don't blank it out on the first note-off.
+            let mut active_count = [0u16; 128];
 
             let mut player = MIDIPlayer::new(
                 kdmapi_for_thread,
@@ -163,6 +167,7 @@ impl PlayerHandle {
                             player.send_all_notes_off();
                             player.state = PlayerState::Paused;
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                         }
                         PlayerCommand::Stop => {
                             player.send_all_notes_off();
@@ -170,6 +175,7 @@ impl PlayerHandle {
                             player.seek_position_ns = 0;
                             player.reset_tracks();
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                             *lock_mutex(&pitch_bend_clone) = [8192; 16];
                         }
                         PlayerCommand::Seek(pos) => {
@@ -186,6 +192,7 @@ impl PlayerHandle {
                                 Instant::now() - Duration::from_nanos(latest_pos);
                             player.seek_tracks(latest_pos);
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                             *lock_mutex(&pitch_bend_clone) = [8192; 16];
 
                             position_clone.store(player.seek_position_ns, Ordering::SeqCst);
@@ -199,6 +206,7 @@ impl PlayerHandle {
                             player.state = PlayerState::Loading;
                             state_clone.store(PlayerState::Loading as u32, Ordering::SeqCst);
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                             *lock_mutex(&pitch_bend_clone) = [8192; 16];
                             // 古い MIDI データを即座に解放
                             *lock_mutex(&current_midi_data_for_thread) = None;
@@ -300,6 +308,7 @@ impl PlayerHandle {
 
                             player.state = PlayerState::Stopped;
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                             let _ = tx_main_feedback_for_thread
                                 .send(PlayerFeedback::ParseCancelled);
                         }
@@ -325,6 +334,7 @@ impl PlayerHandle {
 
                             player.state = PlayerState::Stopped;
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                             let _ = tx_main_feedback_for_thread
                                 .send(PlayerFeedback::ParseFailed(path));
                         }
@@ -374,14 +384,19 @@ impl PlayerHandle {
                                         {
                                             let mut guard = lock_mutex(&active_notes_clone);
                                             if track.pend_p1 < 128 {
+                                                let key = track.pend_p1 as usize;
                                                 let msg_type = track.pend_status & 0xF0;
                                                 if msg_type == 0x90 && track.pend_p2 > 0 {
-                                                    guard[track.pend_p1 as usize] =
+                                                    active_count[key] += 1;
+                                                    guard[key] =
                                                         Some((track.cursor.track_index, track.pend_status & 0x0F));
                                                 } else if msg_type == 0x80
                                                     || (msg_type == 0x90 && track.pend_p2 == 0)
                                                 {
-                                                    guard[track.pend_p1 as usize] = None;
+                                                    active_count[key] = active_count[key].saturating_sub(1);
+                                                    if active_count[key] == 0 {
+                                                        guard[key] = None;
+                                                    }
                                                 }
                                             }
                                         }
@@ -423,14 +438,19 @@ impl PlayerHandle {
                                     {
                                         let mut guard = lock_mutex(&active_notes_clone);
                                         if track.cursor.param1 < 128 {
+                                            let key = track.cursor.param1 as usize;
                                             let msg_type = track.cursor.status & 0xF0;
                                             if msg_type == 0x90 && track.cursor.param2 > 0 {
-                                                guard[track.cursor.param1 as usize] =
+                                                active_count[key] += 1;
+                                                guard[key] =
                                                     Some((track.cursor.track_index, track.cursor.status & 0x0F));
                                             } else if msg_type == 0x80
                                                 || (msg_type == 0x90 && track.cursor.param2 == 0)
                                             {
-                                                guard[track.cursor.param1 as usize] = None;
+                                                active_count[key] = active_count[key].saturating_sub(1);
+                                                if active_count[key] == 0 {
+                                                    guard[key] = None;
+                                                }
                                             }
                                         }
                                     }
@@ -460,6 +480,7 @@ impl PlayerHandle {
                             player.state = PlayerState::Stopped;
                             player.send_all_notes_off();
                             *lock_mutex(&active_notes_clone) = [None; 128];
+                            active_count = [0u16; 128];
                         }
                     }
                 }

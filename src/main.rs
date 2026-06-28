@@ -217,6 +217,15 @@ fn main() {
         .expect("Failed to create keyboard layout texture");
     keyboard_layout_texture.set_texture_filter(&thread, TextureFilter::TEXTURE_FILTER_POINT);
 
+    // Per-key "hit" data for the keyboard shader: a 128x1 texture where column
+    // `note` holds the active voice's color (alpha 255) when that key is sounding,
+    // or transparent when idle. Updated each frame from the player's active notes.
+    let keyboard_hit_image = Image::gen_image_color(128, 1, Color::BLANK);
+    let mut keyboard_hit_texture = rl
+        .load_texture_from_image(&thread, &keyboard_hit_image)
+        .expect("Failed to create keyboard hit texture");
+    keyboard_hit_texture.set_texture_filter(&thread, TextureFilter::TEXTURE_FILTER_POINT);
+
     let mut current_layout_width = 800;
     let mut current_layout_height = 80;
     let mut last_integrate_keyboard = app_state.integrate_keyboard;
@@ -230,6 +239,12 @@ fn main() {
     let mut piano_roll_req_data: Option<std::sync::Arc<kazumidiparser::MIDIPlayerData>> = None;
     // Per-key forward-scan cursors for the draw, persisted across frames.
     let mut piano_roll_draw_state = piano_roll::PianoRollDrawState::new();
+    // Keyboard-highlight forward cursors: which note (if any) is sounding on each
+    // key at the current playback tick. Position-based, so it works the same during
+    // play, pause and stop. Reset on rewind or when the chunk is rebuilt.
+    let mut kb_hl_cursor = [0u32; 128];
+    let mut kb_hl_last_tick = 0u32;
+    let mut kb_hl_last_gen = u64::MAX;
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -426,11 +441,69 @@ fn main() {
         // Push the debug scan-delay knob to the worker.
         piano_roll_worker.set_scan_delay_ms(app_state.scan_delay_ms);
 
+        // Refresh the keyboard hit texture from the notes sounding at the current
+        // playback tick (position-based, derived from the piano-roll chunk). This
+        // behaves identically during play, pause and stop, and handles overlapping
+        // same-key notes. Per-key forward cursors keep it cheap on dense MIDI.
+        {
+            let mut hit_pixels = [0u8; 128 * 4];
+            if let Some(data) = engine.get_midi_data() {
+                // Safety: as_ptr() yields a valid pointer for this call.
+                let parser_data = unsafe { &*data.as_ptr() };
+                let current_tick =
+                    kazumidiparser_cursor::ns_to_tick(parser_data, playback_position_ns);
+                piano_roll_worker.with_chunk(|chunk| {
+                    // Reset the cursors on rewind or when the chunk was rebuilt.
+                    if current_tick < kb_hl_last_tick || chunk.generation != kb_hl_last_gen {
+                        kb_hl_cursor = [0u32; 128];
+                    }
+                    kb_hl_last_tick = current_tick;
+                    kb_hl_last_gen = chunk.generation;
+
+                    for note in 0..128usize {
+                        let bucket = &chunk.notes_by_key[note];
+                        // Advance past notes that have already ended.
+                        let mut lo = kb_hl_cursor[note] as usize;
+                        while lo < bucket.len() && bucket[lo].end_tick <= current_tick {
+                            lo += 1;
+                        }
+                        kb_hl_cursor[note] = lo as u32;
+
+                        // Among notes covering `now` (start <= now < end), pick the
+                        // one with the latest start: that is the note drawn on top in
+                        // the piano roll (later notes overwrite earlier ones), so the
+                        // key shows the same color as the topmost overlapping note.
+                        let mut chosen: Option<&piano_roll::RollNote> = None;
+                        let mut i = lo;
+                        while let Some(n) = bucket.get(i) {
+                            if n.start_tick > current_tick {
+                                break;
+                            }
+                            if n.end_tick > current_tick {
+                                chosen = Some(n);
+                            }
+                            i += 1;
+                        }
+                        if let Some(n) = chosen {
+                            let (r, g, b) =
+                                utils::get_note_color_by_track_channel(n.track, n.channel);
+                            let o = note * 4;
+                            hit_pixels[o] = r;
+                            hit_pixels[o + 1] = g;
+                            hit_pixels[o + 2] = b;
+                            hit_pixels[o + 3] = 255;
+                        }
+                    }
+                });
+            }
+            let _ = keyboard_hit_texture.update_texture(&hit_pixels);
+        }
+
         // Mouse-wheel anywhere (when no overlay is open) adjusts note scroll speed.
         // Multiplicative steps give smooth, symmetric zoom in/out; clamped.
         if wheel != 0.0 && !app_state.overlay_manager.blocks_input() {
             app_state.note_speed =
-                (app_state.note_speed * 1.1_f32.powf(wheel)).clamp(0.1, 12.0);
+                (app_state.note_speed * 1.1_f32.powf(wheel)).clamp(0.01, 12.0);
         }
 
         // Handle keyboard shortcuts only when overlay is completely closed
@@ -864,6 +937,7 @@ fn main() {
                                     window,
                                     &mut piano_keyboard_shader,
                                     &keyboard_layout_texture,
+                                    &keyboard_hit_texture,
                                     Some(keyboard_rect),
                                 );
                             }
@@ -1017,6 +1091,7 @@ fn main() {
                                 window,
                                 &mut piano_keyboard_shader,
                                 &keyboard_layout_texture,
+                                &keyboard_hit_texture,
                                 Some(Rectangle::new(cx, cy, cw, ch)),
                             );
                         }
