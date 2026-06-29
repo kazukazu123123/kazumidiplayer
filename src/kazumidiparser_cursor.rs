@@ -363,14 +363,19 @@ pub fn tick_to_ns(data: &KazuMIDIParserData, tick: u32) -> u64 {
     if data.tempo_count == 0 {
         return 0;
     }
-    let mut i = 0;
     unsafe {
-        while i + 1 < data.tempo_count {
-            if *data.tempo_tick.add(i + 1) > tick {
-                break;
+        // Largest i with tempo_tick[i] <= tick (tempo_tick is ascending).
+        let mut lo = 0usize;
+        let mut hi = data.tempo_count;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if *data.tempo_tick.add(mid) <= tick {
+                lo = mid;
+            } else {
+                hi = mid;
             }
-            i += 1;
         }
+        let i = lo;
         let base_ns = *data.tempo_ns.add(i);
         let base_tick = *data.tempo_tick.add(i);
         let tempo = *data.tempo_val.add(i);
@@ -388,14 +393,19 @@ pub fn ns_to_tick(data: &KazuMIDIParserData, ns: u64) -> u32 {
     if data.tempo_count == 0 || ns == 0 {
         return 0;
     }
-    let mut i = 0;
     unsafe {
-        while i + 1 < data.tempo_count {
-            if *data.tempo_ns.add(i + 1) > ns {
-                break;
+        // Largest i with tempo_ns[i] <= ns (tempo_ns is ascending).
+        let mut lo = 0usize;
+        let mut hi = data.tempo_count;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if *data.tempo_ns.add(mid) <= ns {
+                lo = mid;
+            } else {
+                hi = mid;
             }
-            i += 1;
         }
+        let i = lo;
         let base_ns = *data.tempo_ns.add(i);
         let base_tick = *data.tempo_tick.add(i);
         let tempo = *data.tempo_val.add(i);

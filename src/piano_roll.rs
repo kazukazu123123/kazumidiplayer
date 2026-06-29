@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::kazumidiparser_cursor::{
-    cursor_next, ns_to_tick, seek_track_cursor_with_held, tick_to_ns, TrackCursor,
+    cursor_next, ns_to_tick, seek_track_cursor_with_held, TrackCursor,
 };
 use crate::ui_components::piano_keyboard::get_keyboard_note_regions;
 use crate::utils::get_note_color_by_index;
@@ -545,14 +545,36 @@ pub fn draw_piano_roll_chunk(
         let current_ns = playback_position_ns;
         let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
         let top_tick = ns_to_tick(data, current_ns.saturating_add(span_ns));
-        let data_ptr = data as *const KazuMIDIParserData;
+        // Invert tick->ns once per pixel row instead of per note edge. row_tick[r]
+        // is the tick at the top boundary of local pixel row r (r=0 is the top /
+        // furthest future, larger r is lower / closer to now); the array is
+        // non-increasing. Mapping a note tick to y is then a binary search with no
+        // per-note tempo-map walk or 128-bit division.
+        let top_y = area.y;
+        let rows = (height.ceil() as usize).max(1) + 1;
+        let mut row_tick = vec![0u32; rows];
+        for (r, slot) in row_tick.iter_mut().enumerate() {
+            let y = top_y + r as f32;
+            let progress = ((bottom - y) / height).clamp(0.0, 1.0);
+            let ns = current_ns.saturating_add((progress * span_ns as f32) as u64);
+            *slot = ns_to_tick(data, ns);
+        }
         (
             top_tick,
             Box::new(move |tick: u32| {
-                // Safety: `data` outlives this closure (same call).
-                let ns = tick_to_ns(unsafe { &*data_ptr }, tick);
-                let progress = ns.saturating_sub(current_ns) as f32 / span_ns as f32;
-                bottom - progress.min(1.0) * height
+                // First row whose tick boundary is <= tick (row_tick is
+                // non-increasing): the pixel where this tick lands.
+                let mut lo = 0usize;
+                let mut hi = row_tick.len();
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if row_tick[mid] > tick {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                top_y + lo as f32
             }),
         )
     };
