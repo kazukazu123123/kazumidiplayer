@@ -29,6 +29,7 @@ pub enum PlayerCommand {
     SetPitchBendOverride(bool),
     SetPitchBendMultiplier(u8),
     SetUnlimitedOutput(bool),
+    SetSpeed(f32),
 }
 
 pub enum PlayerFeedback {
@@ -64,6 +65,8 @@ pub struct PlayerHandle {
     pitch_bend_override: Arc<AtomicBool>,
     pitch_bend_multiplier: Arc<AtomicU8>,
     unlimited_output: Arc<AtomicBool>,
+    // Playback speed as f32 bits (1.0 = normal). Scales wall-clock -> song time.
+    playback_speed: Arc<AtomicU32>,
 }
 
 impl Clone for PlayerHandle {
@@ -80,6 +83,7 @@ impl Clone for PlayerHandle {
             pitch_bend_override: self.pitch_bend_override.clone(),
             pitch_bend_multiplier: self.pitch_bend_multiplier.clone(),
             unlimited_output: self.unlimited_output.clone(),
+            playback_speed: self.playback_speed.clone(),
         }
     }
 }
@@ -101,6 +105,7 @@ impl PlayerHandle {
         let pitch_bend_override = Arc::new(AtomicBool::new(false));
         let pitch_bend_multiplier = Arc::new(AtomicU8::new(12));
         let unlimited_output = Arc::new(AtomicBool::new(false));
+        let playback_speed = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -130,6 +135,7 @@ impl PlayerHandle {
         let pitch_bend_override_for_thread = pitch_bend_override.clone();
         let pitch_bend_multiplier_for_thread = pitch_bend_multiplier.clone();
         let unlimited_output_for_thread = unlimited_output.clone();
+        let playback_speed_for_thread = playback_speed.clone();
 
         thread::spawn(move || {
             let pitch_bend_override_clone = pitch_bend_override_for_thread;
@@ -141,6 +147,10 @@ impl PlayerHandle {
             let duration_clone = duration_ns_for_thread;
             let current_parse_cancellation_token_clone = current_parse_cancellation_token_for_thread;
             let active_notes_clone = active_notes_for_thread;
+            let playback_speed_clone = playback_speed_for_thread;
+            // Wall-clock -> song-time speed actually applied to `playback_start`.
+            // When the requested speed changes we re-anchor `playback_start`.
+            let mut applied_speed = 1.0f32;
             // Per-key count of currently-held note-ons (across all tracks/channels).
             // A key clears only when this drops to 0, so overlapping notes on the
             // same key (unisons/doublings) don't blank it out on the first note-off.
@@ -160,8 +170,8 @@ impl PlayerHandle {
                     match cmd {
                         PlayerCommand::Play => {
                             player.state = PlayerState::Playing;
-                            playback_start = Instant::now()
-                                - Duration::from_nanos(player.seek_position_ns);
+                            applied_speed = read_speed(&playback_speed_clone);
+                            playback_start = anchor_start(player.seek_position_ns, applied_speed);
                         }
                         PlayerCommand::Pause => {
                             player.send_all_notes_off();
@@ -188,8 +198,8 @@ impl PlayerHandle {
 
                             player.send_all_notes_off();
                             player.seek_position_ns = latest_pos;
-                            playback_start =
-                                Instant::now() - Duration::from_nanos(latest_pos);
+                            applied_speed = read_speed(&playback_speed_clone);
+                            playback_start = anchor_start(latest_pos, applied_speed);
                             player.seek_tracks(latest_pos);
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
@@ -242,6 +252,10 @@ impl PlayerHandle {
                         }
                         PlayerCommand::SetUnlimitedOutput(enabled) => {
                             player.unlimited_output.store(enabled, Ordering::SeqCst);
+                        }
+                        PlayerCommand::SetSpeed(speed) => {
+                            let clamped = speed.clamp(0.05, 4.0);
+                            playback_speed_clone.store(clamped.to_bits(), Ordering::Relaxed);
                         }
                     }
                 }
@@ -347,7 +361,15 @@ impl PlayerHandle {
 
                 if player.state == PlayerState::Playing {
                     if let Some(data) = &player.data {
-                        let elapsed_ns = playback_start.elapsed().as_nanos() as u64;
+                        // If the requested speed changed, re-anchor playback_start so the
+                        // current song position stays continuous, then apply the new rate.
+                        let requested_speed = read_speed(&playback_speed_clone);
+                        if requested_speed != applied_speed {
+                            playback_start = anchor_start(player.seek_position_ns, requested_speed);
+                            applied_speed = requested_speed;
+                        }
+                        let elapsed_ns =
+                            (playback_start.elapsed().as_nanos() as f64 * applied_speed as f64) as u64;
                         player.seek_position_ns = elapsed_ns;
 
                         let cur_tick =
@@ -509,6 +531,7 @@ impl PlayerHandle {
             pitch_bend_override,
             pitch_bend_multiplier,
             unlimited_output,
+            playback_speed,
         }
     }
 
@@ -526,6 +549,10 @@ impl PlayerHandle {
 
     pub fn set_unlimited_output(&self, enabled: bool) {
         let _ = self.tx_command.send(PlayerCommand::SetUnlimitedOutput(enabled));
+    }
+
+    pub fn set_speed(&self, speed: f32) {
+        let _ = self.tx_command.send(PlayerCommand::SetSpeed(speed));
     }
 
     pub fn get_midi_data(&self) -> Option<Arc<kazumidiparser::MIDIPlayerData>> {
@@ -770,6 +797,18 @@ fn send_midi_event_with_override(
 
     let midi_msg = status as u32 | ((out_p1 as u32) << 8) | ((out_p2 as u32) << 16);
     stream.send_direct_data(midi_msg);
+}
+
+/// Read the requested playback speed, clamped to the supported range.
+fn read_speed(speed: &Arc<AtomicU32>) -> f32 {
+    f32::from_bits(speed.load(Ordering::Relaxed)).clamp(0.05, 4.0)
+}
+
+/// Wall-clock anchor such that `anchor.elapsed() * speed == position_ns`, i.e. the
+/// instant that maps to song position 0 at the given speed.
+fn anchor_start(position_ns: u64, speed: f32) -> Instant {
+    let back_ns = (position_ns as f64 / speed as f64) as u64;
+    Instant::now() - Duration::from_nanos(back_ns)
 }
 
 

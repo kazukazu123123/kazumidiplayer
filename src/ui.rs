@@ -88,6 +88,10 @@ pub fn draw_media_controls(
     y_offset: f32,
     input_event: Option<InputEvent>,
     mouse_pos: Option<Vector2>,
+    is_mouse_down: bool,
+    playback_speed: &mut f32,
+    speed_slider_dragging: &mut bool,
+    content_right: f32,
 ) {
     let button_w = 80.0;
     let button_h = 30.0;
@@ -134,6 +138,58 @@ pub fn draw_media_controls(
         d, stop_rect, "Stop", 18, can_stop, 1.0, click_pos, mouse_pos,
     ) {
         tx.send(PlayerCommand::Stop).ok();
+    }
+
+    // Playback speed slider: starts right after the transport buttons and stretches
+    // to fill the remaining content width, so it grows/shrinks with the window.
+    const SPEED_MIN: f32 = 0.05;
+    const SPEED_MAX: f32 = 4.0;
+    let buttons_right = stop_rect.x + button_w + spacing;
+    let slider_x = buttons_right;
+    let slider_w = (content_right - slider_x).max(40.0);
+    let track_y = y_offset + 18.0;
+    let text_color = Color::new(230, 230, 230, 255);
+
+    d.draw_text(
+        format!("{:.2}x", *playback_speed).as_str(),
+        slider_x as i32,
+        y_offset as i32,
+        14,
+        text_color,
+    );
+    d.draw_rectangle(
+        slider_x as i32,
+        track_y as i32,
+        slider_w as i32,
+        4,
+        Color::new(80, 80, 80, 255),
+    );
+    let t = ((*playback_speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)).clamp(0.0, 1.0);
+    let thumb_x = slider_x + t * slider_w;
+    let thumb_rect = Rectangle::new(thumb_x - 5.0, track_y - 6.0, 10.0, 16.0);
+    d.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, 255));
+
+    let hit_rect = Rectangle::new(slider_x, track_y - 6.0, slider_w, 16.0);
+    if let Some(cp) = click_pos {
+        if thumb_rect.check_collision_point_rec(cp) || hit_rect.check_collision_point_rec(cp) {
+            *speed_slider_dragging = true;
+        }
+    }
+    if *speed_slider_dragging {
+        if is_mouse_down {
+            if let Some(mp) = mouse_pos {
+                let clamped_x = mp.x.clamp(slider_x, slider_x + slider_w);
+                let new_t = (clamped_x - slider_x) / slider_w;
+                let mut v = SPEED_MIN + new_t * (SPEED_MAX - SPEED_MIN);
+                v = (v / 0.05).round() * 0.05;
+                if (v - 1.0).abs() < 0.08 {
+                    v = 1.0;
+                }
+                *playback_speed = v.clamp(SPEED_MIN, SPEED_MAX);
+            }
+        } else {
+            *speed_slider_dragging = false;
+        }
     }
 }
 

@@ -109,7 +109,7 @@ fn main() {
     let piano_roll_window_handle = window_manager.new_window("Piano Roll", 50, 50, 128, 150);
     window_manager.set_window_min_size(piano_roll_window_handle, Some(100), Some(80));
 
-    let controls_window_handle = window_manager.new_window("Player Controls", 50, 250, 280, 110);
+    let controls_window_handle = window_manager.new_window("Player Controls", 50, 250, 350, 110);
     window_manager.set_window_min_size(controls_window_handle, Some(280), Some(110));
     window_manager.set_window_max_size(controls_window_handle, None, Some(110));
 
@@ -1045,6 +1045,7 @@ fn main() {
                                 app_state.start_seeking(seek_ns, &engine);
                             }
 
+                            let prev_speed = app_state.playback_speed;
                             ui::draw_media_controls(
                                 &mut d_scissor,
                                 &tx_commands_to_player,
@@ -1057,7 +1058,14 @@ fn main() {
                                 cy + 70.0,
                                 current_event,
                                 ui_mouse_pos,
+                                is_mouse_down,
+                                &mut app_state.playback_speed,
+                                &mut app_state.speed_slider_dragging,
+                                cx + cw - 10.0,
                             );
+                            if app_state.playback_speed != prev_speed {
+                                engine.set_speed(app_state.playback_speed);
+                            }
 
                             // Drag handling does not draw, so it can stay inside the scissor block.
                             if app_state.is_dragging_seek

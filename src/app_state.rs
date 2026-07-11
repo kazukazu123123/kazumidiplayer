@@ -28,6 +28,8 @@ pub struct AppState {
     pub note_speed: f32,
     /// Debug: artificial piano-roll scan delay in milliseconds (slider-controlled).
     pub scan_delay_ms: u32,
+    /// Playback speed multiplier (0.05–4.0, slider-controlled; 1.0 = normal).
+    pub playback_speed: f32,
     pub tick_map: Option<Vec<(u64, u32, u64)>>,
     pub midi_data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub last_seek_sent_ns: Option<u64>,
@@ -55,6 +57,7 @@ pub struct AppState {
     pub settings_scrollbar_drag_start_scroll: f32,
     pub settings_pb_multiplier_slider_dragging: bool,
     pub settings_scan_delay_slider_dragging: bool,
+    pub speed_slider_dragging: bool,
 
     // --- Editor ---
     pub editor_text: String,
@@ -118,6 +121,7 @@ impl AppState {
             is_tick_based: false,
             note_speed: 1.0,
             scan_delay_ms: 0,
+            playback_speed: 1.0,
             tick_map: None,
             midi_data: None,
             last_seek_sent_ns: None,
@@ -145,6 +149,7 @@ impl AppState {
             settings_scrollbar_drag_start_scroll: 0.0,
             settings_pb_multiplier_slider_dragging: false,
             settings_scan_delay_slider_dragging: false,
+            speed_slider_dragging: false,
 
             // --- Editor ---
             editor_text: String::new(),
