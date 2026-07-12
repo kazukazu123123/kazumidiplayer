@@ -774,6 +774,12 @@ fn main() {
         }
 
         let mut d = rl.begin_drawing(&thread);
+        // Clear the backbuffer. The final composite blits render_texture shifted by
+        // -canvas_offset, so a strip of width canvas_offset on the right/bottom edge
+        // is left uncovered; without this clear it retains stale pixels from earlier
+        // frames (e.g. the right edge of the top-right stats panel ghosts as the NPS
+        // number changes width).
+        d.clear_background(Color::BLACK);
 
         // Phase 1: Render each window (frame + titlebar + content) into its private RT.
         for &wid in &window_ids {
