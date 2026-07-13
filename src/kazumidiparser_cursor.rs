@@ -306,10 +306,26 @@ pub unsafe fn seek_track_cursor(
     cursor
 }
 
-/// Like `seek_track_cursor`, but also reports the notes still held at
-/// `target_tick`, as `(start_tick, channel)` per key. Notes whose note-on lies
-/// before the keyframe used for the jump are not detected (rare), so very long
-/// notes spanning a keyframe boundary may be missed.
+/// A note that was still sounding when a seek landed mid-note: the key it is on,
+/// the tick it started at, and its channel.
+#[derive(Clone, Copy)]
+pub struct HeldNote {
+    pub key: u8,
+    pub start_tick: u32,
+    pub channel: u8,
+}
+
+/// Like `seek_track_cursor`, but also reports every note still held at
+/// `target_tick`, in note-on order.
+///
+/// Held notes are tracked per (channel, key), and several note-ons may stack on one
+/// of those before any note-off arrives -- routine in dense MIDI, where a key is
+/// struck again while it still rings. Each note-off closes the oldest note still
+/// open on its (channel, key), so overlapping notes survive as separate notes
+/// instead of truncating each other.
+///
+/// Notes whose note-on lies before the keyframe used for the jump are not detected,
+/// so a very long note spanning a keyframe boundary can still be missed.
 ///
 /// # Safety
 /// Same requirements as `seek_track_cursor`.
@@ -317,8 +333,9 @@ pub unsafe fn seek_track_cursor_with_held(
     data: &KazuMIDIParserData,
     track_idx: u16,
     target_tick: u32,
-) -> (TrackCursor, [Option<(u32, u8)>; 128]) {
-    let mut held: [Option<(u32, u8)>; 128] = [None; 128];
+) -> (TrackCursor, Vec<HeldNote>) {
+    // Open notes per key, in note-on order, each with the channel that opened it.
+    let mut open: [Vec<(u32, u8)>; 128] = std::array::from_fn(|_| Vec::new());
 
     let mut cursor = match unsafe { init_track_cursor(data, track_idx) } {
         Some(c) => c,
@@ -339,13 +356,13 @@ pub unsafe fn seek_track_cursor_with_held(
                     skip_next_delta: false,
                     header_checked: false,
                 },
-                held,
+                Vec::new(),
             );
         }
     };
 
     if cursor.p.is_null() {
-        return (cursor, held);
+        return (cursor, Vec::new());
     }
 
     unsafe {
@@ -362,10 +379,16 @@ pub unsafe fn seek_track_cursor_with_held(
             let msg_type = cursor.status & 0xF0;
             let key = cursor.param1 as usize;
             if key < 128 {
+                let channel = cursor.status & 0x0F;
                 if msg_type == 0x90 && cursor.param2 > 0 {
-                    held[key] = Some((cursor.abs_tick, cursor.status & 0x0F));
+                    open[key].push((cursor.abs_tick, channel));
                 } else if msg_type == 0x80 || (msg_type == 0x90 && cursor.param2 == 0) {
-                    held[key] = None;
+                    // Close the oldest note still open on this channel and key. A
+                    // note-off carries no way to say which of several stacked notes
+                    // it ends, so oldest-first is the convention.
+                    if let Some(pos) = open[key].iter().position(|&(_, ch)| ch == channel) {
+                        open[key].remove(pos);
+                    }
                 }
             }
         }
@@ -373,6 +396,19 @@ pub unsafe fn seek_track_cursor_with_held(
             cursor.has_event = false;
         }
     }
+
+    // Flatten, oldest note-on first, so the caller can append them in start order.
+    let mut held: Vec<HeldNote> = Vec::new();
+    for (key, notes) in open.iter().enumerate() {
+        for &(start_tick, channel) in notes {
+            held.push(HeldNote {
+                key: key as u8,
+                start_tick,
+                channel,
+            });
+        }
+    }
+    held.sort_by_key(|n| n.start_tick);
 
     (cursor, held)
 }

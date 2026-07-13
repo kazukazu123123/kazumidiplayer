@@ -1,5 +1,6 @@
 use kazumidiparser::{KazuMIDIParserData, MIDIPlayerData};
 use raylib::prelude::*;
+use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -374,13 +375,21 @@ fn run_scan(
     let end_tick = parser.max_tick;
     let num_tracks = parser.header.tracks as usize;
 
-    // Per-track, per-key: the absolute index of the still-open note on that key, so
-    // the note-off can patch its end. Independent per track so one track's note-off
-    // never closes another track's note on the same key. `NO_PENDING` is the
-    // "nothing held" sentinel (cheaper than `Option<u64>`, which would double the
-    // size of this track-by-key table on MIDIs with thousands of tracks).
-    const NO_PENDING: u64 = u64::MAX;
-    let mut pending: Vec<[u64; 128]> = vec![[NO_PENDING; 128]; num_tracks];
+    // Notes that are open (note-on seen, note-off not yet), keyed by the triple that
+    // identifies a voice: track, channel, key. The value is a queue of the absolute
+    // indices of every note currently ringing on that voice, oldest first, so a
+    // note-off can patch the right one's end.
+    //
+    // Several note-ons stack on one voice all the time in dense MIDI: a key is struck
+    // again while it still rings, and the note-offs arrive later. Keeping only the
+    // latest (and closing the previous one on re-trigger) chopped those notes into
+    // stubs, which is what made the roll disagree with what was actually playing.
+    //
+    // A map rather than a track-by-key table: the table ignored channel entirely, and
+    // sizing one per (track, channel, key) would run to tens of megabytes on a MIDI
+    // with thousands of tracks. Only open notes are held here, of which there are at
+    // most a few tens of thousands.
+    let mut open: FxHashMap<(u16, u8, u8), VecDeque<u64>> = FxHashMap::default();
     // Running count of notes ever appended to each key (published + queued in the
     // current batch), i.e. the absolute index the next appended note will take.
     // Absolute, not a queue position: retiring pops notes off the front, so queue
@@ -404,18 +413,19 @@ fn run_scan(
         // reports notes already held at `start_tick`, so notes spanning the seek
         // point still render.
         let (cur, held) = unsafe { seek_track_cursor_with_held(parser, ti as u16, start_tick) };
-        for (key, slot) in held.iter().enumerate() {
-            if let Some((s, ch)) = slot {
-                let idx = appended[key];
-                appended[key] += 1;
-                batch[key].push(RollNote {
-                    start_tick: *s,
-                    end_tick: OPEN_END,
-                    color: crate::utils::note_color_index(ti as u16, *ch),
-                });
-                staged += 1;
-                pending[ti][key] = idx;
-            }
+        for note in held {
+            let key = note.key as usize;
+            let idx = appended[key];
+            appended[key] += 1;
+            batch[key].push(RollNote {
+                start_tick: note.start_tick,
+                end_tick: OPEN_END,
+                color: crate::utils::note_color_index(ti as u16, note.channel),
+            });
+            staged += 1;
+            open.entry((ti as u16, note.channel, note.key))
+                .or_default()
+                .push_back(idx);
         }
         if cur.has_event && !cur.is_tempo && cur.abs_tick <= end_tick {
             heap.push(Reverse((cur.abs_tick, ti)));
@@ -557,11 +567,8 @@ fn run_scan(
             if key < 128 {
                 let channel = cur.status & 0x0F;
                 if msg_type == 0x90 && cur.param2 > 0 {
-                    // Re-trigger on a still-held key: close the previous note here.
-                    let held = std::mem::replace(&mut pending[ti][key], NO_PENDING);
-                    if held != NO_PENDING {
-                        patches.push((key as u8, held, tick));
-                    }
+                    // A re-trigger does not end the note already ringing: it stacks on
+                    // top of it. Both stay open until their own note-offs arrive.
                     let idx = appended[key];
                     appended[key] += 1;
                     batch[key].push(RollNote {
@@ -570,11 +577,17 @@ fn run_scan(
                         color: crate::utils::note_color_index(ti as u16, channel),
                     });
                     staged += 1;
-                    pending[ti][key] = idx;
+                    open.entry((ti as u16, channel, key as u8))
+                        .or_default()
+                        .push_back(idx);
                 } else if msg_type == 0x80 || (msg_type == 0x90 && cur.param2 == 0) {
-                    let held = std::mem::replace(&mut pending[ti][key], NO_PENDING);
-                    if held != NO_PENDING {
-                        patches.push((key as u8, held, tick));
+                    // Close the oldest note still ringing on this voice. A note-off
+                    // carries no way to say which of several stacked notes it ends,
+                    // so oldest-first is the convention.
+                    if let Some(queue) = open.get_mut(&(ti as u16, channel, key as u8)) {
+                        if let Some(idx) = queue.pop_front() {
+                            patches.push((key as u8, idx, tick));
+                        }
                     }
                 }
             }
@@ -622,12 +635,10 @@ fn run_scan(
         }
     }
 
-    // Notes still held at the end extend to the final tick.
-    for track_pending in pending.iter() {
-        for (key, idx) in track_pending.iter().enumerate() {
-            if *idx != NO_PENDING {
-                patches.push((key as u8, *idx, end_tick));
-            }
+    // Notes still ringing at the end extend to the final tick.
+    for ((_, _, key), queue) in open.iter() {
+        for idx in queue.iter() {
+            patches.push((*key, *idx, end_tick));
         }
     }
 
