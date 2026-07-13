@@ -65,6 +65,9 @@ pub enum AppOverlay {
     Settings,
     Loading,
     TextEditor,
+    /// The player thread died. Nothing the app can do will work from here, so this
+    /// one is terminal: it is never closed, and it swallows all input.
+    PlayerCrashed,
 }
 
 pub struct AppState {
@@ -329,6 +332,23 @@ impl AppState {
         }
     }
 
+    /// The player thread has died: commands are going nowhere, the position and state
+    /// it publishes are frozen, and nothing here can revive it. Tear the session down
+    /// to something inert and raise the terminal overlay, rather than leaving a UI that
+    /// looks alive and answers nothing.
+    pub fn enter_player_crashed(&mut self) {
+        self.is_loading = false;
+        self.parse_toast = None;
+        self.current_progress = None;
+        self.reset_parse_progress();
+        self.is_dragging_seek = false;
+        self.last_seek_sent_ns = None;
+        self.midi_data = None;
+        self.tick_map = None;
+        self.last_state = PlayerState::Stopped;
+        self.overlay_manager.open(AppOverlay::PlayerCrashed);
+    }
+
     fn reset_parse_progress(&mut self) {
         self.current_progress = None;
         self.parse_rate_samples.clear();
@@ -369,6 +389,11 @@ impl AppState {
         path: &str,
         tx_commands: &mpsc::Sender<PlayerCommand>,
     ) {
+        // With the player gone the load command has no reader; accepting the file would
+        // only spin the loading overlay forever.
+        if self.overlay_manager.current_kind() == Some(AppOverlay::PlayerCrashed) {
+            return;
+        }
         self.is_loading = true;
         self.is_dragging_seek = false;
         self.last_seek_sent_ns = None;

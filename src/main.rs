@@ -439,14 +439,26 @@ fn main() {
         };
         let mouse_pos = Vector2::new(mouse_point.x as f32, mouse_point.y as f32);
 
-        // Update overlay manager
+        // Update overlay manager. The crash overlay wins over everything and is never
+        // taken back down: once the player thread is gone the session is over, and any
+        // other overlay would only offer controls that no longer do anything.
+        let player_crashed =
+            app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::PlayerCrashed);
+        if !engine.is_alive() && !player_crashed {
+            app_state.enter_player_crashed();
+        }
+
         let is_processing = app_state.current_progress.is_some();
-        if is_loading || is_processing {
-            app_state
-                .overlay_manager
-                .open(app_state::AppOverlay::Loading);
-        } else if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::Loading) {
-            app_state.overlay_manager.close();
+        if !player_crashed && engine.is_alive() {
+            if is_loading || is_processing {
+                app_state
+                    .overlay_manager
+                    .open(app_state::AppOverlay::Loading);
+            } else if app_state.overlay_manager.current_kind()
+                == Some(app_state::AppOverlay::Loading)
+            {
+                app_state.overlay_manager.close();
+            }
         }
         app_state.overlay_manager.update(dt);
         app_state.update_parse_toast(dt);
@@ -1124,7 +1136,7 @@ fn main() {
                                 let clamped_mouse_x =
                                     local_mouse.x.clamp(seek_x, seek_x + seek_w);
                                 let t = (clamped_mouse_x - seek_x) / seek_w;
-                                let seek_ns = (t * duration_ns as f32) as u64;
+                                let seek_ns = (t as f64 * duration_ns as f64) as u64;
                                 app_state.start_seeking(seek_ns, &engine);
                             }
 
@@ -1161,7 +1173,7 @@ fn main() {
                                     let clamped_mouse_x =
                                         local_mouse.x.clamp(seek_x, seek_x + seek_w);
                                     let t = (clamped_mouse_x - seek_x) / seek_w;
-                                    let seek_ns = (t * duration_ns as f32) as u64;
+                                    let seek_ns = (t as f64 * duration_ns as f64) as u64;
                                     app_state.update_seek_preview(
                                         seek_ns,
                                         &engine,
@@ -1471,6 +1483,9 @@ fn main() {
                             piano_keyboard_window_handle,
                             !app_state.integrate_keyboard,
                         );
+                    }
+                    app_state::AppOverlay::PlayerCrashed => {
+                        ui::draw_player_crashed_overlay(d, screen_width, screen_height, fade_t);
                     }
                     app_state::AppOverlay::Loading => {
                         // Once the parse is done the toast owns the panel and carries it to

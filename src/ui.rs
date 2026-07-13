@@ -63,7 +63,10 @@ pub fn draw_seek_bar(
 
         // Playback progress
         let current_position_ns = playback_position_ns;
-        let fill = ((current_position_ns as f32 / duration_ns as f32) * w) as i32;
+        // f64 throughout: an f32 only carries ~7 significant digits, so on a MIDI
+        // hours long the nanosecond counts round to millisecond-sized steps and the
+        // bar moves in visible jumps.
+        let fill = ((current_position_ns as f64 / duration_ns as f64) * w as f64) as i32;
         d.draw_rectangle(x as i32, y as i32, fill, h as i32, Color::GREEN);
 
         // Check for seek initiation
@@ -230,6 +233,46 @@ pub fn draw_loading_overlay(
 }
 
 /// Draws the parse panel body. `alpha_factor` (0..1) scales every color's alpha, and
+/// The terminal panel shown when the player thread has died. It offers no action
+/// because there is none: the thread is gone, and every command the UI could send
+/// would be dropped on the floor. It exists so the app says what happened instead of
+/// going quiet and ignoring clicks.
+pub fn draw_player_crashed_overlay(
+    d: &mut RaylibDrawHandle,
+    screen_width: i32,
+    screen_height: i32,
+    fade_t: f32,
+) {
+    let a = |v: f32| (v * fade_t.clamp(0.0, 1.0)) as u8;
+
+    let w = 520.0f32.min(screen_width as f32 - 40.0);
+    let h = 150.0;
+    let x = (screen_width as f32 - w) / 2.0;
+    let y = (screen_height as f32 - h) / 2.0;
+    let panel = Rectangle::new(x, y, w, h);
+
+    d.draw_rectangle_rec(panel, Color::new(40, 20, 22, a(245.0)));
+    d.draw_rectangle_lines_ex(panel, 1.0, Color::new(220, 70, 70, a(255.0)));
+
+    let title = Color::new(255, 110, 110, a(255.0));
+    let body = Color::new(225, 215, 215, a(255.0));
+    d.draw_text("Player thread crashed", x as i32 + 20, y as i32 + 22, 24, title);
+    d.draw_text(
+        "Playback, seeking and loading no longer work.",
+        x as i32 + 20,
+        y as i32 + 62,
+        18,
+        body,
+    );
+    d.draw_text(
+        "Restart the app. The panic is printed on the console.",
+        x as i32 + 20,
+        y as i32 + 88,
+        18,
+        body,
+    );
+}
+
 /// `camera` decides where and at what scale it lands.
 pub fn draw_loading_panel(
     d: &mut RaylibDrawHandle,

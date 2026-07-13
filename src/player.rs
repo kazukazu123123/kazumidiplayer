@@ -54,6 +54,18 @@ pub(crate) struct TrackState {
 // All fields are trivially Copy/Send.
 unsafe impl Send for TrackState {}
 
+/// Clears its flag when dropped, which for the player thread happens only if that
+/// thread unwinds: its loop never returns. A dead player thread silently swallows
+/// every command, so without this the app just stops responding to play, seek and
+/// even file loads with no indication why.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct PlayerHandle {
     tx_command: Sender<PlayerCommand>,
     state: Arc<AtomicU32>,
@@ -70,6 +82,8 @@ pub struct PlayerHandle {
     playback_speed: Arc<AtomicU32>,
     // Running note-on count, used to derive NPS in the stats overlay.
     notes_played: Arc<AtomicU64>,
+    // False once the player thread has unwound; see `AliveGuard`.
+    alive: Arc<AtomicBool>,
 }
 
 impl Clone for PlayerHandle {
@@ -88,6 +102,7 @@ impl Clone for PlayerHandle {
             unlimited_output: self.unlimited_output.clone(),
             playback_speed: self.playback_speed.clone(),
             notes_played: self.notes_played.clone(),
+            alive: self.alive.clone(),
         }
     }
 }
@@ -111,6 +126,7 @@ impl PlayerHandle {
         let unlimited_output = Arc::new(AtomicBool::new(false));
         let playback_speed = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let notes_played = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -142,6 +158,7 @@ impl PlayerHandle {
         let unlimited_output_for_thread = unlimited_output.clone();
         let playback_speed_for_thread = playback_speed.clone();
         let notes_played_for_thread = notes_played.clone();
+        let alive_for_thread = alive.clone();
 
         thread::spawn(move || {
             let pitch_bend_override_clone = pitch_bend_override_for_thread;
@@ -155,10 +172,22 @@ impl PlayerHandle {
             let active_notes_clone = active_notes_for_thread;
             let playback_speed_clone = playback_speed_for_thread;
             let notes_played_clone = notes_played_for_thread;
+            // Dropped only if this thread panics, flagging the handle as dead.
+            let _alive_guard = AliveGuard(alive_for_thread);
             // Running count of every note-on triggered, used to derive NPS.
             let mut notes_played_count: u64 = 0;
-            // Wall-clock -> song-time speed actually applied to `playback_start`.
-            // When the requested speed changes we re-anchor `playback_start`.
+            // Song time runs from an anchor: `playback_base_ns` is the position the
+            // anchor instant maps to, and time since then is scaled by the speed.
+            //
+            //     position = playback_base_ns + playback_start.elapsed() * applied_speed
+            //
+            // Re-anchoring (on play, seek, or a speed change) sets the base to the
+            // current position and restarts the clock. It used to instead back-date the
+            // anchor to the instant that mapped to position 0, but on Windows an
+            // `Instant` cannot precede boot, so seeking deep into a long file at a slow
+            // speed would push the anchor before it and panic.
+            let mut playback_base_ns: u64 = 0;
+            // Wall-clock -> song-time speed actually applied since the anchor.
             let mut applied_speed = 1.0f32;
             // Per-key count of currently-held note-ons (across all tracks/channels).
             // A key clears only when this drops to 0, so overlapping notes on the
@@ -180,7 +209,8 @@ impl PlayerHandle {
                         PlayerCommand::Play => {
                             player.state = PlayerState::Playing;
                             applied_speed = read_speed(&playback_speed_clone);
-                            playback_start = anchor_start(player.seek_position_ns, applied_speed);
+                            playback_base_ns = player.seek_position_ns;
+                            playback_start = Instant::now();
                         }
                         PlayerCommand::Pause => {
                             player.send_all_notes_off();
@@ -208,7 +238,8 @@ impl PlayerHandle {
                             player.reset_playback_state();
                             player.seek_position_ns = latest_pos;
                             applied_speed = read_speed(&playback_speed_clone);
-                            playback_start = anchor_start(latest_pos, applied_speed);
+                            playback_base_ns = latest_pos;
+                            playback_start = Instant::now();
                             player.seek_tracks(latest_pos);
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
@@ -304,6 +335,7 @@ impl PlayerHandle {
 
                             *lock_mutex(&pitch_bend_clone) = [8192; 16];
 
+                            playback_base_ns = player.seek_position_ns;
                             playback_start = Instant::now();
                             player.state = PlayerState::Paused;
 
@@ -375,16 +407,17 @@ impl PlayerHandle {
 
                 if player.state == PlayerState::Playing {
                     if let Some(data) = &player.data {
-                        // If the requested speed changed, re-anchor playback_start so the
-                        // current song position stays continuous, then apply the new rate.
+                        // If the requested speed changed, re-anchor at the current position
+                        // so song time stays continuous, then apply the new rate.
                         let requested_speed = read_speed(&playback_speed_clone);
                         if requested_speed != applied_speed {
-                            playback_start = anchor_start(player.seek_position_ns, requested_speed);
+                            playback_base_ns = player.seek_position_ns;
+                            playback_start = Instant::now();
                             applied_speed = requested_speed;
                         }
-                        let elapsed_ns =
+                        let since_anchor_ns =
                             (playback_start.elapsed().as_nanos() as f64 * applied_speed as f64) as u64;
-                        player.seek_position_ns = elapsed_ns;
+                        player.seek_position_ns = playback_base_ns.saturating_add(since_anchor_ns);
 
                         let cur_tick =
                             // Safety: data.as_ptr() returns a valid pointer to the C MIDI struct
@@ -555,7 +588,14 @@ impl PlayerHandle {
             unlimited_output,
             playback_speed,
             notes_played,
+            alive,
         }
+    }
+
+    /// False once the player thread has died. Commands sent to a dead player are
+    /// silently dropped, so the UI must say so rather than appear merely stuck.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     pub fn send(&self, cmd: PlayerCommand) {
@@ -855,11 +895,5 @@ fn read_speed(speed: &Arc<AtomicU32>) -> f32 {
     f32::from_bits(speed.load(Ordering::Relaxed)).clamp(0.05, 4.0)
 }
 
-/// Wall-clock anchor such that `anchor.elapsed() * speed == position_ns`, i.e. the
-/// instant that maps to song position 0 at the given speed.
-fn anchor_start(position_ns: u64, speed: f32) -> Instant {
-    let back_ns = (position_ns as f64 / speed as f64) as u64;
-    Instant::now() - Duration::from_nanos(back_ns)
-}
 
 
