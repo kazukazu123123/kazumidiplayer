@@ -98,12 +98,20 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     )
 }
 
+/// `MM:SS.mmm`, or `H:MM:SS.mmm` once past an hour. The hour field only appears when
+/// there is one, so the common case is not padded with a leading `00:`, and minutes
+/// stay two digits rather than running to `61:` and beyond.
 pub fn format_time(ns: u64) -> String {
     let total_seconds = ns / 1_000_000_000;
-    let minutes = total_seconds / 60;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
     let seconds = total_seconds % 60;
     let millis = (ns % 1_000_000_000) / 1_000_000;
-    format!("{:02}:{:02}.{:03}", minutes, seconds, millis)
+    if hours > 0 {
+        format!("{}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+    } else {
+        format!("{:02}:{:02}.{:03}", minutes, seconds, millis)
+    }
 }
 
 /// Group a count into thousands, e.g. `1234567` -> `1,234,567`.
