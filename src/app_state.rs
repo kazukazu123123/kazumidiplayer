@@ -88,7 +88,7 @@ pub struct AppState {
     pub note_speed: f32,
     /// Debug: artificial piano-roll scan delay in milliseconds (slider-controlled).
     pub scan_delay_ms: u32,
-    /// Playback speed multiplier (0.05–4.0, slider-controlled; 1.0 = normal).
+    /// Playback speed multiplier (0.05 to 4.0, slider-controlled; 1.0 = normal).
     pub playback_speed: f32,
     /// Worker threads kazumidiparser uses to parse a file (1..=cpu_threads()).
     pub parse_threads: u32,
