@@ -14,6 +14,12 @@ pub struct TrackCursor {
     pub tempo_val: u32,
     pub has_event: bool,
     pub skip_next_delta: bool,
+    /// Whether the optional "MTrk" header at the cursor's start position has been
+    /// looked for yet. It can only sit at the very first read, but the check used to
+    /// run on every event, costing a 4-byte compare per event across the whole file. It
+    /// also risked a false positive: MIDI data that happens to read as "MTrk"
+    /// mid-track would have skipped 8 bytes of real events.
+    pub header_checked: bool,
 }
 
 /// Read a variable-length value from a MIDI byte stream.
@@ -88,6 +94,7 @@ pub unsafe fn init_track_cursor(data: &KazuMIDIParserData, track_idx: u16) -> Op
             tempo_val: 0,
             has_event: false,
             skip_next_delta: false,
+            header_checked: false,
         })
     }
 }
@@ -100,11 +107,15 @@ pub unsafe fn init_track_cursor(data: &KazuMIDIParserData, track_idx: u16) -> Op
 #[inline]
 pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
     unsafe {
-        // Skip MTrk header if present at track start
-        if c.p.add(4) <= c.end {
-            let sig = std::slice::from_raw_parts(c.p, 4);
-            if sig == b"MTrk" && c.p.add(8) <= c.end {
-                c.p = c.p.add(8);
+        // Skip the MTrk header if the cursor starts on one. Once only: see
+        // `header_checked`.
+        if !c.header_checked {
+            c.header_checked = true;
+            if c.p.add(4) <= c.end {
+                let sig = std::slice::from_raw_parts(c.p, 4);
+                if sig == b"MTrk" && c.p.add(8) <= c.end {
+                    c.p = c.p.add(8);
+                }
             }
         }
         while c.p < c.end {
@@ -198,6 +209,48 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
     }
 }
 
+/// Jump a cursor to the last keyframe at or before `target_tick`, so the walk to
+/// the target starts near it instead of at the head of the track. Keyframes are in
+/// ascending tick order, so this is a binary search: a linear scan here would cost
+/// (tracks x keyframes) per seek and get slower the later in the file you land.
+///
+/// No-op when the track has no keyframes (the cursor then walks from the start).
+///
+/// # Safety
+/// - `data` must be valid and `track_idx` within bounds.
+/// - `cursor` must belong to `track_idx` and be freshly initialized.
+unsafe fn jump_to_keyframe(data: &KazuMIDIParserData, cursor: &mut TrackCursor, target_tick: u32) {
+    unsafe {
+        let ti = cursor.track_index as usize;
+        let kc = *data.keyframe_counts.add(ti);
+        if kc == 0 {
+            return;
+        }
+        let kf_ptr = *data.keyframes.add(ti);
+
+        // Largest j with keyframes[j].abs_tick <= target_tick. Keyframe 0 sits at
+        // the track start, so when every keyframe is past the target, j = 0 is the
+        // correct (and safe) place to start.
+        let mut lo = 0usize;
+        let mut hi = kc;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if (*kf_ptr.add(mid)).abs_tick <= target_tick {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+
+        let kf = &*kf_ptr.add(lo);
+        let track_start_offset = *data.track_index.add(ti);
+        cursor.p = data.raw.add(track_start_offset + kf.raw_offset);
+        cursor.abs_tick = kf.abs_tick;
+        cursor.running_status = kf.running_status;
+        cursor.skip_next_delta = true;
+    }
+}
+
 /// Seek a track cursor to the first event at or after the given tick.
 ///
 /// # Safety
@@ -225,6 +278,7 @@ pub unsafe fn seek_track_cursor(
                 tempo_val: 0,
                 has_event: false,
                 skip_next_delta: false,
+                header_checked: false,
             };
         }
     };
@@ -234,25 +288,7 @@ pub unsafe fn seek_track_cursor(
     }
 
     unsafe {
-        let kc = *data.keyframe_counts.add(track_idx as usize);
-        if kc > 0 {
-            let kf_ptr = *data.keyframes.add(track_idx as usize);
-            let mut best = 0;
-            for j in 0..kc {
-                let kf = &*kf_ptr.add(j);
-                if kf.abs_tick <= target_tick {
-                    best = j;
-                } else {
-                    break;
-                }
-            }
-            let best_kf = &*kf_ptr.add(best);
-            let track_start_offset = *data.track_index.add(track_idx as usize);
-            cursor.p = data.raw.add(track_start_offset + best_kf.raw_offset);
-            cursor.abs_tick = best_kf.abs_tick;
-            cursor.running_status = best_kf.running_status;
-            cursor.skip_next_delta = true;
-        }
+        jump_to_keyframe(data, &mut cursor, target_tick);
 
         while cursor_next(&mut cursor) {
             if cursor.is_tempo {
@@ -301,6 +337,7 @@ pub unsafe fn seek_track_cursor_with_held(
                     tempo_val: 0,
                     has_event: false,
                     skip_next_delta: false,
+                    header_checked: false,
                 },
                 held,
             );
@@ -312,25 +349,7 @@ pub unsafe fn seek_track_cursor_with_held(
     }
 
     unsafe {
-        let kc = *data.keyframe_counts.add(track_idx as usize);
-        if kc > 0 {
-            let kf_ptr = *data.keyframes.add(track_idx as usize);
-            let mut best = 0;
-            for j in 0..kc {
-                let kf = &*kf_ptr.add(j);
-                if kf.abs_tick <= target_tick {
-                    best = j;
-                } else {
-                    break;
-                }
-            }
-            let best_kf = &*kf_ptr.add(best);
-            let track_start_offset = *data.track_index.add(track_idx as usize);
-            cursor.p = data.raw.add(track_start_offset + best_kf.raw_offset);
-            cursor.abs_tick = best_kf.abs_tick;
-            cursor.running_status = best_kf.running_status;
-            cursor.skip_next_delta = true;
-        }
+        jump_to_keyframe(data, &mut cursor, target_tick);
 
         // Walk to the target, tracking note on/off so we know what is held.
         while cursor_next(&mut cursor) {

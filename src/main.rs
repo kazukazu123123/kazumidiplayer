@@ -245,21 +245,20 @@ fn main() {
     let mut current_layout_height = 80;
     let mut last_integrate_keyboard = app_state.integrate_keyboard;
 
-    // Background generator for piano-roll draw data. `roll_req_*` track the
-    // coverage we last asked for, so we only re-request when the cached chunk no
-    // longer spans the visible window (advanced past it, seeked back, new file).
+    // Background generator for piano-roll draw data. It streams a sliding window
+    // around the playhead: we raise its lookahead target and retire what playback
+    // has passed every frame, and only regenerate when the window no longer holds
+    // the playhead (new file, or a seek that lands outside it).
     let mut piano_roll_worker = piano_roll::PianoRollWorker::new();
-    // The chunk covers the whole MIDI (tick 0 -> end), so it only needs to be
-    // regenerated when the file itself changes; seeks and stops reuse it.
     let mut piano_roll_req_data: Option<std::sync::Arc<kazumidiparser::MIDIPlayerData>> = None;
-    // Per-key forward-scan cursors for the draw, persisted across frames.
-    let mut piano_roll_draw_state = piano_roll::PianoRollDrawState::new();
-    // Keyboard-highlight forward cursors: which note (if any) is sounding on each
-    // key at the current playback tick. Position-based, so it works the same during
-    // play, pause and stop. Reset on rewind or when the chunk is rebuilt.
-    let mut kb_hl_cursor = [0u32; 128];
-    let mut kb_hl_last_tick = 0u32;
-    let mut kb_hl_last_gen = u64::MAX;
+    // Playhead tick as of the previous frame, used to spot a seek: normal playback
+    // advances by well under a screenful, so a jump backwards or a large jump
+    // forwards means the resident window is stale and must be rebuilt.
+    let mut piano_roll_last_tick = 0u32;
+    // The highest lookahead ceiling this window has ever been given. Notes may exist
+    // anywhere below it, so this is what says whether the window is holding more than
+    // the current zoom needs. How far the scan actually got does not.
+    let mut piano_roll_max_target = 0u32;
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -504,29 +503,16 @@ fn main() {
                 let current_tick =
                     kazumidiparser_cursor::ns_to_tick(parser_data, playback_position_ns);
                 piano_roll_worker.with_chunk(|chunk| {
-                    // Reset the cursors on rewind or when the chunk was rebuilt.
-                    if current_tick < kb_hl_last_tick || chunk.generation != kb_hl_last_gen {
-                        kb_hl_cursor = [0u32; 128];
-                    }
-                    kb_hl_last_tick = current_tick;
-                    kb_hl_last_gen = chunk.generation;
-
                     for note in 0..128usize {
                         let bucket = &chunk.notes_by_key[note];
-                        // Advance past notes that have already ended.
-                        let mut lo = kb_hl_cursor[note] as usize;
-                        while lo < bucket.len() && bucket[lo].end_tick <= current_tick {
-                            lo += 1;
-                        }
-                        kb_hl_cursor[note] = lo as u32;
-
                         // Among notes covering `now` (start <= now < end), pick the
                         // one with the latest start: that is the note drawn on top in
                         // the piano roll (later notes overwrite earlier ones), so the
                         // key shows the same color as the topmost overlapping note.
+                        // The queue front is already the earliest still-live note --
+                        // passed notes are retired, so no cursor is needed.
                         let mut chosen: Option<u8> = None;
-                        let mut i = lo;
-                        while let Some(n) = bucket.get(i) {
+                        for n in bucket.iter() {
                             // Copy out of the packed struct by value.
                             let start_tick = n.start_tick;
                             if start_tick > current_tick {
@@ -535,7 +521,6 @@ fn main() {
                             if n.end_tick > current_tick {
                                 chosen = Some(n.color);
                             }
-                            i += 1;
                         }
                         if let Some(color) = chosen {
                             let (r, g, b) = utils::get_note_color_by_index(color);
@@ -552,10 +537,12 @@ fn main() {
         }
 
         // Mouse-wheel anywhere (when no overlay is open) adjusts note scroll speed.
-        // Multiplicative steps give smooth, symmetric zoom in/out; clamped.
+        // Multiplicative steps give smooth, symmetric zoom in/out. The floor is only
+        // there to keep the arithmetic alive (see MIN_NOTE_SPEED), not to bound how
+        // far out you can zoom.
         if wheel != 0.0 && !app_state.overlay_manager.blocks_input() {
-            app_state.note_speed =
-                (app_state.note_speed * 1.1_f32.powf(wheel)).clamp(0.01, 12.0);
+            app_state.note_speed = (app_state.note_speed * 1.1_f32.powf(wheel))
+                .clamp(piano_roll::MIN_NOTE_SPEED, 12.0);
         }
 
         // Handle keyboard shortcuts only when overlay is completely closed
@@ -943,30 +930,76 @@ fn main() {
                                     // struct, kept alive by the Arc for this call.
                                     let parser_data = unsafe { &*data.as_ptr() };
 
-                                    // Generate once from the very start of the MIDI to its
-                                    // end, and only regenerate when the file itself changes.
-                                    // Because the whole tick range is covered, seeks and stops
-                                    // never need a regeneration. The worker's scan frontier
-                                    // (read in the draw) drives the bottom-to-top reveal.
+                                    let current_tick = kazumidiparser_cursor::ns_to_tick(
+                                        parser_data,
+                                        playback_position_ns,
+                                    );
+                                    // Topmost visible tick, and the span it covers: one
+                                    // screenful. The scan is allowed a little beyond that,
+                                    // which is what bounds the resident window.
+                                    let top_tick = piano_roll::future_tick(
+                                        parser_data,
+                                        playback_position_ns,
+                                        app_state.is_tick_based,
+                                        app_state.note_speed,
+                                        roll_h,
+                                    )
+                                    .min(parser_data.max_tick);
+                                    let span = top_tick.saturating_sub(current_tick).max(1);
+                                    // Generate a little past the top edge, not a lot: the slack
+                                    // only has to cover what playback eats between frames plus
+                                    // the scan's latency. Every extra screenful of lookahead is
+                                    // another screenful of notes resident, which on a dense MIDI
+                                    // is measured in hundreds of megabytes.
+                                    let target = top_tick
+                                        .saturating_add(span / 4)
+                                        .min(parser_data.max_tick);
+
+                                    // Rebuild the window on a new file, or on a seek that lands
+                                    // outside it: backwards (behind what we already retired) or
+                                    // a forward jump the streaming scan can't just walk into.
                                     let data_changed = match &piano_roll_req_data {
                                         Some(d) => !std::sync::Arc::ptr_eq(d, &data),
                                         None => true,
                                     };
-                                    if data_changed {
-                                        // Cancel any in-flight scan and regenerate from tick 0
-                                        // to the end. `top_tick` is the priority target so the
-                                        // visible window shows at once.
-                                        let top_tick = piano_roll::future_tick(
-                                            parser_data,
-                                            playback_position_ns,
-                                            app_state.is_tick_based,
-                                            app_state.note_speed,
-                                            roll_h,
-                                        )
-                                        .min(parser_data.max_tick);
-                                        piano_roll_worker.regenerate(data.clone(), 0, top_tick);
+                                    let seeked = current_tick < piano_roll_last_tick
+                                        || current_tick
+                                            > piano_roll_last_tick.saturating_add(span);
+                                    piano_roll_last_tick = current_tick;
+
+                                    // Zooming in shrinks the visible span, leaving notes generated
+                                    // for the old, wider view sitting far above the screen. They
+                                    // can't be trimmed off the back of the queues (the scan
+                                    // addresses notes by absolute index, and dropping the tail
+                                    // would desync it), so rebuild the window instead. That is
+                                    // cheap now that seeking is a binary search.
+                                    //
+                                    // Compare against the ceiling we authorized, not the frontier
+                                    // the scan reached: on a dense MIDI the scan lags well behind
+                                    // its target, so a frontier test would almost never fire and
+                                    // the stale notes would never be freed. The margin keeps a
+                                    // slider drag from rebuilding every frame: half a screenful of
+                                    // stale notes is tolerated, more than that is thrown away.
+                                    let zoomed_in =
+                                        piano_roll_max_target > target.saturating_add(span / 2);
+
+                                    if data_changed || seeked || zoomed_in {
+                                        piano_roll_worker.regenerate(
+                                            data.clone(),
+                                            current_tick,
+                                            top_tick,
+                                        );
                                         piano_roll_req_data = Some(data.clone());
+                                        // Fresh window: nothing above the new ceiling exists.
+                                        piano_roll_max_target = target;
                                     }
+                                    piano_roll_max_target = piano_roll_max_target.max(target);
+
+                                    // Let the scan run up to `target`, and drop everything
+                                    // playback has already passed. Together these keep only a
+                                    // sliding window of notes in memory.
+                                    piano_roll_worker.set_target_tick(target);
+                                    piano_roll_worker.retire(current_tick);
 
                                     let roll_area = Rectangle::new(cx, cy, cw, roll_h);
                                     // Render every frame from the (possibly still
@@ -980,7 +1013,6 @@ fn main() {
                                             app_state.is_tick_based,
                                             app_state.note_speed,
                                             chunk,
-                                            &mut piano_roll_draw_state,
                                         );
                                     });
                                 }
@@ -1072,16 +1104,10 @@ fn main() {
                             let seek_y = cy + 40.0;
                             let seek_w = cw - 20.0;
                             let seek_h = 20.0;
-                            // Note-generation progress over the whole MIDI.
-                            let gen_frac = if is_midi_loaded && !is_loading {
-                                engine.get_midi_data().map(|data| {
-                                    // Safety: as_ptr() valid for this call.
-                                    let max_tick = unsafe { (*data.as_ptr()).max_tick };
-                                    piano_roll_worker.gen_progress(max_tick).0
-                                })
-                            } else {
-                                None
-                            };
+                            // The roll no longer pre-generates the whole MIDI (it streams a
+                            // window around the playhead), so there is no whole-file
+                            // generation progress to show behind the seek bar.
+                            let gen_frac: Option<f32> = None;
                             if ui::draw_seek_bar(
                                 &mut d_scissor,
                                 seek_x,
