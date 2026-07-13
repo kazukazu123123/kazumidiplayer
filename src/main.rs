@@ -1000,6 +1000,10 @@ fn main() {
                                             data.clone(),
                                             current_tick,
                                             top_tick,
+                                            // A new file: whatever is on screen belongs to the
+                                            // old one and must go, even though that leaves the
+                                            // roll blank until the scan reaches the first notes.
+                                            data_changed,
                                         );
                                         piano_roll_req_data = Some(data.clone());
                                         // Fresh window: nothing above the new ceiling exists.

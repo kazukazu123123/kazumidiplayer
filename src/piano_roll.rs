@@ -289,14 +289,37 @@ impl PianoRollWorker {
     /// window forward from `start_tick`. Call on load, on a seek that lands outside
     /// the resident window, and on a zoom that shrinks it.
     ///
-    /// The visible chunk is left untouched and keeps drawing: the new window is
-    /// built in the other slot and swapped in only once its visible range is
-    /// complete, so a rebuild never blanks the roll.
-    pub fn regenerate(&self, data: Arc<MIDIPlayerData>, start_tick: u32, priority_tick: u32) {
+    /// The visible chunk normally keeps drawing while the new window is built in the
+    /// other slot, and is swapped only once the new one's visible range is complete,
+    /// so a rebuild never blanks the roll. `drop_visible` overrides that: the notes on
+    /// screen belong to a file that is no longer loaded, and showing another MIDI's
+    /// roll for the seconds the scan takes is worse than showing none. Dropping them
+    /// also leaves the scan nothing to protect, so it reveals its window as it fills.
+    pub fn regenerate(
+        &self,
+        data: Arc<MIDIPlayerData>,
+        start_tick: u32,
+        priority_tick: u32,
+        drop_visible: bool,
+    ) {
         let generation = self.latest_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.target_tick.store(priority_tick, Ordering::Relaxed);
 
-        let build_slot = 1 - self.live.load(Ordering::SeqCst);
+        let live_slot = self.live.load(Ordering::SeqCst);
+        let build_slot = 1 - live_slot;
+
+        if drop_visible {
+            let mut g = self.chunks[live_slot].lock().unwrap();
+            for bucket in g.notes_by_key.iter_mut() {
+                bucket.clear();
+                bucket.shrink_to_fit();
+            }
+            g.retired = [0; 128];
+            g.done = false;
+            g.scan_frontier_tick = start_tick;
+            g.window_start_tick = start_tick;
+        }
+
         {
             // Empty the build slot for the new generation. Anything in it is either
             // an abandoned build or the window we swapped out last time.
@@ -368,6 +391,17 @@ fn run_scan(
         }
         old.retired = [0; 128];
         old.done = false;
+    };
+
+    // Whether to show this window as it is built rather than only once its visible
+    // range is complete. Withholding is what makes a seek land in one piece instead
+    // of filling in bottom-to-top, but it only pays when there is already a window on
+    // screen to hold onto. With nothing to show -- a fresh file -- withholding leaves
+    // the roll blank and inert for as long as the scan takes, which on a dense MIDI is
+    // seconds. Then it is better to let it fill: the filling *is* the progress bar.
+    let reveal_progressively = {
+        let live_chunk = chunks[1 - build_slot].lock().unwrap();
+        live_chunk.notes_by_key.iter().all(|b| b.is_empty())
     };
 
     // Safety: the Arc keeps the C MIDI struct alive for this call.
@@ -505,9 +539,10 @@ fn run_scan(
 
         if tick != last_tick {
             if !priority_done {
-                // Visible window: withhold all output (regardless of scan delay)
-                // until it is fully scanned, then publish it in one shot, so a
-                // seek shows the whole visible area instantly.
+                // Visible window: withhold the reveal until it is fully scanned, then
+                // publish it in one shot, so a seek shows the whole visible area at
+                // once. Unless there is nothing on screen to withhold it for, in which
+                // case let it fill in bottom-to-top as it is found.
                 if last_tick >= priority_tick {
                     events_since_publish = 0;
                     if !publish(&mut batch, &mut staged, &mut patches, last_tick) {
@@ -520,6 +555,19 @@ fn run_scan(
                     }
                     priority_done = true;
                     commit(&mut committed);
+                } else if reveal_progressively && events_since_publish >= 2048 {
+                    events_since_publish = 0;
+                    if !publish(&mut batch, &mut staged, &mut patches, last_tick) {
+                        return;
+                    }
+                    // Swap this half-built window in: it is replacing an empty one, so
+                    // there is nothing to lose by showing it early.
+                    commit(&mut committed);
+                    if latest.load(Ordering::SeqCst) != generation
+                        || shutdown.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
                 }
                 last_tick = tick;
             } else {
@@ -620,7 +668,10 @@ fn run_scan(
         // screenful in memory. The frontier is only advanced to the last *complete*
         // tick, so this never reveals a half-scanned one.
         if staged >= MAX_STAGED || patches.len() >= MAX_STAGED {
-            let frontier = if priority_done {
+            // Hold the frontier at the window start while the reveal is being withheld;
+            // publishing `last_tick` there would leak a partial visible window, which is
+            // exactly what the withholding exists to prevent.
+            let frontier = if priority_done || reveal_progressively {
                 last_tick.saturating_sub(1)
             } else {
                 start_tick
