@@ -180,7 +180,7 @@ impl PlayerHandle {
                             active_count = [0u16; 128];
                         }
                         PlayerCommand::Stop => {
-                            player.send_all_notes_off();
+                            player.reset_playback_state();
                             player.state = PlayerState::Stopped;
                             player.seek_position_ns = 0;
                             player.reset_tracks();
@@ -196,7 +196,7 @@ impl PlayerHandle {
                                 }
                             }
 
-                            player.send_all_notes_off();
+                            player.reset_playback_state();
                             player.seek_position_ns = latest_pos;
                             applied_speed = read_speed(&playback_speed_clone);
                             playback_start = anchor_start(latest_pos, applied_speed);
@@ -500,9 +500,10 @@ impl PlayerHandle {
                         let max_ns = tick_to_ns(unsafe { &*data.as_ptr() }, max_tick);
                         if player.seek_position_ns >= max_ns {
                             player.state = PlayerState::Stopped;
-                            player.send_all_notes_off();
+                            player.reset_playback_state();
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
+                            *lock_mutex(&pitch_bend_clone) = [8192; 16];
                         }
                     }
                 }
@@ -624,6 +625,24 @@ impl MIDIPlayer {
         for ch in 0..16u32 {
             self.stream.send_direct_data((0xB0 | ch) | (123 << 8) | (0 << 16));
             self.stream.send_direct_data((0xB0 | ch) | (120 << 8) | (0 << 16));
+        }
+    }
+
+    /// Bring the synth back to a neutral state after a stop or a seek: silence
+    /// everything, reset controllers, and force the pitch wheel back to center.
+    /// All-notes-off alone leaves the wheel wherever the song last bent it, so
+    /// the next notes would sound detuned until that channel's next 0xE0 event.
+    fn reset_playback_state(&mut self) {
+        self.send_all_notes_off();
+        for ch in 0..16u32 {
+            self.stream.send_direct_data((0xB0 | ch) | (121 << 8) | (0 << 16));
+            self.stream.send_direct_data((0xE0 | ch) | (0 << 8) | (64 << 16));
+        }
+        // Reset-all-controllers leaves RPN selection undefined and may drop the
+        // pitch bend sensitivity we programmed, so re-establish both.
+        self.reset_channel_states();
+        if self.pitch_bend_override.load(Ordering::SeqCst) {
+            self.send_pitch_bend_range_override();
         }
     }
 
