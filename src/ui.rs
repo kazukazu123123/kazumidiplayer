@@ -2,7 +2,7 @@ use crate::player::{PlayerCommand, PlayerState};
 use crate::ui_components::button::draw_button;
 use crate::ui_components::scrollbar::draw_scrollbar;
 use crate::ui_components::toggle::draw_toggle;
-use crate::utils::{format_bytes, format_count, format_count_short, format_time};
+use crate::utils::{cubic_bezier, format_bytes, format_count, format_count_short, format_time};
 use crate::window_manager::InputEvent;
 use raylib::prelude::*;
 use std::sync::mpsc::Sender;
@@ -193,6 +193,12 @@ pub fn draw_media_controls(
     }
 }
 
+/// The loading panel's size in its own (unscaled) coordinate space. The panel is drawn
+/// under a caller-supplied camera so the same body can sit centered while parsing and
+/// then fly to the corner as a toast.
+pub const LOADING_PANEL_W: f32 = 400.0;
+pub const LOADING_PANEL_H: f32 = 172.0;
+
 pub fn draw_loading_overlay(
     d: &mut RaylibDrawHandle,
     screen_width: i32,
@@ -206,13 +212,37 @@ pub fn draw_loading_overlay(
     let scale = 0.95 + 0.05 * eased_t;
 
     let camera = Camera2D {
-        target: Vector2::new(200.0, 60.0),
+        target: Vector2::new(LOADING_PANEL_W / 2.0, LOADING_PANEL_H / 2.0),
         offset: Vector2::new(screen_width as f32 / 2.0, screen_height as f32 / 2.0),
         rotation: 0.0,
         zoom: scale,
     };
 
-    let panel_rect = Rectangle::new(0.0, 0.0, 400.0, 148.0);
+    draw_loading_panel(
+        d,
+        camera,
+        eased_t,
+        "Opening MIDI File...",
+        current_progress,
+        parse_bps,
+        parse_eps,
+    );
+}
+
+/// Draws the parse panel body. `alpha_factor` (0..1) scales every color's alpha, and
+/// `camera` decides where and at what scale it lands.
+pub fn draw_loading_panel(
+    d: &mut RaylibDrawHandle,
+    camera: Camera2D,
+    alpha_factor: f32,
+    title: &str,
+    current_progress: &Option<crate::midi_parser_worker::ParseProgress>,
+    parse_bps: f64,
+    parse_eps: f64,
+) {
+    let eased_t = alpha_factor.clamp(0.0, 1.0);
+
+    let panel_rect = Rectangle::new(0.0, 0.0, LOADING_PANEL_W, LOADING_PANEL_H);
     let border_color = Color::new(0, 135, 200, (255.0 * eased_t) as u8);
     let text_color = Color::new(240, 240, 240, (255.0 * eased_t) as u8);
 
@@ -228,7 +258,7 @@ pub fn draw_loading_overlay(
 
         d2d.draw_text_ex(
             &font,
-            "Opening MIDI File...",
+            title,
             Vector2::new(20.0, 20.0),
             20.0,
             spacing,
@@ -269,35 +299,117 @@ pub fn draw_loading_overlay(
 
             let events = progress.events_done;
             let eps = parse_eps.max(0.0) as u64;
-            let sub_color = Color::new(170, 170, 170, (255.0 * eased_t) as u8);
+            let label_color = Color::new(140, 140, 140, (255.0 * eased_t) as u8);
+            let value_color = Color::new(210, 210, 210, (255.0 * eased_t) as u8);
 
-            let lines = [
-                format!(
-                    "Tracks: {}/{}   Events: {} ({})",
-                    progress.tracks_done,
-                    progress.total_tracks,
-                    format_count_short(events),
-                    format_count(events),
+            // 2x2 grid: each stat sits in a fixed cell, so the values line up in two
+            // columns instead of drifting with the width of whatever precedes them.
+            let cells: [(&str, String); 4] = [
+                (
+                    "Tracks",
+                    format!("{} / {}", progress.tracks_done, progress.total_tracks),
                 ),
-                format!(
-                    "Speed:  {}/s   {} ev/s ({}/s)",
-                    format_bytes(parse_bps.max(0.0) as u64),
-                    format_count_short(eps),
-                    format_count(eps),
+                (
+                    "Events",
+                    format!("{} ({})", format_count_short(events), format_count(events)),
+                ),
+                (
+                    "Speed",
+                    format!("{}/s", format_bytes(parse_bps.max(0.0) as u64)),
+                ),
+                (
+                    "Events/s",
+                    format!("{} ({})", format_count_short(eps), format_count(eps)),
                 ),
             ];
-            for (i, line) in lines.iter().enumerate() {
-                d2d.draw_text_ex(
+
+            let grid_x = bar_x;
+            let grid_y = bar_y + bar_h + 10.0;
+            let col_w = bar_w / 2.0;
+            let row_h = 32.0;
+
+            for (i, (label, value)) in cells.iter().enumerate() {
+                let x = grid_x + (i % 2) as f32 * col_w;
+                let y = grid_y + (i / 2) as f32 * row_h;
+
+                // A multi-million-event count is wider than its column, so clip each cell to
+                // its own cell box: a long value is cut off rather than running into the
+                // neighbouring column or past the panel edge.
+                let clip_tl = d2d.get_world_to_screen2D(Vector2::new(x, y), camera);
+                let clip_br =
+                    d2d.get_world_to_screen2D(Vector2::new(x + col_w - 8.0, y + row_h), camera);
+                let mut d_clip = d2d.begin_scissor_mode(
+                    clip_tl.x as i32,
+                    clip_tl.y as i32,
+                    (clip_br.x - clip_tl.x) as i32,
+                    (clip_br.y - clip_tl.y) as i32,
+                );
+
+                d_clip.draw_text_ex(
                     &font,
-                    line,
-                    Vector2::new(bar_x, bar_y + bar_h + 8.0 + i as f32 * 18.0),
+                    label,
+                    Vector2::new(x, y),
+                    12.0,
+                    spacing,
+                    label_color,
+                );
+                d_clip.draw_text_ex(
+                    &font,
+                    value,
+                    Vector2::new(x, y + 14.0),
                     16.0,
                     spacing,
-                    sub_color,
+                    value_color,
                 );
             }
         }
     }
+}
+
+/// Draws the finished-parse panel on its way out: it swings from the center of the
+/// screen down to the bottom-right corner, sits there, then fades. `fly_t` is 0 at the
+/// center and 1 at the corner; `alpha` fades the whole panel at the end.
+pub fn draw_parse_toast(
+    d: &mut RaylibDrawHandle,
+    screen_width: i32,
+    screen_height: i32,
+    fly_t: f32,
+    alpha: f32,
+    progress: &Option<crate::midi_parser_worker::ParseProgress>,
+    parse_bps: f64,
+    parse_eps: f64,
+) {
+    const MARGIN: f32 = 16.0;
+
+    // The swing, as a cubic-bezier: it accelerates out of the center, drifts past the
+    // corner, then eases back into it. Tune the feel here: y1 > 1.0 is the overshoot,
+    // and the second control point's late x is what gives the settle its weight.
+    let eased = cubic_bezier(0.34, 1.28, 0.64, 1.0, fly_t);
+
+    // The panel keeps its size the whole way: shrinking it made the text unreadable.
+    let half_w = LOADING_PANEL_W / 2.0;
+    let half_h = LOADING_PANEL_H / 2.0;
+
+    // Both endpoints are where the panel's *center* sits on screen, so the overshoot
+    // never pushes the panel off the visible area by more than the easing allows.
+    let start = Vector2::new(screen_width as f32 / 2.0, screen_height as f32 / 2.0);
+    let end = Vector2::new(
+        screen_width as f32 - MARGIN - half_w,
+        screen_height as f32 - MARGIN - half_h,
+    );
+    let offset = Vector2::new(
+        start.x + (end.x - start.x) * eased,
+        start.y + (end.y - start.y) * eased,
+    );
+
+    let camera = Camera2D {
+        target: Vector2::new(LOADING_PANEL_W / 2.0, LOADING_PANEL_H / 2.0),
+        offset,
+        rotation: 0.0,
+        zoom: 1.0,
+    };
+
+    draw_loading_panel(d, camera, alpha, "Loaded!", progress, parse_bps, parse_eps);
 }
 
 pub fn draw_settings_overlay(
@@ -327,8 +439,12 @@ pub fn draw_settings_overlay(
     scrollbar_drag_start_y: &mut f32,
     scrollbar_drag_start_scroll: &mut f32,
     pb_multiplier_slider_dragging: &mut bool,
+    parse_threads: &mut u32,
+    parse_threads_slider_dragging: &mut bool,
     scan_delay_ms: &mut u32,
     scan_delay_slider_dragging: &mut bool,
+    show_stats: &mut bool,
+    show_stats_animation: f32,
 ) -> bool {
     // Ease-out cubic: 1 - (1 - t)^3
     let eased_t = 1.0 - (1.0 - alpha_factor).powi(3);
@@ -384,6 +500,10 @@ pub fn draw_settings_overlay(
     if *pitch_bend_override {
         measure_layout.next(38.0);
     }
+    measure_layout.next(18.0); // "Parsing:" label
+    measure_layout.next(38.0); // Parse Threads slider
+    measure_layout.next(18.0); // "Statistics:" label
+    measure_layout.next(30.0); // Show Statistics toggle
     measure_layout.next(38.0); // Scan Delay slider (debug)
     let content_height = measure_layout.content_height(20.0);
     let max_scroll = f32::max(content_height - viewport_height, 0.0);
@@ -634,6 +754,104 @@ pub fn draw_settings_overlay(
                             *pb_multiplier_slider_dragging = false;
                         }
                     }
+                }
+            }
+
+            // Parsing section label
+            let y = layout.next(18.0);
+            if is_visible(sy(y), 18.0) {
+                d_scissor.draw_text_ex(
+                    &font,
+                    "Parsing:",
+                    Vector2::new(20.0, sy(y)),
+                    18.0,
+                    spacing,
+                    text_color,
+                );
+            }
+
+            // Parse Threads slider: 1..=hardware threads. Applies to the next load.
+            {
+                let max_threads = crate::app_state::cpu_threads();
+                let y = layout.next(38.0);
+                if is_visible(sy(y), 38.0) {
+                    *parse_threads = (*parse_threads).clamp(1, max_threads);
+                    let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
+                    let label = format!("Parse Threads: {} / {}", *parse_threads, max_threads);
+                    d_scissor.draw_text_ex(
+                        &font,
+                        &label,
+                        Vector2::new(slider_rect.x, sy(y)),
+                        16.0,
+                        1.0,
+                        text_color,
+                    );
+                    d_scissor.draw_rectangle(
+                        slider_rect.x as i32,
+                        (slider_rect.y + 8.0) as i32,
+                        slider_rect.width as i32,
+                        4,
+                        Color::new(80, 80, 80, (255.0 * eased_t) as u8),
+                    );
+                    // A single-core machine has no range to drag: pin the thumb at the end.
+                    let span = (max_threads - 1) as f32;
+                    let t = if span > 0.0 {
+                        ((*parse_threads - 1) as f32 / span).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let thumb_x = slider_rect.x + t * slider_rect.width;
+                    let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
+                    d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
+
+                    if let Some(cp) = click_pos {
+                        if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
+                            *parse_threads_slider_dragging = true;
+                        }
+                    }
+
+                    if *parse_threads_slider_dragging {
+                        if is_mouse_down {
+                            if span > 0.0 {
+                                let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
+                                let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
+                                *parse_threads = (new_t * span).round() as u32 + 1;
+                            }
+                        } else {
+                            *parse_threads_slider_dragging = false;
+                        }
+                    }
+                }
+            }
+
+            // Statistics section label
+            let y = layout.next(18.0);
+            if is_visible(sy(y), 18.0) {
+                d_scissor.draw_text_ex(
+                    &font,
+                    "Statistics:",
+                    Vector2::new(20.0, sy(y)),
+                    18.0,
+                    spacing,
+                    text_color,
+                );
+            }
+
+            // Show Statistics toggle
+            let y = layout.next(30.0);
+            let show_stats_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            if is_visible(show_stats_rect.y, show_stats_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    show_stats_rect,
+                    "Show Statistics",
+                    show_stats_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *show_stats = !*show_stats;
                 }
             }
 

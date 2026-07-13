@@ -30,6 +30,7 @@ pub enum PlayerCommand {
     SetPitchBendMultiplier(u8),
     SetUnlimitedOutput(bool),
     SetSpeed(f32),
+    SetParseThreads(u32),
 }
 
 pub enum PlayerFeedback {
@@ -67,6 +68,8 @@ pub struct PlayerHandle {
     unlimited_output: Arc<AtomicBool>,
     // Playback speed as f32 bits (1.0 = normal). Scales wall-clock -> song time.
     playback_speed: Arc<AtomicU32>,
+    // Running note-on count, used to derive NPS in the stats overlay.
+    notes_played: Arc<AtomicU64>,
 }
 
 impl Clone for PlayerHandle {
@@ -84,6 +87,7 @@ impl Clone for PlayerHandle {
             pitch_bend_multiplier: self.pitch_bend_multiplier.clone(),
             unlimited_output: self.unlimited_output.clone(),
             playback_speed: self.playback_speed.clone(),
+            notes_played: self.notes_played.clone(),
         }
     }
 }
@@ -106,6 +110,7 @@ impl PlayerHandle {
         let pitch_bend_multiplier = Arc::new(AtomicU8::new(12));
         let unlimited_output = Arc::new(AtomicBool::new(false));
         let playback_speed = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let notes_played = Arc::new(AtomicU64::new(0));
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -136,6 +141,7 @@ impl PlayerHandle {
         let pitch_bend_multiplier_for_thread = pitch_bend_multiplier.clone();
         let unlimited_output_for_thread = unlimited_output.clone();
         let playback_speed_for_thread = playback_speed.clone();
+        let notes_played_for_thread = notes_played.clone();
 
         thread::spawn(move || {
             let pitch_bend_override_clone = pitch_bend_override_for_thread;
@@ -148,6 +154,9 @@ impl PlayerHandle {
             let current_parse_cancellation_token_clone = current_parse_cancellation_token_for_thread;
             let active_notes_clone = active_notes_for_thread;
             let playback_speed_clone = playback_speed_for_thread;
+            let notes_played_clone = notes_played_for_thread;
+            // Running count of every note-on triggered, used to derive NPS.
+            let mut notes_played_count: u64 = 0;
             // Wall-clock -> song-time speed actually applied to `playback_start`.
             // When the requested speed changes we re-anchor `playback_start`.
             let mut applied_speed = 1.0f32;
@@ -217,6 +226,8 @@ impl PlayerHandle {
                             state_clone.store(PlayerState::Loading as u32, Ordering::SeqCst);
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
+                            notes_played_count = 0;
+                            notes_played_clone.store(0, Ordering::Relaxed);
                             *lock_mutex(&pitch_bend_clone) = [8192; 16];
                             // 古い MIDI データを即座に解放
                             *lock_mutex(&current_midi_data_for_thread) = None;
@@ -256,6 +267,9 @@ impl PlayerHandle {
                         PlayerCommand::SetSpeed(speed) => {
                             let clamped = speed.clamp(0.05, 4.0);
                             playback_speed_clone.store(clamped.to_bits(), Ordering::Relaxed);
+                        }
+                        PlayerCommand::SetParseThreads(threads) => {
+                            parser_worker_for_thread.set_threads(threads);
                         }
                     }
                 }
@@ -410,12 +424,15 @@ impl PlayerHandle {
                                                 let msg_type = track.pend_status & 0xF0;
                                                 if msg_type == 0x90 && track.pend_p2 > 0 {
                                                     active_count[key] += 1;
+                                                    notes_played_count += 1;
                                                     guard[key] =
                                                         Some((track.cursor.track_index, track.pend_status & 0x0F));
                                                 } else if msg_type == 0x80
                                                     || (msg_type == 0x90 && track.pend_p2 == 0)
                                                 {
-                                                    active_count[key] = active_count[key].saturating_sub(1);
+                                                    if active_count[key] > 0 {
+                                                        active_count[key] -= 1;
+                                                    }
                                                     if active_count[key] == 0 {
                                                         guard[key] = None;
                                                     }
@@ -464,12 +481,15 @@ impl PlayerHandle {
                                             let msg_type = track.cursor.status & 0xF0;
                                             if msg_type == 0x90 && track.cursor.param2 > 0 {
                                                 active_count[key] += 1;
+                                                notes_played_count += 1;
                                                 guard[key] =
                                                     Some((track.cursor.track_index, track.cursor.status & 0x0F));
                                             } else if msg_type == 0x80
                                                 || (msg_type == 0x90 && track.cursor.param2 == 0)
                                             {
-                                                active_count[key] = active_count[key].saturating_sub(1);
+                                                if active_count[key] > 0 {
+                                                    active_count[key] -= 1;
+                                                }
                                                 if active_count[key] == 0 {
                                                     guard[key] = None;
                                                 }
@@ -510,6 +530,7 @@ impl PlayerHandle {
 
                 state_clone.store(player.state as u32, Ordering::SeqCst);
                 position_clone.store(player.seek_position_ns, Ordering::SeqCst);
+                notes_played_clone.store(notes_played_count, Ordering::Relaxed);
                 *lock_mutex(&pitch_bend_range_clone) = player.channel_pitch_bend_range;
 
                 if player.state != PlayerState::Playing {
@@ -533,6 +554,7 @@ impl PlayerHandle {
             pitch_bend_multiplier,
             unlimited_output,
             playback_speed,
+            notes_played,
         }
     }
 
@@ -554,6 +576,16 @@ impl PlayerHandle {
 
     pub fn set_speed(&self, speed: f32) {
         let _ = self.tx_command.send(PlayerCommand::SetSpeed(speed));
+    }
+
+    /// Takes effect on the next load; a parse already in flight keeps its count.
+    pub fn set_parse_threads(&self, threads: u32) {
+        let _ = self.tx_command.send(PlayerCommand::SetParseThreads(threads));
+    }
+
+    /// Running total of note-ons triggered for the current file.
+    pub fn notes_played(&self) -> u64 {
+        self.notes_played.load(Ordering::Relaxed)
     }
 
     pub fn get_midi_data(&self) -> Option<Arc<kazumidiparser::MIDIPlayerData>> {

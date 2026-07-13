@@ -1,4 +1,5 @@
 use kazumidiparser::MIDIPlayerData;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -21,11 +22,16 @@ pub enum ParserFeedbackCommand {
 #[derive(Clone)]
 pub struct MIDIParserWorker {
     tx: Sender<ParserCommand>,
+    /// Thread count handed to `MIDIPlayerData::parse`. Read when a parse starts, so
+    /// a change applies to the next load, not the one already running.
+    threads: Arc<AtomicU32>,
 }
 
 impl MIDIParserWorker {
     pub fn spawn(tx_feedback_to_player: Sender<ParserFeedbackCommand>) -> Self {
         let (tx, rx) = mpsc::channel::<ParserCommand>();
+        let threads = Arc::new(AtomicU32::new(crate::app_state::cpu_threads()));
+        let threads_for_thread = threads.clone();
 
         thread::spawn(move || {
             let mut current_token: Option<kazumidiparser::CancelToken> = None;
@@ -41,6 +47,7 @@ impl MIDIParserWorker {
                         let tx_feedback = tx_feedback_to_player.clone();
                         let token_clone = token.clone();
                         current_token = Some(token);
+                        let threads = threads_for_thread.load(Ordering::Relaxed).max(1);
 
                         thread::spawn(move || {
                             let tx_for_progress = tx_feedback.clone();
@@ -50,7 +57,7 @@ impl MIDIParserWorker {
 
                             let parse_result = MIDIPlayerData::parse(
                                 &path,
-                                1,
+                                threads,
                                 Some(&mut on_progress),
                                 Some(&token_clone),
                             );
@@ -82,10 +89,14 @@ impl MIDIParserWorker {
             }
         });
 
-        Self { tx }
+        Self { tx, threads }
     }
 
     pub fn send(&self, cmd: ParserCommand) {
         self.tx.send(cmd).ok();
+    }
+
+    pub fn set_threads(&self, threads: u32) {
+        self.threads.store(threads.max(1), Ordering::Relaxed);
     }
 }

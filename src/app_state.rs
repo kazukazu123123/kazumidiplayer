@@ -12,6 +12,54 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Hardware thread count: both the parse-threads default and the slider's maximum.
+/// Oversubscribing past this only adds context switching, so it is the ceiling.
+pub fn cpu_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// The loading panel's exit animation: once a parse finishes, the panel keeps its final
+/// numbers, swings out to the bottom-right corner, lingers, then fades away.
+pub struct ParseToast {
+    pub elapsed: f32,
+    /// The last progress snapshot of the finished parse, so the toast keeps showing the
+    /// file's real totals after `current_progress` has been cleared.
+    pub progress: Option<ParseProgress>,
+    pub parse_bps: f64,
+    pub parse_eps: f64,
+}
+
+impl ParseToast {
+    /// Swing from center to corner. Long enough that the overshoot and settle are actually
+    /// visible: below ~0.25s the bounce passes in a couple of frames and reads as a jump.
+    pub const FLY: f32 = 0.38;
+    /// Sit in the corner.
+    pub const HOLD: f32 = 2.0;
+    /// Fade out.
+    pub const FADE: f32 = 0.4;
+
+    pub fn total() -> f32 {
+        Self::FLY + Self::HOLD + Self::FADE
+    }
+
+    /// 0.0 at the center, 1.0 once parked in the corner.
+    pub fn fly_t(&self) -> f32 {
+        (self.elapsed / Self::FLY).clamp(0.0, 1.0)
+    }
+
+    pub fn alpha(&self) -> f32 {
+        let fade_start = Self::FLY + Self::HOLD;
+        if self.elapsed <= fade_start {
+            1.0
+        } else {
+            (1.0 - (self.elapsed - fade_start) / Self::FADE).clamp(0.0, 1.0)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppOverlay {
     Settings,
@@ -32,6 +80,8 @@ pub struct AppState {
     pub is_dragging_seek: bool,
     pub last_state: PlayerState,
     pub is_loading: bool,
+    /// Present only while the finished loading panel is animating out.
+    pub parse_toast: Option<ParseToast>,
     pub is_tick_based: bool,
     /// Piano-roll scroll speed multiplier (higher = notes move faster, shorter
     /// visible window). Adjusted with the mouse wheel over the piano roll.
@@ -40,6 +90,19 @@ pub struct AppState {
     pub scan_delay_ms: u32,
     /// Playback speed multiplier (0.05–4.0, slider-controlled; 1.0 = normal).
     pub playback_speed: f32,
+    /// Worker threads kazumidiparser uses to parse a file (1..=cpu_threads()).
+    pub parse_threads: u32,
+
+    // --- Statistics overlay ---
+    pub show_stats: bool,
+    pub show_stats_animation: f32,
+    /// Monotonic clock (seconds) advanced each frame, used to window NPS samples.
+    pub stats_clock: f32,
+    /// Ring of `(clock, notes_played)` snapshots kept for a ~1s window so NPS is a
+    /// moving average rather than a jumpy instantaneous delta.
+    pub nps_samples: VecDeque<(f32, u64)>,
+    /// Most recent notes-per-second value shown in the stats overlay.
+    pub nps_value: f32,
     pub tick_map: Option<Vec<(u64, u32, u64)>>,
     pub midi_data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub last_seek_sent_ns: Option<u64>,
@@ -67,6 +130,7 @@ pub struct AppState {
     pub settings_scrollbar_drag_start_scroll: f32,
     pub settings_pb_multiplier_slider_dragging: bool,
     pub settings_scan_delay_slider_dragging: bool,
+    pub settings_parse_threads_slider_dragging: bool,
     pub speed_slider_dragging: bool,
 
     // --- Editor ---
@@ -131,10 +195,17 @@ impl AppState {
             is_dragging_seek: false,
             last_state: PlayerState::Stopped,
             is_loading: false,
+            parse_toast: None,
             is_tick_based: false,
             note_speed: 1.0,
             scan_delay_ms: 0,
             playback_speed: 1.0,
+            parse_threads: cpu_threads(),
+            show_stats: true,
+            show_stats_animation: 0.0,
+            stats_clock: 0.0,
+            nps_samples: VecDeque::new(),
+            nps_value: 0.0,
             tick_map: None,
             midi_data: None,
             last_seek_sent_ns: None,
@@ -162,6 +233,7 @@ impl AppState {
             settings_scrollbar_drag_start_scroll: 0.0,
             settings_pb_multiplier_slider_dragging: false,
             settings_scan_delay_slider_dragging: false,
+            settings_parse_threads_slider_dragging: false,
             speed_slider_dragging: false,
 
             // --- Editor ---
@@ -216,6 +288,14 @@ impl AppState {
             }
             PlayerFeedback::Loaded(path) => {
                 self.is_loading = false;
+                // Snapshot the final numbers before they are cleared: the toast carries the
+                // panel out of the screen still showing them.
+                self.parse_toast = Some(ParseToast {
+                    elapsed: 0.0,
+                    progress: self.current_progress,
+                    parse_bps: self.parse_bps,
+                    parse_eps: self.parse_eps,
+                });
                 self.reset_parse_progress();
                 self.is_dragging_seek = false;
                 self.last_seek_sent_ns = None;
@@ -235,6 +315,16 @@ impl AppState {
             PlayerFeedback::Progress(progress) => {
                 self.current_progress = Some(progress);
                 self.update_parse_rate(progress, Instant::now());
+            }
+        }
+    }
+
+    /// Advances the finished-parse panel's exit animation and drops it when it is done.
+    pub fn update_parse_toast(&mut self, dt: f32) {
+        if let Some(toast) = &mut self.parse_toast {
+            toast.elapsed += dt;
+            if toast.elapsed >= ParseToast::total() {
+                self.parse_toast = None;
             }
         }
     }
@@ -282,6 +372,7 @@ impl AppState {
         self.is_loading = true;
         self.is_dragging_seek = false;
         self.last_seek_sent_ns = None;
+        self.parse_toast = None;
         self.current_progress = None;
         self.midi_data = None;
         tx_commands.send(PlayerCommand::LoadFile(path.to_string())).ok();

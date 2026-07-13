@@ -84,6 +84,21 @@ fn move_cursor_down(text: &str, cursor_pos: usize) -> usize {
     new_pos
 }
 
+// Format an integer with comma thousands separators (e.g. 1204880 -> "1,204,880").
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 fn animate_toggle(condition: bool, value: &mut f32, dt: f32, speed: f32) {
     if condition {
         *value = (*value + dt * speed).min(1.0);
@@ -311,6 +326,41 @@ fn main() {
         animate_toggle(app_state.autoplay_on_load, &mut app_state.autoplay_animation, dt, anim_speed);
         animate_toggle(app_state.pitch_bend_override_enabled, &mut app_state.pitch_bend_override_animation, dt, anim_speed);
         animate_toggle(app_state.unlimited_output_enabled, &mut app_state.unlimited_output_animation, dt, anim_speed);
+        animate_toggle(app_state.show_stats, &mut app_state.show_stats_animation, dt, anim_speed);
+
+        // Notes-per-second as a 1-second moving average of the player's note-on
+        // counter: snapshot (clock, notes) each frame, drop samples older than 1s,
+        // and divide the note delta by the actual time span they cover.
+        app_state.stats_clock += dt;
+        {
+            let now_notes = engine.notes_played();
+            let clock = app_state.stats_clock;
+            app_state.nps_samples.push_back((clock, now_notes));
+            while app_state
+                .nps_samples
+                .front()
+                .map_or(false, |&(t, _)| clock - t > 1.0)
+            {
+                // Keep one sample just past the 1s boundary so the window stays full.
+                if app_state.nps_samples.len() > 1
+                    && app_state.nps_samples.get(1).map_or(false, |&(t, _)| clock - t > 1.0)
+                {
+                    app_state.nps_samples.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if let (Some(&(t0, n0)), Some(&(t1, n1))) =
+                (app_state.nps_samples.front(), app_state.nps_samples.back())
+            {
+                let span = t1 - t0;
+                app_state.nps_value = if span > 1e-3 {
+                    (n1.saturating_sub(n0)) as f32 / span
+                } else {
+                    0.0
+                };
+            }
+        }
 
         // Shaking Window Logic
         app_state.shake_state.update(
@@ -400,6 +450,7 @@ fn main() {
             app_state.overlay_manager.close();
         }
         app_state.overlay_manager.update(dt);
+        app_state.update_parse_toast(dt);
 
         app_state.last_input_event = None;
         let active_window_id;
@@ -1142,6 +1193,44 @@ fn main() {
                 Color::WHITE,
             );
 
+            // Statistics overlay, pinned to the top-right corner (toggled in Settings).
+            // Drawn as a translucent panel; fades with its animation.
+            let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
+            if stats_alpha > 0.01 {
+                let lines = [
+                    format!("NPS   {}", group_thousands(app_state.nps_value.round() as u64)),
+                ];
+                let font_size = 18;
+                let pad = 8;
+                let line_h = 22;
+                let panel_w = 170;
+                let panel_h = pad * 2 + line_h * lines.len() as i32;
+                let px = screen_width - panel_w - 10 + canvas_offset_x;
+                let py = 10 + canvas_offset_y;
+                let bg_a = (180.0 * stats_alpha) as u8;
+                let border_a = (200.0 * stats_alpha) as u8;
+                let text_a = (255.0 * stats_alpha) as u8;
+                d_rt.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 24, bg_a));
+                // draw_rectangle_lines is GL-line based and rasterizes off-by-one from the
+                // filled rect, leaving a 1px sliver of fill outside the border. draw_rectangle_lines_ex
+                // draws the border as filled rects inside the rectangle bounds, so it lands
+                // exactly on the fill's edge columns/rows.
+                d_rt.draw_rectangle_lines_ex(
+                    Rectangle::new(px as f32, py as f32, panel_w as f32, panel_h as f32),
+                    1.0,
+                    Color::new(0, 135, 200, border_a),
+                );
+                for (i, line) in lines.iter().enumerate() {
+                    d_rt.draw_text(
+                        line,
+                        px + pad,
+                        py + pad + i as i32 * line_h,
+                        font_size,
+                        Color::new(210, 225, 255, text_a),
+                    );
+                }
+            }
+
             for &wid in &window_ids {
                 let window = match window_manager.get_window(wid) {
                     Some(w) if w.visible => w,
@@ -1302,6 +1391,7 @@ fn main() {
                         let prev_pb_override = app_state.pitch_bend_override_enabled;
                         let prev_pb_multiplier = app_state.pitch_bend_multiplier;
                         let prev_unlimited_output = app_state.unlimited_output_enabled;
+                        let prev_parse_threads = app_state.parse_threads;
                         if ui::draw_settings_overlay(
                             d,
                             screen_width,
@@ -1329,8 +1419,12 @@ fn main() {
                             &mut app_state.settings_scrollbar_drag_start_y,
                             &mut app_state.settings_scrollbar_drag_start_scroll,
                             &mut app_state.settings_pb_multiplier_slider_dragging,
+                            &mut app_state.parse_threads,
+                            &mut app_state.settings_parse_threads_slider_dragging,
                             &mut app_state.scan_delay_ms,
                             &mut app_state.settings_scan_delay_slider_dragging,
+                            &mut app_state.show_stats,
+                            app_state.show_stats_animation,
                         ) {
                             close_requested = true;
                         }
@@ -1343,6 +1437,9 @@ fn main() {
                         if app_state.unlimited_output_enabled != prev_unlimited_output {
                             engine.set_unlimited_output(app_state.unlimited_output_enabled);
                         }
+                        if app_state.parse_threads != prev_parse_threads {
+                            engine.set_parse_threads(app_state.parse_threads);
+                        }
 
                         window_manager.set_window_visible(
                             piano_keyboard_window_handle,
@@ -1350,15 +1447,19 @@ fn main() {
                         );
                     }
                     app_state::AppOverlay::Loading => {
-                        ui::draw_loading_overlay(
-                            d,
-                            screen_width,
-                            screen_height,
-                            fade_t,
-                            &app_state.current_progress,
-                            app_state.parse_bps,
-                            app_state.parse_eps,
-                        );
+                        // Once the parse is done the toast owns the panel and carries it to
+                        // the corner; only the dimming backdrop is left to fade out here.
+                        if app_state.parse_toast.is_none() {
+                            ui::draw_loading_overlay(
+                                d,
+                                screen_width,
+                                screen_height,
+                                fade_t,
+                                &app_state.current_progress,
+                                app_state.parse_bps,
+                                app_state.parse_eps,
+                            );
+                        }
                     }
                     app_state::AppOverlay::TextEditor => {
                         let (close, apply) = ui::draw_text_editor_overlay(
@@ -1388,6 +1489,21 @@ fn main() {
                     }
                 },
             );
+
+        // Drawn outside the overlay manager: it outlives the overlay's fade-out and must
+        // not be dimmed by the backdrop.
+        if let Some(toast) = &app_state.parse_toast {
+            ui::draw_parse_toast(
+                &mut d,
+                screen_width,
+                screen_height,
+                toast.fly_t(),
+                toast.alpha(),
+                &toast.progress,
+                toast.parse_bps,
+                toast.parse_eps,
+            );
+        }
 
         if close_requested {
             app_state.overlay_manager.close();

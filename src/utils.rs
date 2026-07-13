@@ -5,6 +5,46 @@ pub fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// CSS `cubic-bezier(x1, y1, x2, y2)`: maps progress `t` (0..1) to an eased value. The
+/// curve's endpoints are fixed at (0,0) and (1,1); the two control points shape it.
+/// `y` may leave 0..1 (that is what makes a curve overshoot), but `x` must stay in it,
+/// so x1/x2 are clamped: a curve that doubles back in x has no single value per t.
+///
+/// x(t) is not invertible in closed form, so the parameter for a given progress is found
+/// with a few Newton steps (the curve is monotonic in x, so this converges fast), then y
+/// is evaluated at it.
+pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let x1 = x1.clamp(0.0, 1.0);
+    let x2 = x2.clamp(0.0, 1.0);
+
+    // B(u) for control points (0, p1, p2, 1), expanded into polynomial coefficients.
+    let curve = |p1: f32, p2: f32, u: f32| {
+        let a = 3.0 * p1 - 3.0 * p2 + 1.0;
+        let b = -6.0 * p1 + 3.0 * p2;
+        let c = 3.0 * p1;
+        ((a * u + b) * u + c) * u
+    };
+    let slope = |p1: f32, p2: f32, u: f32| {
+        let a = 3.0 * p1 - 3.0 * p2 + 1.0;
+        let b = -6.0 * p1 + 3.0 * p2;
+        let c = 3.0 * p1;
+        (3.0 * a * u + 2.0 * b) * u + c
+    };
+
+    let mut u = t;
+    for _ in 0..5 {
+        let dx = curve(x1, x2, u) - t;
+        let d = slope(x1, x2, u);
+        if d.abs() < 1e-6 {
+            break;
+        }
+        u -= dx / d;
+    }
+
+    curve(y1, y2, u.clamp(0.0, 1.0))
+}
+
 // Fold a (track, channel) pair into a single 0..255 color-palette index. This is
 // all the color depends on, so it can be stored as one byte per note instead of
 // keeping the full track (u16) + channel (u8).
@@ -80,8 +120,11 @@ pub fn format_count(n: u64) -> String {
 }
 
 /// Abbreviate a count to 3 significant-ish digits, e.g. `1234567` -> `1.23M`.
+///
+/// Counts use K/M/B, not the K/M/G of `format_bytes`: these are events, and "1.23G
+/// events" reads like a data size.
 pub fn format_count_short(n: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1_000_000_000, "G"), (1_000_000, "M"), (1_000, "K")];
+    const UNITS: [(u64, &str); 3] = [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")];
     for (scale, suffix) in UNITS {
         if n >= scale {
             let v = n as f64 / scale as f64;
