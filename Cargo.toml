@@ -5,7 +5,22 @@ edition = "2024"
 
 [dependencies]
 libloading = "0.9.0"
-raylib = { version = "6.0.0", features = ["SUPPORT_IMAGE_GENERATION"] }
+# SUPPORT_SCREEN_CAPTURE is deliberately absent: it compiles a hardcoded
+# F12-takes-a-screenshot handler into raylib, with no way to turn it off at runtime.
+# The rest is only what this app actually draws with. Audio is KDMAPI's job, and
+# nothing here loads a model, a font file or an image file.
+raylib = { version = "6.0.0", default-features = false, features = [
+    "GLFW_BUILD_X11",
+    "SUPPORT_MODULE_RSHAPES",
+    "SUPPORT_MODULE_RTEXTURES",
+    "SUPPORT_MODULE_RTEXT",
+    "SUPPORT_MODULE_RMODELS",
+    "SUPPORT_MODULE_RAUDIO",
+    "USE_AUDIO",
+    "SUPPORT_IMAGE_GENERATION",
+    "SUPPORT_WINMM_HIGHRES_TIMER",
+    "SUPPORT_TRACELOG",
+] }
 
 kazumidiparser = { version = "0.1.0", path = "../SelfMadeLibraries/kazumidiparser" }
 rustc-hash = "2"
