@@ -10,8 +10,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::kazumidiparser_cursor::{
-    cursor_next, ns_to_tick, seek_track_cursor_with_held, TrackCursor,
+    cursor_next, keyframe_tick_for, ns_to_tick, seek_track_cursor_with_held, TrackCursor,
 };
+use crate::note_index::NoteIndex;
 use crate::ui_components::piano_keyboard::get_keyboard_note_regions;
 use crate::utils::get_note_color_by_index;
 
@@ -101,6 +102,9 @@ struct RollRequest {
     /// Which chunk slot to fill. It is the one the draw is *not* reading; the scan
     /// flips `live` to it once the visible range is complete.
     build_slot: usize,
+    /// Absent until the background index is built. Without it the scan cannot see
+    /// notes that began before the keyframe it seeks from, and they go missing.
+    index: Option<Arc<NoteIndex>>,
 }
 
 /// Compute the topmost visible tick (the future point shown at the top edge),
@@ -154,6 +158,9 @@ pub struct PianoRollWorker {
     /// Set on shutdown so a running scan bails and the thread can be joined before
     /// the process tears down (avoids killing the thread mid-allocation).
     shutdown: Arc<AtomicBool>,
+    /// The background note index, once built. Handed to each scan so it can restore
+    /// the notes a keyframe seek cannot see.
+    note_index: Mutex<Option<Arc<NoteIndex>>>,
 }
 
 impl PianoRollWorker {
@@ -194,6 +201,7 @@ impl PianoRollWorker {
                     req.start_tick,
                     req.priority_tick,
                     req.generation,
+                    req.index.clone(),
                     &latest_for_thread,
                     &chunks_for_thread,
                     req.build_slot,
@@ -214,7 +222,14 @@ impl PianoRollWorker {
             scan_delay_ms,
             target_tick,
             shutdown,
+            note_index: Mutex::new(None),
         }
+    }
+
+    /// Hand the worker the finished note index. Scans started after this see the notes
+    /// that a keyframe seek would otherwise miss; the caller regenerates to apply it.
+    pub fn set_note_index(&self, index: Arc<NoteIndex>) {
+        *self.note_index.lock().unwrap() = Some(index);
     }
 
     /// The chunk the draw reads. The scan may be filling the other one.
@@ -342,6 +357,7 @@ impl PianoRollWorker {
                 priority_tick,
                 generation,
                 build_slot,
+                index: self.note_index.lock().unwrap().clone(),
             });
         }
     }
@@ -363,6 +379,7 @@ fn run_scan(
     start_tick: u32,
     priority_tick: u32,
     generation: u64,
+    index: Option<Arc<NoteIndex>>,
     latest: &AtomicU64,
     chunks: &[Arc<Mutex<RollChunk>>; 2],
     build_slot: usize,
@@ -423,6 +440,12 @@ fn run_scan(
     // sizing one per (track, channel, key) would run to tens of megabytes on a MIDI
     // with thousands of tracks. Only open notes are held here, of which there are at
     // most a few tens of thousands.
+    //
+    // A queue entry of `DROPPED` is a note that exists in the MIDI but was left out of
+    // the roll (see the per-key cap below). It holds the note's place so that the
+    // note-off that closes it consumes it, rather than closing the next note on the
+    // voice and cutting that one short.
+    const DROPPED: u64 = u64::MAX;
     let mut open: FxHashMap<(u16, u8, u8), VecDeque<u64>> = FxHashMap::default();
     // Running count of notes ever appended to each key (published + queued in the
     // current batch), i.e. the absolute index the next appended note will take.
@@ -442,29 +465,89 @@ fn run_scan(
     let mut staged = 0usize;
     let mut patches: Vec<(u8, u64, u32)> = Vec::new();
 
+    // What is sounding at `start_tick`, kept to the newest MAX_SOUNDING_PER_KEY notes
+    // on each key as the tracks are walked.
+    //
+    // Some MIDIs sustain absurdly: one MIDI here leaves ten million notes ringing at
+    // once, eighty thousand of them on a single key. They are all drawn from the
+    // playhead upwards, over each other, in the same one-key-wide column, so all but a
+    // handful are painted over and never seen. Collecting them first and trimming after
+    // would mean building a hundred-megabyte list on every seek, so each key holds a
+    // min-heap on start tick instead and the oldest falls out as newer ones arrive.
+    // What survives is what is drawn on top.
+    const MAX_SOUNDING_PER_KEY: usize = 128;
+    let mut sounding: [BinaryHeap<Reverse<(u32, u16, u8)>>; 128] =
+        std::array::from_fn(|_| BinaryHeap::new());
+    // Notes evicted above, counted per voice. They still have note-offs coming, and a
+    // note-off closes the oldest note on its voice, so each one has to leave a
+    // tombstone in the voice's queue or it would close a note that is still drawn and
+    // cut it short. Only the count is needed: every evicted note is older than every
+    // note kept on that key, so all the tombstones sit at the front of the queue.
+    let mut evicted: FxHashMap<(u16, u8, u8), u64> = FxHashMap::default();
+
     for ti in 0..num_tracks {
         // Safety: ti < num_tracks; parser valid for this call. Each track also
         // reports notes already held at `start_tick`, so notes spanning the seek
         // point still render.
-        let (cur, held) = unsafe { seek_track_cursor_with_held(parser, ti as u16, start_tick) };
+        let (cur, mut held) = unsafe {
+            seek_track_cursor_with_held(parser, ti as u16, start_tick, MAX_SOUNDING_PER_KEY)
+        };
+        // The walk begins at a keyframe and so cannot see notes that began before it.
+        // The index knows those; merge them in, keeping start order.
+        if let Some(index) = &index {
+            let kf = unsafe { keyframe_tick_for(parser, ti as u16, start_tick) };
+            let missed = index.missed_at(ti as u16, kf, start_tick);
+            if !missed.is_empty() {
+                held.extend(missed.into_iter().map(|n| {
+                    crate::kazumidiparser_cursor::HeldNote {
+                        key: n.key,
+                        start_tick: n.start_tick,
+                        channel: n.channel,
+                    }
+                }));
+            }
+        }
+
         for note in held {
-            let key = note.key as usize;
-            let idx = appended[key];
-            appended[key] += 1;
-            batch[key].push(RollNote {
-                start_tick: note.start_tick,
-                end_tick: OPEN_END,
-                color: crate::utils::note_color_index(ti as u16, note.channel),
-            });
-            staged += 1;
-            open.entry((ti as u16, note.channel, note.key))
-                .or_default()
-                .push_back(idx);
+            let newest = &mut sounding[note.key as usize];
+            newest.push(Reverse((note.start_tick, ti as u16, note.channel)));
+            if newest.len() > MAX_SOUNDING_PER_KEY {
+                if let Some(Reverse((_, old_ti, old_ch))) = newest.pop() {
+                    *evicted.entry((old_ti, old_ch, note.key)).or_default() += 1;
+                }
+            }
         }
         if cur.has_event && !cur.is_tempo && cur.abs_tick <= end_tick {
             heap.push(Reverse((cur.abs_tick, ti)));
         }
         cursors.push(cur);
+    }
+
+    // Tombstones first: every evicted note is older than every note kept on its key, so
+    // they all sit at the front of their voice's queue.
+    for (&(ti, channel, key), &count) in evicted.iter() {
+        let queue = open.entry((ti, channel, key)).or_default();
+        for _ in 0..count {
+            queue.push_back(DROPPED);
+        }
+    }
+
+    // Then the survivors, oldest first, so each key's notes stay in start order.
+    for (key, newest) in sounding.iter_mut().enumerate() {
+        let mut kept: Vec<(u32, u16, u8)> = newest.drain().map(|Reverse(n)| n).collect();
+        kept.sort_unstable();
+
+        for (start, ti, channel) in kept {
+            let idx = appended[key];
+            appended[key] += 1;
+            batch[key].push(RollNote {
+                start_tick: start,
+                end_tick: OPEN_END,
+                color: crate::utils::note_color_index(ti, channel),
+            });
+            staged += 1;
+            open.entry((ti, channel, key as u8)).or_default().push_back(idx);
+        }
     }
 
     let mut events_since_publish = 0u32;
@@ -633,8 +716,12 @@ fn run_scan(
                     // carries no way to say which of several stacked notes it ends,
                     // so oldest-first is the convention.
                     if let Some(queue) = open.get_mut(&(ti as u16, channel, key as u8)) {
+                        // A tombstone consumes its note-off and patches nothing: the
+                        // note it stands for was never put in the roll.
                         if let Some(idx) = queue.pop_front() {
-                            patches.push((key as u8, idx, tick));
+                            if idx != DROPPED {
+                                patches.push((key as u8, idx, tick));
+                            }
                         }
                     }
                 }
@@ -688,7 +775,7 @@ fn run_scan(
 
     // Notes still ringing at the end extend to the final tick.
     for ((_, _, key), queue) in open.iter() {
-        for idx in queue.iter() {
+        for idx in queue.iter().filter(|&&idx| idx != DROPPED) {
             patches.push((*key, *idx, end_tick));
         }
     }

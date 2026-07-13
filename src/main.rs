@@ -3,6 +3,7 @@ mod blur_requester;
 mod kazumidiparser_cursor;
 mod kdmapi;
 mod midi_parser_worker;
+mod note_index;
 mod overlay_manager;
 mod piano_roll;
 mod player;
@@ -259,6 +260,11 @@ fn main() {
     // anywhere below it, so this is what says whether the window is holding more than
     // the current zoom needs. How far the scan actually got does not.
     let mut piano_roll_max_target = 0u32;
+    // Builds, in the background, the index of notes a keyframe seek cannot see. Until
+    // it lands, seeking drops the long notes that were already sounding; once it does,
+    // the roll is rebuilt so they appear.
+    let mut note_index_worker = note_index::NoteIndexWorker::new();
+    let mut note_index_data: Option<std::sync::Arc<kazumidiparser::MIDIPlayerData>> = None;
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -295,6 +301,24 @@ fn main() {
 
         let st = engine.get_state();
         app_state.update_player_state(st);
+
+        // Start indexing each newly loaded file, and pick the index up when it is done.
+        // The roll is regenerated on arrival: scans already running were built without
+        // it and are missing the long notes it knows about.
+        if let Some(data) = engine.get_midi_data() {
+            let is_new = match &note_index_data {
+                Some(d) => !std::sync::Arc::ptr_eq(d, &data),
+                None => true,
+            };
+            if is_new {
+                note_index_worker.start(data.clone(), app_state.parse_threads);
+                note_index_data = Some(data);
+            }
+        }
+        if let Some(index) = note_index_worker.take_ready() {
+            piano_roll_worker.set_note_index(index);
+            piano_roll_req_data = None; // force the roll to rebuild with the index
+        }
 
         let playback_position_ns = engine.position_ns();
         let pitch_bend_normalized = engine.get_pitch_bend_normalized();

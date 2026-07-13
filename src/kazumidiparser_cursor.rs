@@ -1,4 +1,6 @@
 use kazumidiparser::KazuMIDIParserData;
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub struct TrackCursor {
@@ -251,6 +253,51 @@ unsafe fn jump_to_keyframe(data: &KazuMIDIParserData, cursor: &mut TrackCursor, 
     }
 }
 
+/// The tick of the keyframe a seek to `target_tick` would jump to, i.e. the point a
+/// held-note walk starts from. Notes that were already sounding at this tick are the
+/// ones such a walk cannot see, so this is what a note index is queried against.
+///
+/// # Safety
+/// - `data` must be valid and `track_idx` within bounds.
+pub unsafe fn keyframe_tick_for(data: &KazuMIDIParserData, track_idx: u16, target_tick: u32) -> u32 {
+    unsafe {
+        let ti = track_idx as usize;
+        let kc = *data.keyframe_counts.add(ti);
+        if kc == 0 {
+            return 0;
+        }
+        let kf_ptr = *data.keyframes.add(ti);
+        let mut lo = 0usize;
+        let mut hi = kc;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if (*kf_ptr.add(mid)).abs_tick <= target_tick {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (*kf_ptr.add(lo)).abs_tick
+    }
+}
+
+/// The ticks of every keyframe in a track, ascending. Used to decide which notes span
+/// a keyframe and therefore need indexing.
+///
+/// # Safety
+/// - `data` must be valid and `track_idx` within bounds.
+pub unsafe fn keyframe_ticks(data: &KazuMIDIParserData, track_idx: u16) -> Vec<u32> {
+    unsafe {
+        let ti = track_idx as usize;
+        let kc = *data.keyframe_counts.add(ti);
+        if kc == 0 {
+            return Vec::new();
+        }
+        let kf_ptr = *data.keyframes.add(ti);
+        (0..kc).map(|j| (*kf_ptr.add(j)).abs_tick).collect()
+    }
+}
+
 /// Seek a track cursor to the first event at or after the given tick.
 ///
 /// # Safety
@@ -333,9 +380,14 @@ pub unsafe fn seek_track_cursor_with_held(
     data: &KazuMIDIParserData,
     track_idx: u16,
     target_tick: u32,
+    max_per_key: usize,
 ) -> (TrackCursor, Vec<HeldNote>) {
-    // Open notes per key, in note-on order, each with the channel that opened it.
-    let mut open: [Vec<(u32, u8)>; 128] = std::array::from_fn(|_| Vec::new());
+    // Open notes per (channel, key), oldest first. Keyed by channel as well as key so a
+    // note-off closes a note on its own channel, and a queue rather than a list so it
+    // closes the oldest in O(1): a MIDI that sustains heavily can leave millions of
+    // notes open on one track, and searching a list for each note-off would be
+    // quadratic.
+    let mut open: FxHashMap<(u8, u8), VecDeque<u32>> = FxHashMap::default();
 
     let mut cursor = match unsafe { init_track_cursor(data, track_idx) } {
         Some(c) => c,
@@ -381,13 +433,22 @@ pub unsafe fn seek_track_cursor_with_held(
             if key < 128 {
                 let channel = cursor.status & 0x0F;
                 if msg_type == 0x90 && cursor.param2 > 0 {
-                    open[key].push((cursor.abs_tick, channel));
+                    let queue = open.entry((channel, key as u8)).or_default();
+                    queue.push_back(cursor.abs_tick);
+                    // The roll can only draw a handful of notes per key anyway: they
+                    // are all painted over each other in one column. Bound the queue so
+                    // a MIDI that leaves millions of notes ringing does not build a
+                    // multi-hundred-megabyte list here on every seek. The oldest go,
+                    // since the newest are the ones drawn on top.
+                    if queue.len() > max_per_key {
+                        queue.pop_front();
+                    }
                 } else if msg_type == 0x80 || (msg_type == 0x90 && cursor.param2 == 0) {
                     // Close the oldest note still open on this channel and key. A
                     // note-off carries no way to say which of several stacked notes
                     // it ends, so oldest-first is the convention.
-                    if let Some(pos) = open[key].iter().position(|&(_, ch)| ch == channel) {
-                        open[key].remove(pos);
+                    if let Some(queue) = open.get_mut(&(channel, key as u8)) {
+                        queue.pop_front();
                     }
                 }
             }
@@ -399,12 +460,12 @@ pub unsafe fn seek_track_cursor_with_held(
 
     // Flatten, oldest note-on first, so the caller can append them in start order.
     let mut held: Vec<HeldNote> = Vec::new();
-    for (key, notes) in open.iter().enumerate() {
-        for &(start_tick, channel) in notes {
+    for ((channel, key), starts) in open.iter() {
+        for &start_tick in starts {
             held.push(HeldNote {
-                key: key as u8,
+                key: *key,
                 start_tick,
-                channel,
+                channel: *channel,
             });
         }
     }
