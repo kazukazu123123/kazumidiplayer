@@ -66,6 +66,61 @@ pub fn format_time(ns: u64) -> String {
     format!("{:02}:{:02}.{:03}", minutes, seconds, millis)
 }
 
+/// Group a count into thousands, e.g. `1234567` -> `1,234,567`.
+pub fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Abbreviate a count to 3 significant-ish digits, e.g. `1234567` -> `1.23M`.
+pub fn format_count_short(n: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1_000_000_000, "G"), (1_000_000, "M"), (1_000, "K")];
+    for (scale, suffix) in UNITS {
+        if n >= scale {
+            let v = n as f64 / scale as f64;
+            let decimals = if v < 10.0 {
+                2
+            } else if v < 100.0 {
+                1
+            } else {
+                0
+            };
+            return format!("{:.*}{}", decimals, v, suffix);
+        }
+    }
+    n.to_string()
+}
+
+/// Format a byte count with binary units, e.g. `1536` -> `1.50KB`.
+pub fn format_bytes(n: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [
+        (1 << 30, "GB"),
+        (1 << 20, "MB"),
+        (1 << 10, "KB"),
+    ];
+    for (scale, suffix) in UNITS {
+        if n >= scale {
+            let v = n as f64 / scale as f64;
+            let decimals = if v < 10.0 {
+                2
+            } else if v < 100.0 {
+                1
+            } else {
+                0
+            };
+            return format!("{:.*}{}", decimals, v, suffix);
+        }
+    }
+    format!("{}B", n)
+}
+
 pub fn format_measures(weighted_ns: u64, total_weighted_ns: u64) -> String {
     let beat_duration_ns = 500_000_000; // 500ms (120 BPM weighted beat)
     let beats_per_measure = 4;

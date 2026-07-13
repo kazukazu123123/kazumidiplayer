@@ -1,8 +1,11 @@
 use kazumidiparser::MIDIPlayerData;
-use std::ffi::c_void;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
+
+/// A parse-progress snapshot: tracks done and a live per-event count, which is
+/// approximate while tracks are in flight and exact once parsing ends.
+pub use kazumidiparser::Progress as ParseProgress;
 
 pub enum ParserCommand {
     Load(String, kazumidiparser::CancelToken),
@@ -12,25 +15,12 @@ pub enum ParserFeedbackCommand {
     ParseComplete(Arc<MIDIPlayerData>, String, kazumidiparser::CancelToken),
     ParseCancelled(kazumidiparser::CancelToken),
     ParseFailed(String, kazumidiparser::CancelToken),
-    Progress(u16, u16),
+    Progress(ParseProgress),
 }
 
 #[derive(Clone)]
 pub struct MIDIParserWorker {
     tx: Sender<ParserCommand>,
-}
-
-unsafe extern "C" fn progress_callback(
-    current_track: u16,
-    total_tracks: u16,
-    user_data: *mut c_void,
-) {
-    if !user_data.is_null() {
-        // Safety: user_data is guaranteed non-null by the check above.
-        // The pointer is to a Sender<ParserFeedbackCommand> that outlives the callback.
-        let tx = unsafe { &*(user_data as *const Sender<ParserFeedbackCommand>) };
-        let _ = tx.send(ParserFeedbackCommand::Progress(current_track, total_tracks));
-    }
 }
 
 impl MIDIParserWorker {
@@ -54,14 +44,14 @@ impl MIDIParserWorker {
 
                         thread::spawn(move || {
                             let tx_for_progress = tx_feedback.clone();
-                            let tx_ptr =
-                                &tx_for_progress as *const Sender<ParserFeedbackCommand>
-                                    as *mut c_void;
+                            let mut on_progress = |p: ParseProgress| {
+                                let _ = tx_for_progress.send(ParserFeedbackCommand::Progress(p));
+                            };
 
                             let parse_result = MIDIPlayerData::parse(
                                 &path,
-                                Some(progress_callback),
-                                tx_ptr,
+                                1,
+                                Some(&mut on_progress),
                                 Some(&token_clone),
                             );
                             match parse_result {

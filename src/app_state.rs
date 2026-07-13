@@ -1,4 +1,5 @@
 use crate::blur_requester::BlurRequester;
+use crate::midi_parser_worker::ParseProgress;
 use crate::overlay_manager::OverlayManager;
 use crate::player::{PlayerCommand, PlayerFeedback, PlayerState, PlayerHandle};
 use crate::shaking::ShakeState;
@@ -6,8 +7,10 @@ use crate::ui_components::piano_keyboard;
 use crate::utils::get_note_color_by_track_channel;
 use crate::window_manager::{self, InputEvent};
 use raylib::prelude::*;
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppOverlay {
@@ -18,7 +21,14 @@ pub enum AppOverlay {
 
 pub struct AppState {
     // --- Player State ---
-    pub current_progress: Option<(u16, u16)>,
+    pub current_progress: Option<ParseProgress>,
+    /// Ring of `(instant, bytes_done, events_done)` parse-progress snapshots kept for a
+    /// ~0.5s window, so the parse rates are moving averages rather than jumpy deltas.
+    pub parse_rate_samples: VecDeque<(Instant, u64, u64)>,
+    /// Most recent parse speed in events per second, shown in the loading overlay.
+    pub parse_eps: f64,
+    /// Most recent parse speed in bytes per second, shown in the loading overlay.
+    pub parse_bps: f64,
     pub is_dragging_seek: bool,
     pub last_state: PlayerState,
     pub is_loading: bool,
@@ -115,6 +125,9 @@ impl AppState {
         Self {
             // --- Player State ---
             current_progress: None,
+            parse_rate_samples: VecDeque::new(),
+            parse_eps: 0.0,
+            parse_bps: 0.0,
             is_dragging_seek: false,
             last_state: PlayerState::Stopped,
             is_loading: false,
@@ -194,16 +207,16 @@ impl AppState {
         match feedback {
             PlayerFeedback::ParseFailed(path) => {
                 self.is_loading = false;
-                self.current_progress = None;
+                self.reset_parse_progress();
                 println!("[AppState] Parse failed: {}", path);
             }
             PlayerFeedback::ParseCancelled => {
                 self.is_loading = false;
-                self.current_progress = None;
+                self.reset_parse_progress();
             }
             PlayerFeedback::Loaded(path) => {
                 self.is_loading = false;
-                self.current_progress = None;
+                self.reset_parse_progress();
                 self.is_dragging_seek = false;
                 self.last_seek_sent_ns = None;
 
@@ -219,8 +232,44 @@ impl AppState {
                     tx_commands.send(PlayerCommand::Play).ok();
                 }
             }
-            PlayerFeedback::Progress(current, total) => {
-                self.current_progress = Some((current, total));
+            PlayerFeedback::Progress(progress) => {
+                self.current_progress = Some(progress);
+                self.update_parse_rate(progress, Instant::now());
+            }
+        }
+    }
+
+    fn reset_parse_progress(&mut self) {
+        self.current_progress = None;
+        self.parse_rate_samples.clear();
+        self.parse_eps = 0.0;
+        self.parse_bps = 0.0;
+    }
+
+    /// Fold one progress snapshot into the moving-average parse rates. The parser polls
+    /// roughly every millisecond, so a ~0.5s window keeps the numbers readable without
+    /// lagging far behind the real speed.
+    fn update_parse_rate(&mut self, progress: ParseProgress, now: Instant) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+        self.parse_rate_samples
+            .push_back((now, progress.bytes_done, progress.events_done));
+        while let Some(&(t, _, _)) = self.parse_rate_samples.front() {
+            if now.duration_since(t) > WINDOW && self.parse_rate_samples.len() > 2 {
+                self.parse_rate_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if let (Some(&(t0, b0, e0)), Some(&(t1, b1, e1))) = (
+            self.parse_rate_samples.front(),
+            self.parse_rate_samples.back(),
+        ) {
+            let dt = t1.duration_since(t0).as_secs_f64();
+            if dt > 0.0 {
+                self.parse_bps = b1.saturating_sub(b0) as f64 / dt;
+                self.parse_eps = e1.saturating_sub(e0) as f64 / dt;
             }
         }
     }

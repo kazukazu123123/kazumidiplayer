@@ -1356,6 +1356,8 @@ fn main() {
                             screen_height,
                             fade_t,
                             &app_state.current_progress,
+                            app_state.parse_bps,
+                            app_state.parse_eps,
                         );
                     }
                     app_state::AppOverlay::TextEditor => {

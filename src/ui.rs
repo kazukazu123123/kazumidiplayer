@@ -2,7 +2,7 @@ use crate::player::{PlayerCommand, PlayerState};
 use crate::ui_components::button::draw_button;
 use crate::ui_components::scrollbar::draw_scrollbar;
 use crate::ui_components::toggle::draw_toggle;
-use crate::utils::format_time;
+use crate::utils::{format_bytes, format_count, format_count_short, format_time};
 use crate::window_manager::InputEvent;
 use raylib::prelude::*;
 use std::sync::mpsc::Sender;
@@ -198,7 +198,9 @@ pub fn draw_loading_overlay(
     screen_width: i32,
     screen_height: i32,
     t: f32,
-    current_progress: &Option<(u16, u16)>,
+    current_progress: &Option<crate::midi_parser_worker::ParseProgress>,
+    parse_bps: f64,
+    parse_eps: f64,
 ) {
     let eased_t = 1.0 - (1.0 - t).powi(2);
     let scale = 0.95 + 0.05 * eased_t;
@@ -210,7 +212,7 @@ pub fn draw_loading_overlay(
         zoom: scale,
     };
 
-    let panel_rect = Rectangle::new(0.0, 0.0, 400.0, 120.0);
+    let panel_rect = Rectangle::new(0.0, 0.0, 400.0, 148.0);
     let border_color = Color::new(0, 135, 200, (255.0 * eased_t) as u8);
     let text_color = Color::new(240, 240, 240, (255.0 * eased_t) as u8);
 
@@ -233,17 +235,26 @@ pub fn draw_loading_overlay(
             text_color,
         );
 
-        if let Some((current, total)) = current_progress {
-            let progress_text = format!("Processing tracks: {}/{}", current, total);
-            let bar_x = 20.0;
-            let bar_y = 60.0;
-            let bar_w = 360.0;
-            let bar_h = 24.0;
-            let progress_value = if *total > 0 {
-                *current as f32 / *total as f32
+        if let Some(progress) = current_progress {
+            // Bytes consumed is the smoothest completion fraction the parser exposes: it
+            // advances within a track, so it keeps moving on single-huge-track MIDIs where
+            // the track count would sit at 0/1 until the very end.
+            let progress_value = if progress.total_bytes > 0 {
+                progress.bytes_done as f32 / progress.total_bytes as f32
             } else {
                 0.0
             };
+            let progress_text = format!(
+                "{} / {}  ({:.0}%)",
+                format_bytes(progress.bytes_done),
+                format_bytes(progress.total_bytes),
+                progress_value * 100.0,
+            );
+
+            let bar_x = 20.0;
+            let bar_y = 56.0;
+            let bar_w = 360.0;
+            let bar_h = 24.0;
 
             crate::ui_components::progress_bar::draw_progress_bar(
                 &mut d2d,
@@ -255,6 +266,36 @@ pub fn draw_loading_overlay(
                 Some(&progress_text),
                 Color::new(80, 80, 80, (255.0 * eased_t) as u8),
             );
+
+            let events = progress.events_done;
+            let eps = parse_eps.max(0.0) as u64;
+            let sub_color = Color::new(170, 170, 170, (255.0 * eased_t) as u8);
+
+            let lines = [
+                format!(
+                    "Tracks: {}/{}   Events: {} ({})",
+                    progress.tracks_done,
+                    progress.total_tracks,
+                    format_count_short(events),
+                    format_count(events),
+                ),
+                format!(
+                    "Speed:  {}/s   {} ev/s ({}/s)",
+                    format_bytes(parse_bps.max(0.0) as u64),
+                    format_count_short(eps),
+                    format_count(eps),
+                ),
+            ];
+            for (i, line) in lines.iter().enumerate() {
+                d2d.draw_text_ex(
+                    &font,
+                    line,
+                    Vector2::new(bar_x, bar_y + bar_h + 8.0 + i as f32 * 18.0),
+                    16.0,
+                    spacing,
+                    sub_color,
+                );
+            }
         }
     }
 }

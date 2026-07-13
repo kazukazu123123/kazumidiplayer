@@ -34,7 +34,7 @@ pub enum PlayerCommand {
 
 pub enum PlayerFeedback {
     Loaded(String),
-    Progress(u16, u16),
+    Progress(crate::midi_parser_worker::ParseProgress),
 
     ParseFailed(String),
     ParseCancelled,
@@ -352,9 +352,9 @@ impl PlayerHandle {
                             let _ = tx_main_feedback_for_thread
                                 .send(PlayerFeedback::ParseFailed(path));
                         }
-                        ParserFeedbackCommand::Progress(current, total) => {
+                        ParserFeedbackCommand::Progress(progress) => {
                             let _ = tx_main_feedback_for_thread
-                                .send(PlayerFeedback::Progress(current, total));
+                                .send(PlayerFeedback::Progress(progress));
                         }
                     }
                 }
