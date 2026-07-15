@@ -183,13 +183,6 @@ fn main() {
     let mut content_rt_padding: std::collections::HashMap<i32, f32> =
         std::collections::HashMap::new();
 
-    // Canvas bounds for compositing: may be larger than the screen so windows
-    // that extend past the screen edges (or bend beyond their rect) are not clipped.
-    let mut canvas_offset_x = 0i32;
-    let mut canvas_offset_y = 0i32;
-    let mut canvas_width = rl.get_screen_width();
-    let mut canvas_height = rl.get_screen_height();
-
     let blur_shader_src = include_str!("../gaussian_blur.fs");
     let mut blur_shader = rl.load_shader_from_memory(&thread, None, Some(blur_shader_src));
     if blur_shader.id == 0 {
@@ -737,72 +730,11 @@ fn main() {
         let is_mouse_down = rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
         let window_ids = window_manager.get_window_ids_sorted();
 
-        // Compute canvas bounds so off-screen windows (or windows that bend beyond
-        // their rectangle) are not clipped against the global render texture.
-        let bt = window_manager::BORDER_THICKNESS;
-        let mut min_x = 0i32;
-        let mut min_y = 0i32;
-        let mut max_x = rl.get_screen_width();
-        let mut max_y = rl.get_screen_height();
-        for &wid in &window_ids {
-            if let Some(window) = window_manager.get_window(wid) {
-                if !window.visible {
-                    continue;
-                }
-                let left = window.rectangle.left() - bt;
-                let top = window.rectangle.top() - bt;
-                let right = left + window.rectangle.width + 2 * bt;
-                let bottom = top + window.rectangle.height + 2 * bt;
-
-                // Bending windows can extend beyond their rectangle; include padding.
-                let mut extra_top = 0i32;
-                let mut extra_bottom = 0i32;
-                let needs_bend = wid == piano_keyboard_window_handle
-                    || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
-                if needs_bend {
-                    let padding = compute_kb_bend_padding(
-                        (window.rectangle.width + 2 * bt) as f32,
-                        pitch_bend_range,
-                    ) as i32;
-                    extra_top = padding;
-                    extra_bottom = padding;
-                }
-
-                min_x = min_x.min(left);
-                min_y = min_y.min(top - extra_top);
-                max_x = max_x.max(right);
-                max_y = max_y.max(bottom + extra_bottom);
-            }
-        }
-        let new_canvas_offset_x = -min_x;
-        let new_canvas_offset_y = -min_y;
-        let new_canvas_width = max_x - min_x;
-        let new_canvas_height = max_y - min_y;
-
-        if new_canvas_width != canvas_width
-            || new_canvas_height != canvas_height
-            || new_canvas_offset_x != canvas_offset_x
-            || new_canvas_offset_y != canvas_offset_y
-        {
-            canvas_offset_x = new_canvas_offset_x;
-            canvas_offset_y = new_canvas_offset_y;
-            canvas_width = new_canvas_width;
-            canvas_height = new_canvas_height;
-
-            if canvas_width > 0 && canvas_height > 0 {
-                render_texture = rl
-                    .load_render_texture(&thread, canvas_width as u32, canvas_height as u32)
-                    .expect("Failed to recreate render texture");
-                render_texture
-                    .set_texture_filter(&thread, TextureFilter::TEXTURE_FILTER_BILINEAR);
-
-                blur_intermediate_texture = rl
-                    .load_render_texture(&thread, canvas_width as u32, canvas_height as u32)
-                    .expect("Failed to recreate render texture");
-                blur_intermediate_texture
-                    .set_texture_filter(&thread, TextureFilter::TEXTURE_FILTER_BILINEAR);
-            }
-        }
+        // The composite render texture is exactly the screen; it is (re)created only on
+        // window resize, above. It used to grow to enclose off-screen windows and bend
+        // overflow, reallocating every frame as a window was dragged away, all to hold
+        // pixels the physical screen clips anyway. So windows composite straight into
+        // screen space and off-screen content clips as an OS window would.
 
         // Phase 0: Ensure per-window render textures exist and are sized correctly.
         for &wid in &window_ids {
@@ -848,11 +780,7 @@ fn main() {
         }
 
         let mut d = rl.begin_drawing(&thread);
-        // Clear the backbuffer. The final composite blits render_texture shifted by
-        // -canvas_offset, so a strip of width canvas_offset on the right/bottom edge
-        // is left uncovered; without this clear it retains stale pixels from earlier
-        // frames (e.g. the right edge of the top-right stats panel ghosts as the NPS
-        // number changes width).
+        // Clear the backbuffer before the final composite blit covers it.
         d.clear_background(Color::BLACK);
 
         // Phase 1: Render each window (frame + titlebar + content) into its private RT.
@@ -1249,12 +1177,10 @@ fn main() {
             d_rt.clear_background(Color::new(31, 31, 31, 255));
 
             let fps = 1.0 / d_rt.get_frame_time();
-            // Offset by canvas_offset so the FPS text stays at a fixed screen position
-            // after the render_texture is shifted by -canvas_offset during final blit.
             d_rt.draw_text(
                 format!("FPS: {:.2}", fps).as_str(),
-                10 + canvas_offset_x,
-                10 + canvas_offset_y,
+                10,
+                10,
                 20,
                 Color::WHITE,
             );
@@ -1271,8 +1197,8 @@ fn main() {
                 let line_h = 22;
                 let panel_w = 170;
                 let panel_h = pad * 2 + line_h * lines.len() as i32;
-                let px = screen_width - panel_w - 10 + canvas_offset_x;
-                let py = 10 + canvas_offset_y;
+                let px = screen_width - panel_w - 10;
+                let py = 10;
                 let bg_a = (180.0 * stats_alpha) as u8;
                 let border_a = (200.0 * stats_alpha) as u8;
                 let text_a = (255.0 * stats_alpha) as u8;
@@ -1307,10 +1233,11 @@ fn main() {
                     None => continue,
                 };
 
+                let bt = window_manager::BORDER_THICKNESS;
                 let rt_w = win_rt.texture.width as f32;
                 let rt_h = win_rt.texture.height as f32;
-                let screen_x = (window.rectangle.left() - bt) as f32 + canvas_offset_x as f32;
-                let screen_y = (window.rectangle.top() - bt) as f32 + canvas_offset_y as f32;
+                let screen_x = (window.rectangle.left() - bt) as f32;
+                let screen_y = (window.rectangle.top() - bt) as f32;
 
                 let needs_bend = wid == piano_keyboard_window_handle
                     || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
@@ -1384,10 +1311,8 @@ fn main() {
             let screen_h = render_texture.texture.height as f32;
 
             for request in blur_requests {
-                let uv_x = (request.blur_region.x + canvas_offset_x as f32) / screen_w;
-                let uv_y = (screen_h
-                    - (request.blur_region.y + canvas_offset_y as f32)
-                    - request.blur_region.height)
+                let uv_x = request.blur_region.x / screen_w;
+                let uv_y = (screen_h - request.blur_region.y - request.blur_region.height)
                     / screen_h;
                 let uv_w = request.blur_region.width / screen_w;
                 let uv_h = request.blur_region.height / screen_h;
@@ -1441,7 +1366,7 @@ fn main() {
                 render_texture.texture.width as f32,
                 -render_texture.texture.height as f32,
             ),
-            Vector2::new(-canvas_offset_x as f32, -canvas_offset_y as f32),
+            Vector2::new(0.0, 0.0),
             Color::WHITE,
         );
 
