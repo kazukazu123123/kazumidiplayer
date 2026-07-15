@@ -71,7 +71,7 @@ pub enum AppOverlay {
 }
 
 pub struct AppState {
-    // --- Player State ---
+    // Player State
     pub current_progress: Option<ParseProgress>,
     /// Ring of `(instant, bytes_done, events_done)` parse-progress snapshots kept for a
     /// ~0.5s window, so the parse rates are moving averages rather than jumpy deltas.
@@ -96,7 +96,7 @@ pub struct AppState {
     /// Worker threads kazumidiparser uses to parse a file (1..=cpu_threads()).
     pub parse_threads: u32,
 
-    // --- Statistics overlay ---
+    // Statistics overlay
     pub show_stats: bool,
     pub show_stats_animation: f32,
     /// Monotonic clock (seconds) advanced each frame, used to window NPS samples.
@@ -110,7 +110,7 @@ pub struct AppState {
     pub midi_data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub last_seek_sent_ns: Option<u64>,
 
-    // --- Animation ---
+    // Animation
     pub tick_based_animation: f32,
     pub shake_enabled: bool,
     pub shake_animation: f32,
@@ -125,7 +125,7 @@ pub struct AppState {
     pub unlimited_output_enabled: bool,
     pub unlimited_output_animation: f32,
 
-    // --- UI (non-editor) ---
+    // UI (non-editor)
     pub last_input_event: Option<InputEvent>,
     pub settings_scroll_y: f32,
     pub settings_scrollbar_dragging: bool,
@@ -136,7 +136,7 @@ pub struct AppState {
     pub settings_parse_threads_slider_dragging: bool,
     pub speed_slider_dragging: bool,
 
-    // --- Editor ---
+    // Editor
     pub editor_text: String,
     pub editor_scroll_y: f32,
     pub editor_scrollbar_dragging: bool,
@@ -147,7 +147,7 @@ pub struct AppState {
     pub editor_cursor_blink_timer: f32,
     pub editor_cursor_visible: bool,
 
-    // --- Systems ---
+    // Systems
     pub blur_requester: BlurRequester,
     pub overlay_manager: OverlayManager<AppOverlay>,
 }
@@ -190,7 +190,7 @@ fn calculate_tick_map(data: &kazumidiparser::MIDIPlayerData) -> Vec<(u64, u32, u
 impl AppState {
     pub fn new() -> Self {
         Self {
-            // --- Player State ---
+            // Player State
             current_progress: None,
             parse_rate_samples: VecDeque::new(),
             parse_eps: 0.0,
@@ -213,7 +213,7 @@ impl AppState {
             midi_data: None,
             last_seek_sent_ns: None,
 
-            // --- Animation ---
+            // Animation
             tick_based_animation: 0.0,
             shake_enabled: false,
             shake_animation: 0.0,
@@ -228,7 +228,7 @@ impl AppState {
             unlimited_output_enabled: false,
             unlimited_output_animation: 0.0,
 
-            // --- UI (non-editor) ---
+            // UI (non-editor)
             last_input_event: None,
             settings_scroll_y: 0.0,
             settings_scrollbar_dragging: false,
@@ -239,7 +239,7 @@ impl AppState {
             settings_parse_threads_slider_dragging: false,
             speed_slider_dragging: false,
 
-            // --- Editor ---
+            // Editor
             editor_text: String::new(),
             editor_scroll_y: 0.0,
             editor_scrollbar_dragging: false,
@@ -250,7 +250,7 @@ impl AppState {
             editor_cursor_blink_timer: 0.0,
             editor_cursor_visible: true,
 
-            // --- Systems ---
+            // Systems
             blur_requester: BlurRequester::new(),
             overlay_manager: OverlayManager::new(OVERLAY_FADE_DURATION),
         }

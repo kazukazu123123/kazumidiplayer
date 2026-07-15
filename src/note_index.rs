@@ -34,7 +34,7 @@ pub struct SpanningNote {
 
 /// How many spanning notes the index may keep, across all tracks. Some MIDIs have
 /// tens of millions of them (they sustain everything), and holding every one would
-/// cost hundreds of megabytes -- more than the piano roll itself is allowed. Past
+/// cost hundreds of megabytes, more than the piano roll itself is allowed. Past
 /// this the longest notes are kept and the rest dropped: length is what makes a note
 /// both visible (it reaches furthest up the roll) and worth recovering, and the ones
 /// dropped are simply missing, which is what they were before this index existed.

@@ -366,7 +366,7 @@ pub struct HeldNote {
 /// `target_tick`, in note-on order.
 ///
 /// Held notes are tracked per (channel, key), and several note-ons may stack on one
-/// of those before any note-off arrives -- routine in dense MIDI, where a key is
+/// of those before any note-off arrives, which is routine in dense MIDI, where a key is
 /// struck again while it still rings. Each note-off closes the oldest note still
 /// open on its (channel, key), so overlapping notes survive as separate notes
 /// instead of truncating each other.

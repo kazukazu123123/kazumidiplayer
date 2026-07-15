@@ -545,8 +545,8 @@ fn main() {
                         // one with the latest start: that is the note drawn on top in
                         // the piano roll (later notes overwrite earlier ones), so the
                         // key shows the same color as the topmost overlapping note.
-                        // The queue front is already the earliest still-live note --
-                        // passed notes are retired, so no cursor is needed.
+                        // The queue front is already the earliest still-live note,
+                        // since passed notes are retired, so no cursor is needed.
                         let mut chosen: Option<u8> = None;
                         for n in bucket.iter() {
                             // Copy out of the packed struct by value.

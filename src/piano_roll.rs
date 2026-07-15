@@ -413,7 +413,7 @@ fn run_scan(
     // Whether to show this window as it is built rather than only once its visible
     // range is complete. Withholding is what makes a seek land in one piece instead
     // of filling in bottom-to-top, but it only pays when there is already a window on
-    // screen to hold onto. With nothing to show -- a fresh file -- withholding leaves
+    // screen to hold onto. With nothing to show (a fresh file), withholding leaves
     // the roll blank and inert for as long as the scan takes, which on a dense MIDI is
     // seconds. Then it is better to let it fill: the filling *is* the progress bar.
     let reveal_progressively = {
