@@ -7,15 +7,25 @@
 //!
 //! A note is missable exactly when it spans a keyframe (`start < keyframe <= end`),
 //! since the keyframe a seek lands on always sits at or before the target. So indexing
-//! only the notes that span a keyframe is enough to close the hole completely, and
-//! those are rare: they are the notes longer than the gap between keyframes, while a
-//! dense MIDI is overwhelmingly short ones.
+//! only the notes that span a keyframe is enough to close the hole completely.
+//!
+//! Those notes are not rare. It is tempting to reason that they are the ones longer
+//! than the gap between keyframes, and that a dense MIDI is overwhelmingly short
+//! notes, so they must be few. That is backwards. Keyframes are placed every 4096
+//! *events*, not every N ticks, so the denser the track the closer together they
+//! land: on a real 4393-track file, one track had 4850 keyframes over 828k ticks
+//! (~171 ticks apart, shorter than its notes) and 82% of its notes -- 8.1M of 9.9M --
+//! spanned one. Density does not make this index small, it makes it bigger. Hence
+//! `MAX_INDEX_NOTES`, enforced while each track is walked rather than after it.
 //!
 //! Building the index means reading the whole file once, which takes seconds on a
 //! large MIDI. It runs in the background, split across tracks, and seeks keep their
 //! old (lossy) behaviour until it lands.
 
 use kazumidiparser::MIDIPlayerData;
+use rustc_hash::FxHashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -38,6 +48,10 @@ pub struct SpanningNote {
 /// this the longest notes are kept and the rest dropped: length is what makes a note
 /// both visible (it reaches furthest up the roll) and worth recovering, and the ones
 /// dropped are simply missing, which is what they were before this index existed.
+///
+/// It also caps what a single track's walk may hold, so a dense track stages 2M notes
+/// rather than the 8.1M it really has. That bound costs nothing: no track is ever
+/// allowed to keep more than the whole index anyway.
 const MAX_INDEX_NOTES: usize = 2_000_000;
 
 /// Per track, the spanning notes in start-tick order.
@@ -140,7 +154,12 @@ fn build(data: &Arc<MIDIPlayerData>, threads: u32, cancel: &AtomicBool) -> Optio
                     if cancel.load(Ordering::Relaxed) {
                         return None;
                     }
-                    out.push((ti, index_track(&data, ti as u16, end_tick)));
+                    // The budget is the whole index's, not a share of it: no track can
+                    // ever keep more than that anyway, so capping the walk here throws
+                    // away nothing the split below could have kept, while still
+                    // bounding what one track stages to 2M notes instead of the 8.1M a
+                    // dense track really has.
+                    out.push((ti, index_track(&data, ti as u16, end_tick, MAX_INDEX_NOTES)));
                     ti += worker_count;
                 }
                 Some(out)
@@ -158,19 +177,40 @@ fn build(data: &Arc<MIDIPlayerData>, threads: u32, cancel: &AtomicBool) -> Optio
         }
     }
 
+    // Only spend the budget if it is actually exceeded: a file that fits keeps every
+    // note it found.
     let total: usize = by_track.iter().map(|t| t.len()).sum();
     if total > MAX_INDEX_NOTES {
-        // Spend the budget evenly across tracks, and within a track keep the longest
-        // notes. A short spanning note is one that barely crosses a keyframe, so it is
-        // only ever missing from a narrow band of seek positions, and it is also the
-        // one that covers the least of the roll.
-        let per_track = (MAX_INDEX_NOTES / num_tracks.max(1)).max(64);
-        for notes in by_track.iter_mut() {
-            if notes.len() > per_track {
-                notes.select_nth_unstable_by_key(per_track, |n| {
-                    std::cmp::Reverse(n.end_tick.saturating_sub(n.start_tick))
+        // Water-fill: each track gets what it asks for if that fits an equal share of
+        // what is still unspent, and the tracks that want more divide the remainder.
+        // A flat even split hands thousands of empty tracks a share they cannot use
+        // while cutting the few dense ones to the same figure: on a 4393-track file
+        // that is 455 notes each, including for the track with 8.1M to offer. Going
+        // in ascending order of demand is what lets the unused shares fall through to
+        // the tracks that can spend them.
+        let mut order: Vec<usize> = (0..by_track.len()).collect();
+        order.sort_unstable_by_key(|&i| by_track[i].len());
+
+        let mut cap = vec![0usize; by_track.len()];
+        let mut remaining = MAX_INDEX_NOTES;
+        let mut unfilled = order.len();
+        for &i in &order {
+            let share = remaining / unfilled.max(1);
+            let take = by_track[i].len().min(share);
+            cap[i] = take;
+            remaining -= take;
+            unfilled -= 1;
+        }
+
+        // Within a track keep the longest notes. A short spanning note is one that
+        // barely crosses a keyframe, so it is only ever missing from a narrow band of
+        // seek positions, and it is also the one that covers the least of the roll.
+        for (notes, &keep) in by_track.iter_mut().zip(cap.iter()) {
+            if notes.len() > keep {
+                notes.select_nth_unstable_by_key(keep, |n| {
+                    Reverse(n.end_tick.saturating_sub(n.start_tick))
                 });
-                notes.truncate(per_track);
+                notes.truncate(keep);
                 notes.sort_by_key(|n| n.start_tick);
             }
         }
@@ -179,8 +219,14 @@ fn build(data: &Arc<MIDIPlayerData>, threads: u32, cancel: &AtomicBool) -> Optio
     Some(NoteIndex { by_track })
 }
 
-/// Walk one track start to end, emitting the notes that span a keyframe.
-fn index_track(data: &Arc<MIDIPlayerData>, track: u16, end_tick: u32) -> Vec<SpanningNote> {
+/// Walk one track start to end, keeping the longest `budget` notes that span a
+/// keyframe.
+fn index_track(
+    data: &Arc<MIDIPlayerData>,
+    track: u16,
+    end_tick: u32,
+    budget: usize,
+) -> Vec<SpanningNote> {
     // Safety: the Arc keeps the C MIDI struct alive for this call, and `track` is
     // within the track count the caller read from the same struct.
     let parser = unsafe { &*data.as_ptr() };
@@ -194,11 +240,21 @@ fn index_track(data: &Arc<MIDIPlayerData>, track: u16, end_tick: u32) -> Vec<Spa
         return Vec::new();
     };
 
-    // Open notes per key, in note-on order, each carrying the channel that opened it.
-    // Note-ons stack on a key rather than replacing each other, and a note-off closes
-    // the oldest note on its channel: same rule the piano-roll scan follows.
-    let mut open: [Vec<(u32, u8)>; 128] = std::array::from_fn(|_| Vec::new());
-    let mut spanning: Vec<SpanningNote> = Vec::new();
+    // Open notes per (channel, key), oldest first. Note-ons stack on a key rather than
+    // replacing each other, and a note-off closes the oldest note on its channel: same
+    // rule the piano-roll scan follows.
+    //
+    // A queue rather than a list, so a note-off closes the oldest in O(1). This was a
+    // `Vec` searched with `position` and cut with `remove`, which is a scan plus a
+    // shift of the tail on every single note-off: on a track that leaves tens of
+    // thousands of notes ringing on one key that is quadratic, and it is what stopped
+    // this build from ever finishing. `seek_track_cursor_with_held` keeps a queue for
+    // exactly this reason.
+    let mut open: FxHashMap<(u8, u8), VecDeque<u32>> = FxHashMap::default();
+
+    // The longest spanning notes seen so far, shortest at the top so it is the one
+    // evicted once the track is over budget: (duration, start_tick, key, channel).
+    let mut longest: BinaryHeap<Reverse<(u32, u32, u8, u8)>> = BinaryHeap::new();
 
     // Does a keyframe fall in (start, end]? That is exactly when a seek landing on it
     // would start its walk after this note began, and so never see the note-on.
@@ -207,12 +263,28 @@ fn index_track(data: &Arc<MIDIPlayerData>, track: u16, end_tick: u32) -> Vec<Spa
         keyframes.get(i).is_some_and(|&k| k <= end)
     };
 
+    // Offer a closed note to the index, keeping it only if it spans a keyframe and is
+    // long enough to earn one of the track's slots.
+    let keep = |start: u32,
+                end: u32,
+                key: u8,
+                channel: u8,
+                longest: &mut BinaryHeap<Reverse<(u32, u32, u8, u8)>>| {
+        if !spans_keyframe(start, end) {
+            return;
+        }
+        longest.push(Reverse((end.saturating_sub(start), start, key, channel)));
+        if longest.len() > budget {
+            longest.pop();
+        }
+    };
+
     while unsafe { cursor_next(&mut cursor) } {
         if cursor.is_tempo || cursor.abs_tick > end_tick {
             continue;
         }
         let msg_type = cursor.status & 0xF0;
-        let key = cursor.param1 as usize;
+        let key = cursor.param1;
         if key >= 128 {
             continue;
         }
@@ -220,36 +292,33 @@ fn index_track(data: &Arc<MIDIPlayerData>, track: u16, end_tick: u32) -> Vec<Spa
         let tick = cursor.abs_tick;
 
         if msg_type == 0x90 && cursor.param2 > 0 {
-            open[key].push((tick, channel));
+            open.entry((channel, key)).or_default().push_back(tick);
         } else if msg_type == 0x80 || (msg_type == 0x90 && cursor.param2 == 0) {
-            if let Some(pos) = open[key].iter().position(|&(_, ch)| ch == channel) {
-                let (start, ch) = open[key].remove(pos);
-                if spans_keyframe(start, tick) {
-                    spanning.push(SpanningNote {
-                        start_tick: start,
-                        end_tick: tick,
-                        key: key as u8,
-                        channel: ch,
-                    });
-                }
+            // Close the oldest note still open on this channel and key. A note-off
+            // carries no way to say which of several stacked notes it ends, so
+            // oldest-first is the convention.
+            if let Some(start) = open.get_mut(&(channel, key)).and_then(|q| q.pop_front()) {
+                keep(start, tick, key, channel, &mut longest);
             }
         }
     }
 
     // Notes never closed run to the end of the MIDI, as the roll draws them.
-    for (key, notes) in open.iter().enumerate() {
-        for &(start, ch) in notes {
-            if spans_keyframe(start, end_tick) {
-                spanning.push(SpanningNote {
-                    start_tick: start,
-                    end_tick: end_tick,
-                    key: key as u8,
-                    channel: ch,
-                });
-            }
+    for (&(channel, key), starts) in open.iter() {
+        for &start in starts {
+            keep(start, end_tick, key, channel, &mut longest);
         }
     }
 
+    let mut spanning: Vec<SpanningNote> = longest
+        .into_iter()
+        .map(|Reverse((duration, start_tick, key, channel))| SpanningNote {
+            start_tick,
+            end_tick: start_tick.saturating_add(duration),
+            key,
+            channel,
+        })
+        .collect();
     spanning.sort_by_key(|n| n.start_tick);
     spanning
 }
