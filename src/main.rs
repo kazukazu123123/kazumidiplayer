@@ -304,7 +304,7 @@ fn main() {
                 None => true,
             };
             if is_new {
-                note_index_worker.start(data.clone(), app_state.parse_threads);
+                note_index_worker.start(data.clone(), app_state.index_threads);
                 note_index_data = Some(data);
             }
         }
@@ -1412,6 +1412,8 @@ fn main() {
                             &mut app_state.settings_pb_multiplier_slider_dragging,
                             &mut app_state.parse_threads,
                             &mut app_state.settings_parse_threads_slider_dragging,
+                            &mut app_state.index_threads,
+                            &mut app_state.settings_index_threads_slider_dragging,
                             &mut app_state.scan_delay_ms,
                             &mut app_state.settings_scan_delay_slider_dragging,
                             &mut app_state.show_stats,

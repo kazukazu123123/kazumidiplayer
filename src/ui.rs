@@ -484,6 +484,8 @@ pub fn draw_settings_overlay(
     pb_multiplier_slider_dragging: &mut bool,
     parse_threads: &mut u32,
     parse_threads_slider_dragging: &mut bool,
+    index_threads: &mut u32,
+    index_threads_slider_dragging: &mut bool,
     scan_delay_ms: &mut u32,
     scan_delay_slider_dragging: &mut bool,
     show_stats: &mut bool,
@@ -862,6 +864,62 @@ pub fn draw_settings_overlay(
                             }
                         } else {
                             *parse_threads_slider_dragging = false;
+                        }
+                    }
+                }
+            }
+
+            // Note Index Threads slider: 1..=hardware threads. Applies to the next load.
+            // Below the hardware count by default, since this build competes with the
+            // playback it is meant to improve.
+            {
+                let max_threads = crate::app_state::cpu_threads();
+                let y = layout.next(38.0);
+                if is_visible(sy(y), 38.0) {
+                    *index_threads = (*index_threads).clamp(1, max_threads);
+                    let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
+                    let label = format!("Note Index Threads: {} / {}", *index_threads, max_threads);
+                    d_scissor.draw_text_ex(
+                        &font,
+                        &label,
+                        Vector2::new(slider_rect.x, sy(y)),
+                        16.0,
+                        1.0,
+                        text_color,
+                    );
+                    d_scissor.draw_rectangle(
+                        slider_rect.x as i32,
+                        (slider_rect.y + 8.0) as i32,
+                        slider_rect.width as i32,
+                        4,
+                        Color::new(80, 80, 80, (255.0 * eased_t) as u8),
+                    );
+                    // A single-core machine has no range to drag: pin the thumb at the end.
+                    let span = (max_threads - 1) as f32;
+                    let t = if span > 0.0 {
+                        ((*index_threads - 1) as f32 / span).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let thumb_x = slider_rect.x + t * slider_rect.width;
+                    let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
+                    d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
+
+                    if let Some(cp) = click_pos {
+                        if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
+                            *index_threads_slider_dragging = true;
+                        }
+                    }
+
+                    if *index_threads_slider_dragging {
+                        if is_mouse_down {
+                            if span > 0.0 {
+                                let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
+                                let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
+                                *index_threads = (new_t * span).round() as u32 + 1;
+                            }
+                        } else {
+                            *index_threads_slider_dragging = false;
                         }
                     }
                 }
