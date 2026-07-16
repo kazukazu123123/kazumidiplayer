@@ -246,7 +246,7 @@ unsafe fn jump_to_keyframe(data: &KazuMIDIParserData, cursor: &mut TrackCursor, 
 
         let kf = &*kf_ptr.add(lo);
         let track_start_offset = *data.track_index.add(ti);
-        cursor.p = data.raw.add(track_start_offset + kf.raw_offset);
+        cursor.p = data.raw.add(track_start_offset + kf.track_offset as usize);
         cursor.abs_tick = kf.abs_tick;
         cursor.running_status = kf.running_status;
         cursor.skip_next_delta = true;
