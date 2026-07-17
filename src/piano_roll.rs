@@ -43,16 +43,21 @@ const OPEN_END: u32 = u32::MAX;
 /// `utils::note_color_index`). `end_tick == OPEN_END` means the note is still being
 /// held (note-off not scanned yet).
 ///
-/// Packed to 9 bytes (vs 12 with the full track/channel + a redundant note byte)
+/// Packed to 10 bytes (vs 12 with the full track/channel + a redundant note byte)
 /// to keep dense-MIDI buckets small; the key is the bucket index, so it isn't
 /// stored per note. Fields are only ever read/written by value, never by
 /// reference, which is sound for `repr(packed)`.
+///
+/// `color` needs both its bytes, and shrinking it back to one costs more than the
+/// byte is worth: a one-byte index runs out after sixteen tracks and paints the rest
+/// in an earlier track's color. Only a window around the playhead is resident, so
+/// the byte does not scale with the file.
 #[derive(Clone, Copy)]
 #[repr(packed)]
 pub struct RollNote {
     pub start_tick: u32,
     pub end_tick: u32,
-    pub color: u8,
+    pub color: u16,
 }
 
 /// A sliding window of piano-roll draw data, filled in by the worker as playback

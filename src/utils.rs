@@ -45,23 +45,44 @@ pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
     curve(y1, y2, u.clamp(0.0, 1.0))
 }
 
-// Fold a (track, channel) pair into a single 0..255 color-palette index. This is
-// all the color depends on, so it can be stored as one byte per note instead of
-// keeping the full track (u16) + channel (u8).
-pub fn note_color_index(track_index: u16, channel: u8) -> u8 {
-    // 256-color palette (16 tracks x 16 channels = 256 combinations)
-    let track_idx = if track_index == u16::MAX { 0 } else { track_index as usize };
-    ((track_idx * 16 + channel as usize) % 256) as u8
+// Palette index reserved for "no track": color by channel alone. Real tracks index
+// below it, so it doubles as the modulus that keeps them out of its range.
+const NO_TRACK: u16 = 0xFFF0;
+
+// Fold a (track, channel) pair into a color-palette index: the low 4 bits are the
+// channel, the rest the track.
+//
+// The index must not be narrowed to a byte. A byte fits sixteen tracks before
+// `track * 16 + channel` wraps and tracks begin sharing a color, and MIDIs here run
+// to thousands of tracks. Notes stacked on one key are told apart by nothing but
+// their color, so a shared one makes a dense file unreadable rather than merely
+// drab.
+pub fn note_color_index(track_index: u16, channel: u8) -> u16 {
+    let channel = (channel & 0x0F) as u32;
+    if track_index == u16::MAX {
+        return NO_TRACK | channel as u16;
+    }
+    ((track_index as u32 * 16 + channel) % NO_TRACK as u32) as u16
 }
 
 // Get note color from a palette index (see `note_color_index`).
-pub fn get_note_color_by_index(index: u8) -> (u8, u8, u8) {
-    let combined_index = index as usize;
+pub fn get_note_color_by_index(index: u16) -> (u8, u8, u8) {
+    let channel = (index & 0x0F) as usize;
 
-    // Generate color in HSV color space (vary hue)
-    let hue = (combined_index as f32 * 360.0 / 256.0) % 360.0;
-    let saturation = 0.7 + ((combined_index % 3) as f32 * 0.1);
-    let value = 0.8 + ((combined_index % 2) as f32 * 0.15);
+    if index >= NO_TRACK {
+        // No track to distinguish, so the channel gets the hue to itself.
+        return hsv_to_rgb(channel as f32 * 360.0 / 16.0, 0.8, 0.95);
+    }
+
+    // Golden-angle hue stepping: consecutive tracks land far apart on the wheel, and
+    // no two repeat within a file's worth of them. Stepping evenly instead gives
+    // neighbouring tracks neighbouring hues, which reads as one gradient rather than
+    // as separate voices. Channels are shades of their track's hue rather than hues
+    // of their own, so a track still reads as one voice.
+    let track = (index >> 4) as f32;
+    let hue = (track * 137.507_76) % 360.0;
+    let saturation = 0.75 + (channel % 3) as f32 * 0.08;
+    let value = 0.78 + (channel % 4) as f32 * 0.06;
 
     hsv_to_rgb(hue, saturation, value)
 }
@@ -184,4 +205,55 @@ pub fn format_measures(weighted_ns: u64, total_weighted_ns: u64) -> String {
     let current_measure = current_measure.min(total_measures);
 
     format!("{}/{}", current_measure, total_measures.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the wrap a one-byte index brings back: `track * 16 + channel` modulo
+    /// 256 lands track 16 on track 0's color, 17 on 1's, and so on.
+    #[test]
+    fn tracks_past_the_sixteenth_keep_their_own_color() {
+        for track in 1..64u16 {
+            assert_ne!(
+                note_color_index(track, 0),
+                note_color_index(0, 0),
+                "track {track} collides with track 0"
+            );
+        }
+    }
+
+    #[test]
+    fn every_track_gets_a_distinct_index() {
+        let mut seen = std::collections::HashSet::new();
+        for track in 0..4095u16 {
+            assert!(
+                seen.insert(note_color_index(track, 0)),
+                "track {track} reuses an index"
+            );
+        }
+    }
+
+    /// Channels are shades of their track's hue, so they must not collide either.
+    #[test]
+    fn channels_within_a_track_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for channel in 0..16u8 {
+            assert!(seen.insert(note_color_index(7, channel)));
+        }
+    }
+
+    #[test]
+    fn no_track_sentinel_colors_by_channel_alone() {
+        // Distinct per channel, and never confusable with a real track's index.
+        let mut seen = std::collections::HashSet::new();
+        for channel in 0..16u8 {
+            let idx = note_color_index(u16::MAX, channel);
+            assert!(seen.insert(idx));
+            for track in 0..4095u16 {
+                assert_ne!(idx, note_color_index(track, channel));
+            }
+        }
+    }
 }

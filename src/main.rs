@@ -540,7 +540,7 @@ fn main() {
                         // key shows the same color as the topmost overlapping note.
                         // The queue front is already the earliest still-live note,
                         // since passed notes are retired, so no cursor is needed.
-                        let mut chosen: Option<u8> = None;
+                        let mut chosen: Option<u16> = None;
                         for n in bucket.iter() {
                             // Copy out of the packed struct by value.
                             let start_tick = n.start_tick;
