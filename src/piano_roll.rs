@@ -10,10 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::kazumidiparser_cursor::{
-    cursor_next, keyframe_tick_for, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held,
-    TrackCursor,
+    cursor_next, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held, TrackCursor,
 };
-use crate::note_index::NoteIndex;
 use crate::ui_components::piano_keyboard::get_keyboard_note_regions;
 use crate::utils::get_note_color_by_index;
 
@@ -185,9 +183,6 @@ struct RollRequest {
     /// Which chunk slot to fill. It is the one the draw is *not* reading; the scan
     /// flips `live` to it once the visible range is complete.
     build_slot: usize,
-    /// Absent until the background index is built. Without it the scan cannot see
-    /// notes that began before the keyframe it seeks from, and they go missing.
-    index: Option<Arc<NoteIndex>>,
 }
 
 /// Compute the topmost visible tick (the future point shown at the top edge),
@@ -241,9 +236,6 @@ pub struct PianoRollWorker {
     /// Set on shutdown so a running scan bails and the thread can be joined before
     /// the process tears down (avoids killing the thread mid-allocation).
     shutdown: Arc<AtomicBool>,
-    /// The background note index, once built. Handed to each scan so it can restore
-    /// the notes a keyframe seek cannot see.
-    note_index: Mutex<Option<Arc<NoteIndex>>>,
 }
 
 /// Holds a chunk's reader registration for as long as a draw is reading it.
@@ -295,7 +287,6 @@ impl PianoRollWorker {
                     req.start_tick,
                     req.priority_tick,
                     req.generation,
-                    req.index.clone(),
                     &latest_for_thread,
                     &chunks_for_thread,
                     req.build_slot,
@@ -316,14 +307,7 @@ impl PianoRollWorker {
             scan_delay_ms,
             target_tick,
             shutdown,
-            note_index: Mutex::new(None),
         }
-    }
-
-    /// Hand the worker the finished note index. Scans started after this see the notes
-    /// that a keyframe seek would otherwise miss; the caller regenerates to apply it.
-    pub fn set_note_index(&self, index: Arc<NoteIndex>) {
-        *self.note_index.lock().unwrap() = Some(index);
     }
 
     /// The chunk the draw reads, registered as a reader so `commit` cannot recycle
@@ -465,7 +449,6 @@ impl PianoRollWorker {
                 priority_tick,
                 generation,
                 build_slot,
-                index: self.note_index.lock().unwrap().clone(),
             });
         }
     }
@@ -487,7 +470,6 @@ fn run_scan(
     start_tick: u32,
     priority_tick: u32,
     generation: u64,
-    index: Option<Arc<NoteIndex>>,
     latest: &AtomicU64,
     chunks: &[Arc<RollChunk>; 2],
     build_slot: usize,
@@ -610,7 +592,6 @@ fn run_scan(
         let mut handles = Vec::with_capacity(worker_count);
         for w in 0..worker_count {
             let data = data.clone();
-            let index = index.clone();
             handles.push(scope.spawn(move || {
                 // Safety: the Arc keeps the C MIDI struct alive for this call.
                 let parser = unsafe { &*data.as_ptr() };
@@ -620,8 +601,11 @@ fn run_scan(
                 while ti < num_tracks {
                     // Safety: ti < num_tracks; parser valid for this call. Each track
                     // also reports notes already held at `start_tick`, so notes
-                    // spanning the seek point still render.
-                    let (cur, mut held) = unsafe {
+                    // spanning the seek point still render -- except those that began
+                    // before the keyframe the walk starts from, whose note-on it never
+                    // reads. Those are simply missing from the roll until playback
+                    // reaches a rebuild that starts before them.
+                    let (cur, held) = unsafe {
                         seek_track_cursor_with_held(
                             parser,
                             ti as u16,
@@ -629,21 +613,6 @@ fn run_scan(
                             MAX_SOUNDING_PER_KEY,
                         )
                     };
-                    // The walk begins at a keyframe and so cannot see notes that began
-                    // before it. The index knows those; merge them in.
-                    if let Some(index) = &index {
-                        let kf = unsafe { keyframe_tick_for(parser, ti as u16, start_tick) };
-                        let missed = index.missed_at(ti as u16, kf, start_tick);
-                        if !missed.is_empty() {
-                            held.extend(missed.into_iter().map(|n| {
-                                crate::kazumidiparser_cursor::HeldNote {
-                                    key: n.key,
-                                    start_tick: n.start_tick,
-                                    channel: n.channel,
-                                }
-                            }));
-                        }
-                    }
                     out.push((ti, cur, held));
                     ti += worker_count;
                 }

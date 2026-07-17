@@ -95,11 +95,6 @@ pub struct AppState {
     pub playback_speed: f32,
     /// Worker threads kazumidiparser uses to parse a file (1..=cpu_threads()).
     pub parse_threads: u32,
-    /// Worker threads the note index build uses (1..=cpu_threads()). Defaults to two
-    /// below the hardware count: the build is a background nicety, and the player
-    /// thread busy-waits on song time rather than sleeping, so an index handed every
-    /// core starves the playback it exists to improve.
-    pub index_threads: u32,
 
     // Statistics overlay
     pub show_stats: bool,
@@ -139,7 +134,6 @@ pub struct AppState {
     pub settings_pb_multiplier_slider_dragging: bool,
     pub settings_scan_delay_slider_dragging: bool,
     pub settings_parse_threads_slider_dragging: bool,
-    pub settings_index_threads_slider_dragging: bool,
     pub speed_slider_dragging: bool,
 
     // Editor
@@ -210,7 +204,6 @@ impl AppState {
             scan_delay_ms: 0,
             playback_speed: 1.0,
             parse_threads: cpu_threads(),
-            index_threads: cpu_threads().saturating_sub(2).max(1),
             show_stats: true,
             show_stats_animation: 0.0,
             stats_clock: 0.0,
@@ -244,7 +237,6 @@ impl AppState {
             settings_pb_multiplier_slider_dragging: false,
             settings_scan_delay_slider_dragging: false,
             settings_parse_threads_slider_dragging: false,
-            settings_index_threads_slider_dragging: false,
             speed_slider_dragging: false,
 
             // Editor

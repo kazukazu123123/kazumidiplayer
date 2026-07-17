@@ -264,51 +264,6 @@ unsafe fn jump_to_keyframe(data: &KazuMIDIParserData, cursor: &mut TrackCursor, 
     }
 }
 
-/// The tick of the keyframe a seek to `target_tick` would jump to, i.e. the point a
-/// held-note walk starts from. Notes that were already sounding at this tick are the
-/// ones such a walk cannot see, so this is what a note index is queried against.
-///
-/// # Safety
-/// - `data` must be valid and `track_idx` within bounds.
-pub unsafe fn keyframe_tick_for(data: &KazuMIDIParserData, track_idx: u16, target_tick: u32) -> u32 {
-    unsafe {
-        let ti = track_idx as usize;
-        let kc = *data.keyframe_counts.add(ti);
-        if kc == 0 {
-            return 0;
-        }
-        let kf_ptr = *data.keyframes.add(ti);
-        let mut lo = 0usize;
-        let mut hi = kc;
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2;
-            if (*kf_ptr.add(mid)).abs_tick <= target_tick {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        (*kf_ptr.add(lo)).abs_tick
-    }
-}
-
-/// The ticks of every keyframe in a track, ascending. Used to decide which notes span
-/// a keyframe and therefore need indexing.
-///
-/// # Safety
-/// - `data` must be valid and `track_idx` within bounds.
-pub unsafe fn keyframe_ticks(data: &KazuMIDIParserData, track_idx: u16) -> Vec<u32> {
-    unsafe {
-        let ti = track_idx as usize;
-        let kc = *data.keyframe_counts.add(ti);
-        if kc == 0 {
-            return Vec::new();
-        }
-        let kf_ptr = *data.keyframes.add(ti);
-        (0..kc).map(|j| (*kf_ptr.add(j)).abs_tick).collect()
-    }
-}
-
 /// Seek a track cursor to the first event at or after the given tick.
 ///
 /// # Safety
