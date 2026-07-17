@@ -533,7 +533,7 @@ fn main() {
                     kazumidiparser_cursor::ns_to_tick(parser_data, playback_position_ns);
                 piano_roll_worker.with_chunk(|chunk| {
                     for note in 0..128usize {
-                        let bucket = &chunk.notes_by_key[note];
+                        let bucket = chunk.notes_by_key[note].lock().unwrap();
                         // Among notes covering `now` (start <= now < end), pick the
                         // one with the latest start: that is the note drawn on top in
                         // the piano roll (later notes overwrite earlier ones), so the
@@ -541,7 +541,7 @@ fn main() {
                         // The queue front is already the earliest still-live note,
                         // since passed notes are retired, so no cursor is needed.
                         let mut chosen: Option<u16> = None;
-                        for n in bucket.iter() {
+                        for n in bucket.notes.iter() {
                             // Copy out of the packed struct by value.
                             let start_tick = n.start_tick;
                             if start_tick > current_tick {
@@ -551,6 +551,7 @@ fn main() {
                                 chosen = Some(n.color);
                             }
                         }
+                        drop(bucket);
                         if let Some(color) = chosen {
                             let (r, g, b) = utils::get_note_color_by_index(color);
                             let o = note * 4;
@@ -971,7 +972,7 @@ fn main() {
 
                                     let roll_area = Rectangle::new(cx, cy, cw, roll_h);
                                     // Render every frame from the (possibly still
-                                    // generating) chunk via CPU rasterization.
+                                    // generating) chunk.
                                     piano_roll_worker.with_chunk(|chunk| {
                                         piano_roll::draw_piano_roll_chunk(
                                             &mut d_scissor,

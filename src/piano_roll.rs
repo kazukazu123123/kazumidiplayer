@@ -10,7 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::kazumidiparser_cursor::{
-    cursor_next, keyframe_tick_for, ns_to_tick, seek_track_cursor_with_held, TrackCursor,
+    cursor_next, keyframe_tick_for, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held,
+    TrackCursor,
 };
 use crate::note_index::NoteIndex;
 use crate::ui_components::piano_keyboard::get_keyboard_note_regions;
@@ -43,6 +44,20 @@ pub const MAX_NOTE_SPEED: f32 = 128.0;
 /// note-off is found.
 const OPEN_END: u32 = u32::MAX;
 
+/// How dark a note's 1px outline is, as a percentage of the note's own color. A
+/// shade of the note rather than flat black: on a dense MIDI the outlines meet, and
+/// black ones add up to a black roll.
+pub(crate) const BORDER_SHADE: u32 = 45;
+
+/// A note thinner than this on an axis gets no outline across it. Any thinner and
+/// the outline is the whole note, so a dense stretch comes out a flat dark block,
+/// which hides more than the merged fills the outline is there to separate.
+pub(crate) const MIN_OUTLINED_PX: usize = 3;
+
+/// Marks a packed column pixel as already outlined, so it is not darkened a second
+/// time. Sits above the 24 color bits and the occupancy bit.
+const EDGE_BIT: u32 = 1 << 25;
+
 /// A single note rectangle in tick space (resolved to pixels at draw time).
 /// `color` is the palette index for the per-voice color (see
 /// `utils::note_color_index`). `end_tick == OPEN_END` means the note is still being
@@ -65,6 +80,26 @@ pub struct RollNote {
     pub color: u16,
 }
 
+/// One key's notes, and the bookkeeping that has to stay in step with them.
+///
+/// `generation` lives here rather than on the chunk so that a publish's "is this
+/// scan still current?" check and its append are one atomic step under this key's
+/// lock. A chunk-level generation could go stale between the check and the append,
+/// letting an abandoned scan write notes into a bucket `regenerate` had just
+/// cleared.
+#[derive(Default)]
+pub struct KeyBucket {
+    pub generation: u64,
+    /// Notes in start-tick order. A note may have `end_tick == OPEN_END` while it is
+    /// still held; its end is patched in on note-off. Notes that playback has passed
+    /// are popped off the front by `retire`.
+    pub notes: VecDeque<RollNote>,
+    /// Count of notes popped off the front so far. The scan addresses notes by an
+    /// absolute index (total ever appended to this key), so subtracting this maps an
+    /// absolute index to the current queue position.
+    retired: u64,
+}
+
 /// A sliding window of piano-roll draw data, filled in by the worker as playback
 /// approaches and drained from behind as playback passes. Notes are bucketed per
 /// key and, within a bucket, kept in start-tick order (the scan appends in global
@@ -73,30 +108,73 @@ pub struct RollNote {
 ///
 /// Only the window is ever resident, so memory is bounded by how much of the roll
 /// is on screen, not by the length or note count of the MIDI.
+///
+/// Locked per key, not as a whole. One mutex over the entire chunk meant the scan
+/// thread's every publish had to wait for the draw thread to finish a frame --
+/// which is 128 columns of rasterization *and* every GPU rectangle call for them,
+/// since the draw held the lock across all of it. Measured on a dense MIDI, that was
+/// 9.6 seconds of lock wait against 0.5 seconds of actual scanning: the scan was
+/// blocked ~95% of the time and only ran in the gaps between frames. Splitting the
+/// lock per key means a publish for one key contends only with the draw of that same
+/// key's column, and the draw releases each key's lock before it touches the GPU.
+///
+/// The scalar fields are atomics so that reading the frontier never takes a lock at
+/// all.
 pub struct RollChunk {
-    pub generation: u64,
-    pub scan_frontier_tick: u32,
-    pub window_start_tick: u32,
-    pub done: bool,
-    /// Per-key note queues, in start-tick order. A note may have `end_tick ==
-    /// OPEN_END` while it is still held; its end is patched in on note-off. Notes
-    /// that playback has passed are popped off the front by `retire`.
-    pub notes_by_key: [VecDeque<RollNote>; 128],
-    /// Per-key count of notes popped off the front so far. The scan addresses notes
-    /// by an absolute index (total ever appended to that key), so subtracting this
-    /// maps an absolute index to the current queue position.
-    retired: [u64; 128],
+    /// Mirrors the per-bucket generation, so a superseded scan can bail out of a
+    /// publish without taking 128 locks to discover it. The buckets' own copies stay
+    /// authoritative for anything that writes notes.
+    pub generation: AtomicU64,
+    pub scan_frontier_tick: AtomicU32,
+    pub window_start_tick: AtomicU32,
+    pub done: AtomicBool,
+    /// Draws currently reading this chunk. `commit` waits for this to fall to zero
+    /// before recycling the chunk it swapped out, so a draw already in flight is
+    /// never cleared out from under itself. Without it the per-key locks would let a
+    /// commit blank the keys a mid-frame draw had not reached yet.
+    readers: AtomicUsize,
+    pub notes_by_key: [Mutex<KeyBucket>; 128],
 }
 
 impl Default for RollChunk {
     fn default() -> Self {
         Self {
-            generation: 0,
-            scan_frontier_tick: 0,
-            window_start_tick: 0,
-            done: false,
-            notes_by_key: std::array::from_fn(|_| VecDeque::new()),
-            retired: [0; 128],
+            generation: AtomicU64::new(0),
+            scan_frontier_tick: AtomicU32::new(0),
+            window_start_tick: AtomicU32::new(0),
+            done: AtomicBool::new(false),
+            readers: AtomicUsize::new(0),
+            notes_by_key: std::array::from_fn(|_| Mutex::new(KeyBucket::default())),
+        }
+    }
+}
+
+impl RollChunk {
+    /// Reset every bucket to `generation` and hand back the memory they held.
+    /// The buffers are freed after each key's lock is released: `free` takes the
+    /// allocator's lock, and holding a bucket against that is exactly the kind of
+    /// stall this split exists to avoid.
+    fn reset(&self, generation: u64, start_tick: u32) {
+        self.generation.store(generation, Ordering::SeqCst);
+        for slot in self.notes_by_key.iter() {
+            let mut b = slot.lock().unwrap();
+            b.generation = generation;
+            b.retired = 0;
+            let old = std::mem::take(&mut b.notes);
+            drop(b);
+            drop(old);
+        }
+        self.scan_frontier_tick.store(start_tick, Ordering::SeqCst);
+        self.window_start_tick.store(start_tick, Ordering::SeqCst);
+        self.done.store(false, Ordering::SeqCst);
+    }
+
+    /// Block until no draw is reading this chunk. Only called by `commit`, on the
+    /// chunk it has just swapped *out*, so the wait is at most the tail of one frame.
+    fn wait_for_readers(&self) {
+        while self.readers.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+            thread::yield_now();
         }
     }
 }
@@ -151,7 +229,7 @@ pub fn future_tick(
 pub struct PianoRollWorker {
     tx: Option<Sender<RollRequest>>,
     handle: Option<JoinHandle<()>>,
-    chunks: [Arc<Mutex<RollChunk>>; 2],
+    chunks: [Arc<RollChunk>; 2],
     /// Which of `chunks` the draw reads. The scan fills the other one and flips
     /// this when the new window is ready to show.
     live: Arc<AtomicUsize>,
@@ -173,12 +251,23 @@ pub struct PianoRollWorker {
     note_index: Mutex<Option<Arc<NoteIndex>>>,
 }
 
+/// Holds a chunk's reader registration for as long as a draw is reading it.
+pub struct ReaderGuard<'a> {
+    chunk: &'a RollChunk,
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        self.chunk.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl PianoRollWorker {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel::<RollRequest>();
         let chunks = [
-            Arc::new(Mutex::new(RollChunk::default())),
-            Arc::new(Mutex::new(RollChunk::default())),
+            Arc::new(RollChunk::default()),
+            Arc::new(RollChunk::default()),
         ];
         let live = Arc::new(AtomicUsize::new(0));
         let latest_generation = Arc::new(AtomicU64::new(0));
@@ -242,9 +331,20 @@ impl PianoRollWorker {
         *self.note_index.lock().unwrap() = Some(index);
     }
 
-    /// The chunk the draw reads. The scan may be filling the other one.
-    fn live_chunk(&self) -> &Mutex<RollChunk> {
-        &self.chunks[self.live.load(Ordering::SeqCst)]
+    /// The chunk the draw reads, registered as a reader so `commit` cannot recycle
+    /// it mid-frame. Re-reads `live` after registering: a commit that flips `live`
+    /// between the two reads would otherwise have already checked `readers` and
+    /// found it zero, and would clear the chunk under us.
+    fn acquire_live(&self) -> ReaderGuard<'_> {
+        loop {
+            let slot = self.live.load(Ordering::SeqCst);
+            let chunk = &self.chunks[slot];
+            chunk.readers.fetch_add(1, Ordering::SeqCst);
+            if self.live.load(Ordering::SeqCst) == slot {
+                return ReaderGuard { chunk };
+            }
+            chunk.readers.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     pub fn set_scan_delay_ms(&self, ms: u32) {
@@ -267,30 +367,47 @@ impl PianoRollWorker {
     /// the queues are start-sorted, so the first note still alive stops the pop and
     /// a long note holds back everything behind it (exactly what the draw needs).
     pub fn retire(&self, current_tick: u32) {
-        let mut g = self.live_chunk().lock().unwrap();
-        for key in 0..128usize {
-            let bucket = &mut g.notes_by_key[key];
+        let guard = self.acquire_live();
+        for slot in guard.chunk.notes_by_key.iter() {
+            let mut b = slot.lock().unwrap();
             let mut popped = 0u64;
-            while let Some(front) = bucket.front() {
+            while let Some(front) = b.notes.front() {
                 // Copy out of the packed struct before comparing.
                 let end = front.end_tick;
                 if end >= current_tick {
                     break;
                 }
-                bucket.pop_front();
+                b.notes.pop_front();
                 popped += 1;
             }
-            g.retired[key] += popped;
+            b.retired += popped;
 
             // A VecDeque keeps its high-water capacity forever, and it grows by
             // doubling. On a dense MIDI that slack ran to a hundred megabytes of
             // untouched memory. Hand it back once a bucket is holding more than
             // twice what it uses. The 4096 floor keeps this from reallocating over
             // and over on the small, busy buckets.
-            let bucket = &mut g.notes_by_key[key];
-            let (len, cap) = (bucket.len(), bucket.capacity());
-            if cap > 4096 && cap > len.saturating_mul(2) {
-                bucket.shrink_to_fit();
+            //
+            // `shrink_to_fit` allocates a new buffer, copies into it, and frees the
+            // old one. All three take time, and the first and last take the
+            // allocator's lock, so none of it belongs under a bucket the scan is
+            // trying to publish into: this key's queue can hold a dense screenful.
+            //
+            // So only the copy stays. The replacement buffer is allocated before the
+            // lock is taken (from the length seen last frame -- if it moved, the copy
+            // below just grows it again, which is a plain `extend`), and the old
+            // buffer is dropped after it is released.
+            let (len, cap) = (b.notes.len(), b.notes.capacity());
+            let shrink = cap > 4096 && cap > len.saturating_mul(2);
+            drop(b);
+
+            if shrink {
+                let mut fresh = VecDeque::with_capacity(len.next_power_of_two().max(4096));
+                let mut b = slot.lock().unwrap();
+                fresh.extend(b.notes.iter().copied());
+                let discarded = std::mem::replace(&mut b.notes, fresh);
+                drop(b);
+                drop(discarded);
             }
         }
     }
@@ -306,8 +423,8 @@ impl PianoRollWorker {
     }
 
     pub fn with_chunk<R>(&self, f: impl FnOnce(&RollChunk) -> R) -> R {
-        let guard = self.live_chunk().lock().unwrap();
-        f(&guard)
+        let guard = self.acquire_live();
+        f(guard.chunk)
     }
 
     /// Cancel any running scan and hand the worker a fresh request to stream a
@@ -334,31 +451,17 @@ impl PianoRollWorker {
         let build_slot = 1 - live_slot;
 
         if drop_visible {
-            let mut g = self.chunks[live_slot].lock().unwrap();
-            for bucket in g.notes_by_key.iter_mut() {
-                bucket.clear();
-                bucket.shrink_to_fit();
-            }
-            g.retired = [0; 128];
-            g.done = false;
-            g.scan_frontier_tick = start_tick;
-            g.window_start_tick = start_tick;
+            // No scan ever writes the live slot (the new one fills `build_slot`), so
+            // the generation stamped here is inert; it only has to not be an older
+            // one an abandoned scan might still be holding.
+            self.chunks[live_slot].reset(generation, start_tick);
         }
 
-        {
-            // Empty the build slot for the new generation. Anything in it is either
-            // an abandoned build or the window we swapped out last time.
-            let mut g = self.chunks[build_slot].lock().unwrap();
-            g.generation = generation;
-            g.scan_frontier_tick = start_tick;
-            g.window_start_tick = start_tick;
-            g.done = false;
-            for bucket in g.notes_by_key.iter_mut() {
-                bucket.clear();
-                bucket.shrink_to_fit();
-            }
-            g.retired = [0; 128];
-        }
+        // Empty the build slot for the new generation. Anything in it is either an
+        // abandoned build or the window we swapped out last time. Stamping the new
+        // generation into every bucket is also what stops a superseded scan from
+        // publishing into it: each publish re-checks under the same bucket lock.
+        self.chunks[build_slot].reset(generation, start_tick);
 
         if let Some(tx) = &self.tx {
             let _ = tx.send(RollRequest {
@@ -391,7 +494,7 @@ fn run_scan(
     generation: u64,
     index: Option<Arc<NoteIndex>>,
     latest: &AtomicU64,
-    chunks: &[Arc<Mutex<RollChunk>>; 2],
+    chunks: &[Arc<RollChunk>; 2],
     build_slot: usize,
     live: &AtomicUsize,
     scan_delay: &AtomicU32,
@@ -411,13 +514,14 @@ fn run_scan(
         *committed = true;
         live.store(build_slot, Ordering::SeqCst);
 
-        let mut old = chunks[1 - build_slot].lock().unwrap();
-        for bucket in old.notes_by_key.iter_mut() {
-            bucket.clear();
-            bucket.shrink_to_fit();
-        }
-        old.retired = [0; 128];
-        old.done = false;
+        // Recycle the window just swapped out. A draw that started before the store
+        // above is still walking it key by key, and clearing under it would blank
+        // whichever keys it had not reached; wait for it to finish first. Any draw
+        // starting after the store picks up the new slot, so this wait is bounded by
+        // one frame.
+        let old = &chunks[1 - build_slot];
+        old.wait_for_readers();
+        old.reset(generation, start_tick);
     };
 
     // Whether to show this window as it is built rather than only once its visible
@@ -426,10 +530,10 @@ fn run_scan(
     // screen to hold onto. With nothing to show (a fresh file), withholding leaves
     // the roll blank and inert for as long as the scan takes, which on a dense MIDI is
     // seconds. Then it is better to let it fill: the filling *is* the progress bar.
-    let reveal_progressively = {
-        let live_chunk = chunks[1 - build_slot].lock().unwrap();
-        live_chunk.notes_by_key.iter().all(|b| b.is_empty())
-    };
+    let reveal_progressively = chunks[1 - build_slot]
+        .notes_by_key
+        .iter()
+        .all(|b| b.lock().unwrap().notes.is_empty());
 
     // Safety: the Arc keeps the C MIDI struct alive for this call.
     let parser = unsafe { &*data.as_ptr() };
@@ -473,7 +577,10 @@ fn run_scan(
     // rather than pushing a note at a time and re-checking capacity on each.
     let mut batch: [Vec<RollNote>; 128] = std::array::from_fn(|_| Vec::new());
     let mut staged = 0usize;
-    let mut patches: Vec<(u8, u64, u32)> = Vec::new();
+    // Patches are staged per key for the same reason as appends: publish walks the
+    // keys once, locking each bucket a single time for both.
+    let mut patches: [Vec<(u64, u32)>; 128] = std::array::from_fn(|_| Vec::new());
+    let mut patch_count = 0usize;
 
     // What is sounding at `start_tick`, kept to the newest MAX_SOUNDING_PER_KEY notes
     // on each key as the tracks are walked.
@@ -495,29 +602,83 @@ fn run_scan(
     // note kept on that key, so all the tombstones sit at the front of the queue.
     let mut evicted: FxHashMap<(u16, u8, u8), u64> = FxHashMap::default();
 
-    for ti in 0..num_tracks {
-        // Safety: ti < num_tracks; parser valid for this call. Each track also
-        // reports notes already held at `start_tick`, so notes spanning the seek
-        // point still render.
-        let (cur, mut held) = unsafe {
-            seek_track_cursor_with_held(parser, ti as u16, start_tick, MAX_SOUNDING_PER_KEY)
-        };
-        // The walk begins at a keyframe and so cannot see notes that began before it.
-        // The index knows those; merge them in, keeping start order.
-        if let Some(index) = &index {
-            let kf = unsafe { keyframe_tick_for(parser, ti as u16, start_tick) };
-            let missed = index.missed_at(ti as u16, kf, start_tick);
-            if !missed.is_empty() {
-                held.extend(missed.into_iter().map(|n| {
-                    crate::kazumidiparser_cursor::HeldNote {
-                        key: n.key,
-                        start_tick: n.start_tick,
-                        channel: n.channel,
+    // Seek every track to `start_tick`, in parallel. This is the one part of a scan
+    // that splits cleanly: a track's seek reads only its own events and the shared
+    // (immutable) index, so nothing here depends on another track. On a 4393-track
+    // file it was ~50 ms of the ~300 ms a seek took to show anything, and it is a
+    // fixed cost paid on every single seek.
+    //
+    // Stride rather than block: track lengths vary wildly, and interleaving keeps one
+    // thread from drawing all the long ones.
+    let worker_count = (crate::app_state::cpu_threads().max(1) as usize).min(num_tracks.max(1));
+    let seeded = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for w in 0..worker_count {
+            let data = data.clone();
+            let index = index.clone();
+            handles.push(scope.spawn(move || {
+                // Safety: the Arc keeps the C MIDI struct alive for this call.
+                let parser = unsafe { &*data.as_ptr() };
+                let mut out: Vec<(usize, TrackCursor, Vec<crate::kazumidiparser_cursor::HeldNote>)> =
+                    Vec::new();
+                let mut ti = w;
+                while ti < num_tracks {
+                    // Safety: ti < num_tracks; parser valid for this call. Each track
+                    // also reports notes already held at `start_tick`, so notes
+                    // spanning the seek point still render.
+                    let (cur, mut held) = unsafe {
+                        seek_track_cursor_with_held(
+                            parser,
+                            ti as u16,
+                            start_tick,
+                            MAX_SOUNDING_PER_KEY,
+                        )
+                    };
+                    // The walk begins at a keyframe and so cannot see notes that began
+                    // before it. The index knows those; merge them in.
+                    if let Some(index) = &index {
+                        let kf = unsafe { keyframe_tick_for(parser, ti as u16, start_tick) };
+                        let missed = index.missed_at(ti as u16, kf, start_tick);
+                        if !missed.is_empty() {
+                            held.extend(missed.into_iter().map(|n| {
+                                crate::kazumidiparser_cursor::HeldNote {
+                                    key: n.key,
+                                    start_tick: n.start_tick,
+                                    channel: n.channel,
+                                }
+                            }));
+                        }
                     }
-                }));
-            }
+                    out.push((ti, cur, held));
+                    ti += worker_count;
+                }
+                out
+            }));
         }
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .collect::<Vec<_>>()
+    });
 
+    // Fold the seeks back together in track order. `sounding` keeps the newest 128
+    // starts per key, which is the same set whatever order they arrive in, but the
+    // heap merge below wants `cursors` indexed by track, so put them back in order.
+    let mut per_track: Vec<Option<(TrackCursor, Vec<crate::kazumidiparser_cursor::HeldNote>)>> =
+        (0..num_tracks).map(|_| None).collect();
+    for chunk in seeded {
+        for (ti, cur, held) in chunk {
+            per_track[ti] = Some((cur, held));
+        }
+    }
+
+    for (ti, entry) in per_track.into_iter().enumerate() {
+        let Some((cur, held)) = entry else {
+            // A worker panicked; treat the track as empty rather than mis-indexing
+            // every track after it.
+            cursors.push(unsafe { seek_track_cursor(parser, ti as u16, start_tick) });
+            continue;
+        };
         for note in held {
             let newest = &mut sounding[note.key as usize];
             newest.push(Reverse((note.start_tick, ti as u16, note.channel)));
@@ -575,34 +736,56 @@ fn run_scan(
 
     // Flush queued appends + patches and advance the frontier. Returns false if a
     // newer generation took over (caller should abandon the scan).
+    //
+    // One key at a time: each bucket is locked, given its appends and its patches
+    // together, and released before the next is touched. A key with no work is not
+    // locked at all. The draw holds the same locks, but only one column's worth and
+    // only while rasterizing it, so the two threads now interleave instead of the
+    // scan waiting out whole frames.
     let publish = |batch: &mut [Vec<RollNote>; 128],
                    staged: &mut usize,
-                   patches: &mut Vec<(u8, u64, u32)>,
+                   patches: &mut [Vec<(u64, u32)>; 128],
+                   patch_count: &mut usize,
                    frontier: u32|
      -> bool {
-        let mut g = chunk.lock().unwrap();
-        if g.generation != generation {
+        // Cheap early-out on a superseded scan, before taking any lock.
+        if chunk.generation.load(Ordering::SeqCst) != generation {
             return false;
         }
         *staged = 0;
-        for (key, run) in batch.iter_mut().enumerate() {
-            if !run.is_empty() {
-                g.notes_by_key[key].extend(run.drain(..));
-            }
-        }
-        for (key, idx, end) in patches.drain(..) {
-            let key = key as usize;
-            // Absolute index -> current queue position. A note whose index is below
-            // the retired count has already scrolled out of the window; its end no
-            // longer exists to patch, so the patch is simply dropped.
-            let Some(pos) = idx.checked_sub(g.retired[key]) else {
+        *patch_count = 0;
+
+        for (key, (run, key_patches)) in batch.iter_mut().zip(patches.iter_mut()).enumerate() {
+            if run.is_empty() && key_patches.is_empty() {
                 continue;
-            };
-            if let Some(slot) = g.notes_by_key[key].get_mut(pos as usize) {
-                slot.end_tick = end;
+            }
+            let mut b = chunk.notes_by_key[key].lock().unwrap();
+
+            // Re-checked under the bucket's own lock: this and the writes below have
+            // to be one step, or a `regenerate` landing between them would have its
+            // freshly cleared bucket refilled by this abandoned scan.
+            if b.generation != generation {
+                return false;
+            }
+            b.notes.extend(run.drain(..));
+            for (idx, end) in key_patches.drain(..) {
+                // Absolute index -> current queue position. A note whose index is
+                // below the retired count has already scrolled out of the window; its
+                // end no longer exists to patch, so the patch is simply dropped.
+                let Some(pos) = idx.checked_sub(b.retired) else {
+                    continue;
+                };
+                if let Some(slot) = b.notes.get_mut(pos as usize) {
+                    slot.end_tick = end;
+                }
             }
         }
-        g.scan_frontier_tick = frontier;
+
+        // The frontier is only a reveal hint, so it is not worth a lock: a
+        // `regenerate` racing the check above can leave one stale value here, on a
+        // chunk that now holds no notes (so nothing is drawn) and whose new scan
+        // overwrites it on its very first publish.
+        chunk.scan_frontier_tick.store(frontier, Ordering::SeqCst);
         true
     };
 
@@ -619,7 +802,7 @@ fn run_scan(
         while tick > target.load(Ordering::Relaxed) {
             let frontier = target.load(Ordering::Relaxed);
             events_since_publish = 0;
-            if !publish(&mut batch, &mut staged, &mut patches, frontier) {
+            if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, frontier) {
                 return;
             }
             priority_done = true;
@@ -638,7 +821,7 @@ fn run_scan(
                 // case let it fill in bottom-to-top as it is found.
                 if last_tick >= priority_tick {
                     events_since_publish = 0;
-                    if !publish(&mut batch, &mut staged, &mut patches, last_tick) {
+                    if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
                         return;
                     }
                     if latest.load(Ordering::SeqCst) != generation
@@ -650,7 +833,7 @@ fn run_scan(
                     commit(&mut committed);
                 } else if reveal_progressively && events_since_publish >= 2048 {
                     events_since_publish = 0;
-                    if !publish(&mut batch, &mut staged, &mut patches, last_tick) {
+                    if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
                         return;
                     }
                     // Swap this half-built window in: it is replacing an empty one, so
@@ -671,7 +854,7 @@ fn run_scan(
                     let sleep = Duration::from_millis(delay as u64);
                     while last_tick < tick {
                         last_tick += 1;
-                        if !publish(&mut batch, &mut staged, &mut patches, last_tick) {
+                        if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
                             return;
                         }
                         if latest.load(Ordering::SeqCst) != generation
@@ -686,7 +869,7 @@ fn run_scan(
                     // events.
                     if events_since_publish >= 2048 {
                         events_since_publish = 0;
-                        if !publish(&mut batch, &mut staged, &mut patches, last_tick) {
+                        if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
                             return;
                         }
                         if latest.load(Ordering::SeqCst) != generation
@@ -730,7 +913,8 @@ fn run_scan(
                         // note it stands for was never put in the roll.
                         if let Some(idx) = queue.pop_front() {
                             if idx != DROPPED {
-                                patches.push((key as u8, idx, tick));
+                                patches[key].push((idx, tick));
+                                patch_count += 1;
                             }
                         }
                     }
@@ -764,7 +948,7 @@ fn run_scan(
         // millions of notes on a single tick, and staging them all would duplicate a
         // screenful in memory. The frontier is only advanced to the last *complete*
         // tick, so this never reveals a half-scanned one.
-        if staged >= MAX_STAGED || patches.len() >= MAX_STAGED {
+        if staged >= MAX_STAGED || patch_count >= MAX_STAGED {
             // Hold the frontier at the window start while the reveal is being withheld;
             // publishing `last_tick` there would leak a partial visible window, which is
             // exactly what the withholding exists to prevent.
@@ -774,7 +958,7 @@ fn run_scan(
                 start_tick
             };
             events_since_publish = 0;
-            if !publish(&mut batch, &mut staged, &mut patches, frontier) {
+            if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, frontier) {
                 return;
             }
             if latest.load(Ordering::SeqCst) != generation || shutdown.load(Ordering::Relaxed) {
@@ -786,24 +970,151 @@ fn run_scan(
     // Notes still ringing at the end extend to the final tick.
     for ((_, _, key), queue) in open.iter() {
         for idx in queue.iter().filter(|&&idx| idx != DROPPED) {
-            patches.push((*key, *idx, end_tick));
+            patches[*key as usize].push((*idx, end_tick));
+            patch_count += 1;
         }
     }
 
     // Final publish: flush the rest and mark done. The scan can reach the end of the
     // MIDI without ever passing the priority tick (a short tail, or a seek near the
     // end), so this is also the last chance to show what was built.
-    if !publish(&mut batch, &mut staged, &mut patches, end_tick) {
+    if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, end_tick) {
         return;
     }
-    {
-        let mut g = chunk.lock().unwrap();
-        if g.generation != generation {
-            return;
-        }
-        g.done = true;
+    if chunk.generation.load(Ordering::SeqCst) != generation {
+        return;
     }
+    chunk.done.store(true, Ordering::SeqCst);
     commit(&mut committed);
+}
+
+#[inline]
+fn pack(c: (u8, u8, u8)) -> u32 {
+    (1u32 << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32)
+}
+
+/// A note's outline: its own color, darkened, and flagged as already darkened so the
+/// side pass leaves it alone. Without the flag the corners, where a top or bottom
+/// edge meets a side, get darkened twice.
+#[inline]
+fn darken(packed: u32) -> u32 {
+    if packed & EDGE_BIT != 0 {
+        return packed;
+    }
+    let ch = |shift: u32| ((packed >> shift) & 0xFF) * BORDER_SHADE / 100;
+    (1u32 << 24) | EDGE_BIT | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// Index of the first note starting above `limit`, in the deque's logical order.
+/// The bucket is start-sorted, so every note from here on is off the top of the view.
+fn first_note_above(notes: &VecDeque<RollNote>, limit: u32) -> usize {
+    // A VecDeque is a ring, so its contents are up to two slices; each is sorted and
+    // the head's notes all precede the tail's.
+    let (head, tail) = notes.as_slices();
+    let in_head = head.partition_point(|n| n.start_tick <= limit);
+    if in_head < head.len() {
+        in_head
+    } else {
+        head.len() + tail.partition_point(|n| n.start_tick <= limit)
+    }
+}
+
+/// How far back a row's lookup will walk before giving up on finding a note that
+/// covers it. The walk only continues while the notes it passes end *below* the row,
+/// which in a dense stretch means it stops on the first one; the cap is there for a
+/// key holding a rest, where nothing covers the row and the walk would otherwise
+/// scan the whole bucket for every row of the gap.
+const MAX_LOOKBACK: usize = 64;
+
+/// Fill one key's column by asking each pixel which note it shows, rather than by
+/// painting every note and letting them cover each other up.
+///
+/// Painting was measured at ~4.9M notes a frame to produce ~14k rectangles: a pixel
+/// row holds about 285 notes' worth of starts, and 284 of them are painted over. The
+/// waste is not spread across the column, it is *within a row* -- which matters,
+/// because the bucket is start-sorted, so the notes landing in one row are a
+/// contiguous run of it. That makes the winner findable instead of paintable:
+///
+/// - a note reaches this row only if it starts at or before the row's top tick, and
+///   those notes are a prefix of the bucket (binary search, `first_note_above`);
+/// - the roll paints later notes over earlier ones, so the winner is the *last* note
+///   of that prefix which also still ends at or after the row's bottom tick.
+///
+/// The cost stops scaling with the note count and starts scaling with the pixel
+/// count. Measured on the frame that used to touch 4.9M notes: 35k lookups, and every
+/// single one of them found its winner on the first note it checked.
+///
+/// `owner` records which note won each row, so the emit pass can still tell two
+/// touching notes of the same colour apart and outline them separately -- reading the
+/// colour alone would merge them into one block.
+fn rasterize_column(
+    bucket: &Mutex<KeyBucket>,
+    col: &mut [u32],
+    owner: &mut [u32],
+    row_tick: &[u32],
+    current_tick: u32,
+    effective_top: u32,
+) {
+    let b = bucket.lock().unwrap();
+    if b.notes.is_empty() {
+        return;
+    }
+    for slot in col.iter_mut() {
+        *slot = 0;
+    }
+    for slot in owner.iter_mut() {
+        *slot = u32::MAX;
+    }
+
+    for r in 0..col.len() {
+        // The ticks this pixel row covers. Clamped to the window: above the frontier
+        // nothing has been generated, below the playhead nothing is drawn.
+        let t_hi = row_tick[r].min(effective_top);
+        let t_lo = row_tick[r + 1].max(current_tick);
+        if t_hi < t_lo {
+            continue;
+        }
+
+        let prefix = first_note_above(&b.notes, t_hi);
+        if prefix == 0 {
+            continue;
+        }
+
+        // Walk back from the newest note that could reach this row. Each one passed
+        // over is a note that ended before the row starts, i.e. one that is genuinely
+        // not here -- not one being covered up.
+        for (k, n) in b.notes.range(..prefix).rev().enumerate() {
+            if k >= MAX_LOOKBACK {
+                break;
+            }
+            if n.end_tick >= t_lo {
+                col[r] = pack(get_note_color_by_index(n.color));
+                owner[r] = (prefix - 1 - k) as u32;
+                break;
+            }
+        }
+    }
+
+    // Outline each note's visible extent, top and bottom. Per run of one owner rather
+    // than per note: a note that is partly covered only shows where it won, and that
+    // is the edge worth drawing.
+    let mut r = 0usize;
+    while r < col.len() {
+        if owner[r] == u32::MAX {
+            r += 1;
+            continue;
+        }
+        let run_start = r;
+        let who = owner[r];
+        while r < col.len() && owner[r] == who {
+            r += 1;
+        }
+        if r - run_start >= MIN_OUTLINED_PX {
+            let edge = darken(col[run_start]);
+            col[run_start] = edge;
+            col[r - 1] = edge;
+        }
+    }
 }
 
 /// Draw a scrolling piano roll from the (possibly still-generating) chunk.
@@ -821,138 +1132,94 @@ pub fn draw_piano_roll_chunk(
     chunk: &RollChunk,
 ) {
     let current_tick = ns_to_tick(data, playback_position_ns);
-
     let speed = note_speed.max(MIN_NOTE_SPEED);
     let bottom = area.y + area.height;
     let height = area.height;
-    // Scale the visible span with the window height so pixels-per-time stays
-    // constant: a taller window shows more future, it does not stretch notes.
+    // Scale the visible span with the window height so pixels-per-time stays constant:
+    // a taller window shows more future, it does not stretch notes.
     let height_scale = (height / REFERENCE_HEIGHT).max(0.01);
+    let height_px = (area.height.ceil() as usize).max(1);
+    let top_y = area.y;
 
-    // tick -> y mapping; y(now) = bottom, y(top) = top of the area.
-    let (top_tick, tick_to_y): (u32, Box<dyn Fn(u32) -> f32>) = if is_tick_based {
+    // The tick at each pixel row's top edge; row 0 is the top of the view (furthest
+    // future) and row `height_px` is the playhead, so this is non-increasing. Row r
+    // therefore covers ticks [row_tick[r + 1], row_tick[r]].
+    //
+    // This is the inverse of the old tick -> y mapping, and it is the only direction
+    // the rasterizer needs now that pixels look their note up instead of notes
+    // painting themselves onto pixels. Both axis modes build it, so there is one path
+    // rather than a closure per mode.
+    let mut row_tick = vec![0u32; height_px + 1];
+    let top_tick = if is_tick_based {
         let division = (data.header.division as u32).max(1);
-        let span = (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
-        let start = current_tick;
-        (
-            current_tick.saturating_add(span),
-            Box::new(move |tick: u32| {
-                let progress = tick.saturating_sub(start) as f32 / span as f32;
-                bottom - progress.min(1.0) * height
-            }),
-        )
-    } else {
-        let current_ns = playback_position_ns;
-        let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
-        let top_tick = ns_to_tick(data, current_ns.saturating_add(span_ns));
-        // Invert tick->ns once per pixel row instead of per note edge. row_tick[r]
-        // is the tick at the top boundary of local pixel row r (r=0 is the top /
-        // furthest future, larger r is lower / closer to now); the array is
-        // non-increasing. Mapping a note tick to y is then a binary search with no
-        // per-note tempo-map walk or 128-bit division.
-        let top_y = area.y;
-        let rows = (height.ceil() as usize).max(1) + 1;
-        let mut row_tick = vec![0u32; rows];
+        let span =
+            (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
         for (r, slot) in row_tick.iter_mut().enumerate() {
-            let y = top_y + r as f32;
-            let progress = ((bottom - y) / height).clamp(0.0, 1.0);
-            let ns = current_ns.saturating_add((progress * span_ns as f32) as u64);
+            let progress = ((bottom - (top_y + r as f32)) / height).clamp(0.0, 1.0);
+            *slot = current_tick.saturating_add((progress * span as f32) as u32);
+        }
+        current_tick.saturating_add(span)
+    } else {
+        let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
+        for (r, slot) in row_tick.iter_mut().enumerate() {
+            let progress = ((bottom - (top_y + r as f32)) / height).clamp(0.0, 1.0);
+            let ns = playback_position_ns.saturating_add((progress * span_ns as f32) as u64);
             *slot = ns_to_tick(data, ns);
         }
-        (
-            top_tick,
-            Box::new(move |tick: u32| {
-                // First row whose tick boundary is <= tick (row_tick is
-                // non-increasing): the pixel where this tick lands.
-                let mut lo = 0usize;
-                let mut hi = row_tick.len();
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    if row_tick[mid] > tick {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                top_y + lo as f32
-            }),
-        )
+        ns_to_tick(data, playback_position_ns.saturating_add(span_ns))
     };
 
     // Reveal only up to the scan frontier; notes above it are not generated yet.
-    let effective_top = top_tick.min(chunk.scan_frontier_tick).max(current_tick);
+    let effective_top = top_tick
+        .min(chunk.scan_frontier_tick.load(Ordering::SeqCst))
+        .max(current_tick);
 
     let regions = get_keyboard_note_regions(area.width);
 
-    // Per-key column rasterization: composite each key's notes (in start order,
-    // later-on-top painter's order) into a 1-pixel-wide color column on the CPU,
-    // then emit one rectangle per contiguous same-color run. This caps GPU draw
-    // calls at ~screen-height per key instead of one per note, so density (black
-    // MIDI) no longer explodes the draw-call count.
-    let height_px = (area.height.ceil() as usize).max(1);
-    let top_y = area.y;
-    // Packed color: 0 = empty, else (1<<24) | rgb.
-    let mut col: Vec<u32> = vec![0u32; height_px];
+    // All 128 columns, back to back. Packed color per pixel: 0 = empty, else
+    // (1<<24) | rgb. `owners` runs alongside so the emit pass can separate two
+    // touching notes that happen to share a colour.
+    let mut cols: Vec<u32> = vec![0u32; 128 * height_px];
+    let mut owners: Vec<u32> = vec![u32::MAX; 128 * height_px];
 
-    let pack = |c: (u8, u8, u8)| -> u32 {
-        (1u32 << 24) | ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32)
-    };
-    // Writes a tick-space note span into the column.
-    let write = |col: &mut [u32], y_top: f32, y_bottom: f32, packed: u32| {
-        let a = (y_top - top_y).floor().max(0.0) as usize;
-        let b = ((y_bottom - top_y).ceil() as usize).min(col.len());
-        let a = a.min(col.len());
-        for slot in &mut col[a..b.max(a)] {
-            *slot = packed;
-        }
-    };
+    let worker_count = (crate::app_state::cpu_threads().max(1) as usize).min(128);
+    let mut assignments: Vec<Vec<(usize, &mut [u32], &mut [u32])>> =
+        (0..worker_count).map(|_| Vec::new()).collect();
+    for (key, (col, own)) in cols
+        .chunks_mut(height_px)
+        .zip(owners.chunks_mut(height_px))
+        .enumerate()
+    {
+        assignments[key % worker_count].push((key, col, own));
+    }
 
-    for note in 0..128usize {
-        let bucket = &chunk.notes_by_key[note];
-        if bucket.is_empty() {
-            continue;
+    let row_tick_ref = &row_tick[..];
+    thread::scope(|scope| {
+        for mine in assignments {
+            scope.spawn(move || {
+                for (key, col, own) in mine {
+                    rasterize_column(
+                        &chunk.notes_by_key[key],
+                        col,
+                        own,
+                        row_tick_ref,
+                        current_tick,
+                        effective_top,
+                    );
+                }
+            });
         }
+    });
+
+    // Emit one rectangle per contiguous same-color run.
+    //
+    // The left and right edges are drawn per run rather than per note: every note on
+    // a key spans the key's full width, so those two edges are the same two columns
+    // of pixels for all of them.
+    for (note, col) in cols.chunks(height_px).enumerate() {
         let (rx, rw) = regions[note];
         let x = area.x + rx;
-
-        for slot in col.iter_mut() {
-            *slot = 0;
-        }
-
-        // The queue front is already the first note that can still be visible:
-        // `retire` pops fully-ended notes off the front as playback passes them,
-        // so the draw starts scanning right at the live range.
-        for n in bucket.iter() {
-            // The bucket is start-sorted, so once a note starts above the view the
-            // rest do too.
-            if n.start_tick > effective_top {
-                break;
-            }
-            // A short note after a long one may still be past; skip it. Held notes
-            // carry OPEN_END; clamping below grows them to the frontier.
-            if n.end_tick < current_tick {
-                continue;
-            }
-            // Copy out of the packed struct by value before use.
-            let start_tick = n.start_tick;
-            let end_tick = n.end_tick;
-            let color = n.color;
-            let s = start_tick.max(current_tick);
-            let e = end_tick.min(effective_top);
-            if e <= s {
-                continue;
-            }
-            let y_bottom = tick_to_y(s);
-            let y_top = tick_to_y(e);
-            write(
-                &mut col,
-                y_top,
-                y_bottom,
-                pack(get_note_color_by_index(color)),
-            );
-        }
-
-        // Emit one rectangle per contiguous same-color run.
+        let outline_sides = rw >= MIN_OUTLINED_PX as f32;
         let mut yy = 0usize;
         while yy < height_px {
             let p = col[yy];
@@ -964,11 +1231,15 @@ pub fn draw_piano_roll_chunk(
             while yy < height_px && col[yy] == p {
                 yy += 1;
             }
-            let color = Color::new((p >> 16) as u8, (p >> 8) as u8, p as u8, 255);
-            d.draw_rectangle_rec(
-                Rectangle::new(x, top_y + run_start as f32, rw, (yy - run_start) as f32),
-                color,
-            );
+            let unpack = |v: u32| Color::new((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
+            let y = top_y + run_start as f32;
+            let h = (yy - run_start) as f32;
+            d.draw_rectangle_rec(Rectangle::new(x, y, rw, h), unpack(p));
+            if outline_sides {
+                let edge = unpack(darken(p));
+                d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
+                d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
+            }
         }
     }
 }

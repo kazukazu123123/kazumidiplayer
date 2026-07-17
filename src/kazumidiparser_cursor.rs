@@ -24,6 +24,17 @@ pub struct TrackCursor {
     pub header_checked: bool,
 }
 
+/// Safety: the pointers are into the parser's raw MIDI buffer, which is immutable
+/// for as long as the `MIDIPlayerData` behind them is alive, and every caller holds
+/// an `Arc` to it. A cursor is a read-only position in that buffer, so handing one
+/// to another thread only moves where it is read from, never what it reads. The
+/// piano roll's setup seeks its tracks in parallel and returns the cursors, which is
+/// what needs this.
+///
+/// `Send` only, deliberately: two threads sharing *one* cursor would race on
+/// `cursor_next`, which mutates it.
+unsafe impl Send for TrackCursor {}
+
 /// Read a variable-length value from a MIDI byte stream.
 ///
 /// # Safety
