@@ -117,6 +117,19 @@ fn compute_kb_bend_padding(win_width: f32, pitch_bend_range: f32) -> f32 {
     (max_dy + 2.0).max(0.0)
 }
 
+// Height the keyboard takes off the bottom of the Piano Roll window when it is
+// integrated. The 75 white keys span the full width, so deriving the height from
+// one key's width keeps a real keyboard's proportions as the window widens,
+// instead of smearing the keys out against a fixed height. The roll keeps the
+// larger half: on a wide, short window the ratio would otherwise eat all of it.
+fn compute_integrated_keyboard_height(content_width: f32, content_height: f32) -> f32 {
+    const WHITE_KEY_ASPECT: f32 = 6.0;
+    let white_key_width = content_width / 75.0;
+    (white_key_width * WHITE_KEY_ASPECT)
+        .min(content_height * 0.5)
+        .max(0.0)
+}
+
 fn main() {
     let mut app_state = AppState::new();
 
@@ -375,8 +388,11 @@ fn main() {
         let layout_update_needed = {
             if app_state.integrate_keyboard {
                 if let Some(pr_win) = window_manager.get_window(piano_roll_window_handle) {
-                    let w = pr_win.rectangle.width as i32;
-                    let h = 80; // Fixed height when integrated
+                    let content_w = pr_win.rectangle.width as f32;
+                    let content_h =
+                        (pr_win.rectangle.height - pr_win.get_window_titlebar_height()) as f32;
+                    let w = content_w as i32;
+                    let h = compute_integrated_keyboard_height(content_w, content_h) as i32;
                     if w != current_layout_width || h != current_layout_height {
                         Some((w, h))
                     } else {
@@ -401,9 +417,10 @@ fn main() {
         };
 
         if let Some((w, h)) = layout_update_needed {
-            // Defer layout updates while the mouse is held down (window resize in progress)
-            // to avoid regenerating the texture every frame during drag.
-            if w > 0 && h > 0 && !rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
+            // Regenerate as the window resizes, not once the drag ends: the old texture
+            // would otherwise stretch to the new rectangle and snap back to the right key
+            // widths only on release. One keyboard-sized image is cheap enough per frame.
+            if w > 0 && h > 0 {
                 current_layout_width = w;
                 current_layout_height = h;
 
@@ -862,7 +879,11 @@ fn main() {
                     match wid {
                         id if id == piano_roll_window_handle => {
                             // Reserve the bottom strip for the integrated keyboard.
-                            let keyboard_h = if app_state.integrate_keyboard { 80.0 } else { 0.0 };
+                            let keyboard_h = if app_state.integrate_keyboard {
+                                compute_integrated_keyboard_height(cw, ch)
+                            } else {
+                                0.0
+                            };
                             let roll_h = (ch - keyboard_h).max(0.0);
 
                             if roll_h > 0.0 {
@@ -966,7 +987,7 @@ fn main() {
                             // Draw integrated keyboard if enabled
                             if app_state.integrate_keyboard {
                                 let keyboard_rect =
-                                    Rectangle::new(cx, cy + ch - 80.0, cw, 80.0);
+                                    Rectangle::new(cx, cy + ch - keyboard_h, cw, keyboard_h);
                                 app_state.draw_keyboard(
                                     &mut d_scissor,
                                     window,
