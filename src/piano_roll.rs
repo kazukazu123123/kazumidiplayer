@@ -32,6 +32,11 @@ const REFERENCE_HEIGHT: f32 = 150.0;
 /// impossible to zoom back out of (0 * anything == 0).
 pub const MIN_NOTE_SPEED: f32 = 0.0001;
 
+/// Ceiling for `note_speed`. The speed divides the visible span, so this is how far
+/// you can zoom in: at 128 a single note of a dense stretch is tens of pixels tall,
+/// enough to read one note apart from the next.
+pub const MAX_NOTE_SPEED: f32 = 128.0;
+
 /// `end_tick` sentinel for a note whose note-on has been scanned but whose
 /// note-off has not yet been seen. Such a note is drawn growing from its start up
 /// to the current reveal frontier, and its real end is patched in once the

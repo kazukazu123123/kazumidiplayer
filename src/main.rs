@@ -568,10 +568,10 @@ fn main() {
         // Mouse-wheel anywhere (when no overlay is open) adjusts note scroll speed.
         // Multiplicative steps give smooth, symmetric zoom in/out. The floor is only
         // there to keep the arithmetic alive (see MIN_NOTE_SPEED), not to bound how
-        // far out you can zoom.
+        // far out you can zoom; the ceiling is the real zoom-in limit.
         if wheel != 0.0 && !app_state.overlay_manager.blocks_input() {
             app_state.note_speed = (app_state.note_speed * 1.1_f32.powf(wheel))
-                .clamp(piano_roll::MIN_NOTE_SPEED, 12.0);
+                .clamp(piano_roll::MIN_NOTE_SPEED, piano_roll::MAX_NOTE_SPEED);
         }
 
         // Handle keyboard shortcuts only when overlay is completely closed
