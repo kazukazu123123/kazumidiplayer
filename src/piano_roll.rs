@@ -49,11 +49,6 @@ const OPEN_END: u32 = u32::MAX;
 /// black ones add up to a black roll.
 pub(crate) const BORDER_SHADE: u32 = 45;
 
-/// A note thinner than this on an axis gets no outline across it. Any thinner and
-/// the outline is the whole note, so a dense stretch comes out a flat dark block,
-/// which hides more than the merged fills the outline is there to separate.
-pub(crate) const MIN_OUTLINED_PX: usize = 3;
-
 /// Marks a packed column pixel as already outlined, so it is not darkened a second
 /// time. Sits above the 24 color bits and the occupancy bit.
 const EDGE_BIT: u32 = 1 << 25;
@@ -1109,11 +1104,9 @@ fn rasterize_column(
         while r < col.len() && owner[r] == who {
             r += 1;
         }
-        if r - run_start >= MIN_OUTLINED_PX {
-            let edge = darken(col[run_start]);
-            col[run_start] = edge;
-            col[r - 1] = edge;
-        }
+        let edge = darken(col[run_start]);
+        col[run_start] = edge;
+        col[r - 1] = edge;
     }
 }
 
@@ -1219,7 +1212,6 @@ pub fn draw_piano_roll_chunk(
     for (note, col) in cols.chunks(height_px).enumerate() {
         let (rx, rw) = regions[note];
         let x = area.x + rx;
-        let outline_sides = rw >= MIN_OUTLINED_PX as f32;
         let mut yy = 0usize;
         while yy < height_px {
             let p = col[yy];
@@ -1235,11 +1227,9 @@ pub fn draw_piano_roll_chunk(
             let y = top_y + run_start as f32;
             let h = (yy - run_start) as f32;
             d.draw_rectangle_rec(Rectangle::new(x, y, rw, h), unpack(p));
-            if outline_sides {
-                let edge = unpack(darken(p));
-                d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
-                d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
-            }
+            let edge = unpack(darken(p));
+            d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
+            d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
         }
     }
 }
