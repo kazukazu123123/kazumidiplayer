@@ -474,12 +474,32 @@ pub unsafe fn seek_track_cursor_with_held(
     (cursor, held)
 }
 
+/// The SMF default tempo, in microseconds per quarter note (120 BPM).
+///
+/// The tempo map holds only the 0x51 changes the file actually contains, so it says
+/// nothing about the stretch before the first one -- that stretch runs at this, and
+/// `tempo_ns[0]` is measured on that basis. A file whose first change sits at tick 0
+/// (nearly all of them) never exposes the gap, which is why "2 million de touches",
+/// whose first change is at tick 3386, was the one that broke: the searches below
+/// clamp to entry 0, and `tick - tempo_tick[0]` then underflows a u32 into ~4.3e9,
+/// which turned every tick before 3386 into a time of ~u64::MAX. Playback and the
+/// roll both read these, so both went with it.
+const DEFAULT_TEMPO_US: u64 = 500_000;
+
 #[inline]
 pub fn tick_to_ns(data: &KazuMIDIParserData, tick: u32) -> u64 {
-    if data.tempo_count == 0 {
-        return 0;
+    let division = (data.header.division as u64).max(1);
+    // Before the first tempo change (or with no tempo at all), the default rate.
+    let default_ns = |t: u32| -> u64 {
+        (t as u128 * DEFAULT_TEMPO_US as u128 * 1000 / division as u128) as u64
+    };
+    if data.tempo_count == 0 || data.tempo_tick.is_null() {
+        return default_ns(tick);
     }
     unsafe {
+        if tick < *data.tempo_tick {
+            return default_ns(tick);
+        }
         // Largest i with tempo_tick[i] <= tick (tempo_tick is ascending).
         let mut lo = 0usize;
         let mut hi = data.tempo_count;
@@ -495,21 +515,33 @@ pub fn tick_to_ns(data: &KazuMIDIParserData, tick: u32) -> u64 {
         let base_ns = *data.tempo_ns.add(i);
         let base_tick = *data.tempo_tick.add(i);
         let tempo = *data.tempo_val.add(i);
-        let division = data.header.division as u64;
         // Use u128 to avoid both overflow and truncation errors from integer division.
         // delta_tick can be ~4e9, tempo ~1.6e7, product * 1000 ~ 6.4e19 (> u64::MAX).
-        let delta_tick = (tick - base_tick) as u128;
-        let ns = delta_tick * (tempo as u128) * 1000 / division.max(1) as u128;
+        let delta_tick = tick.saturating_sub(base_tick) as u128;
+        let ns = delta_tick * (tempo as u128) * 1000 / division as u128;
         base_ns.saturating_add(ns as u64)
     }
 }
 
 #[inline]
 pub fn ns_to_tick(data: &KazuMIDIParserData, ns: u64) -> u32 {
-    if data.tempo_count == 0 || ns == 0 {
+    if ns == 0 {
         return 0;
     }
+    let division = (data.header.division as u128).max(1);
+    // The inverse of `tick_to_ns`'s default stretch, and it has to cover the same
+    // range: `tempo_ns[0]` is where the map starts, and below it `ns - tempo_ns[0]`
+    // would underflow exactly as the tick side did.
+    let default_tick = |n: u64| -> u32 {
+        (n as u128 * division / (DEFAULT_TEMPO_US as u128 * 1000)).min(u32::MAX as u128) as u32
+    };
+    if data.tempo_count == 0 || data.tempo_ns.is_null() {
+        return default_tick(ns);
+    }
     unsafe {
+        if ns < *data.tempo_ns {
+            return default_tick(ns);
+        }
         // Largest i with tempo_ns[i] <= ns (tempo_ns is ascending).
         let mut lo = 0usize;
         let mut hi = data.tempo_count;
@@ -525,11 +557,11 @@ pub fn ns_to_tick(data: &KazuMIDIParserData, ns: u64) -> u32 {
         let base_ns = *data.tempo_ns.add(i);
         let base_tick = *data.tempo_tick.add(i);
         let tempo = *data.tempo_val.add(i);
-        let delta_ns = ns - base_ns;
+        let delta_ns = ns.saturating_sub(base_ns);
         // Use u128 to avoid overflow and truncation.
-        let division = data.header.division as u128;
-        let delta_tick = (delta_ns as u128 * division / ((tempo as u128).saturating_mul(1000)))
-            .min(u32::MAX as u128) as u32;
+        let delta_tick = (delta_ns as u128 * division
+            / (tempo as u128).saturating_mul(1000).max(1))
+        .min(u32::MAX as u128) as u32;
         base_tick.saturating_add(delta_tick)
     }
 }
