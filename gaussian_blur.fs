@@ -23,16 +23,25 @@ void main()
         vec2 texelSize = 1.0 / vec2(textureSize(texture0, 0));
         vec4 blurred_color = vec4(0.0);
 
-        int radius = int(blur_radius);
-        float sigma = float(radius) / 2.0;
+        float sigma = blur_radius / 2.0;
+        // 3σ まで取る。±2σ で切ると裾がピーク比 13.5% のまま途切れ、明るい文字や
+        // 細い線の周りに輪郭のあるブルーム状の棚が残る。3σ なら 1.1% で見えない。
+        int taps = int(ceil(sigma * 3.0));
         float total_weight = 0.0;
 
-        for (int i = -radius; i <= radius; i++) {
+        vec2 rect_min = blur_rect_uv.xy;
+        vec2 rect_max = blur_rect_uv.xy + blur_rect_uv.zw;
+
+        for (int i = -taps; i <= taps; i++) {
             vec2 offset = direction * texelSize * float(i);
             vec2 sampleCoord = fragTexCoord + offset;
 
-            // blur_rect_uv 内にクランプ（外のピクセル（ボーダーなど）が滲まないように）
-            sampleCoord = clamp(sampleCoord, blur_rect_uv.xy, blur_rect_uv.xy + blur_rect_uv.zw);
+            // 矩形の外は重みごと捨てて正規化し直す（外のピクセル（ボーダーなど）が
+            // 滲まないように）。clamp で境界に張り付かせると端の 1 列に半カーネル分の
+            // 重みが集中して、縁に帯が出る。
+            if (any(lessThan(sampleCoord, rect_min)) || any(greaterThan(sampleCoord, rect_max))) {
+                continue;
+            }
 
             float dist = float(i);
             float weight = exp(-(dist * dist) / (2.0 * sigma * sigma));
