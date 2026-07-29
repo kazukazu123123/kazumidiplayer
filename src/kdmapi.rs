@@ -44,6 +44,18 @@ impl<'a> KDMAPIBinds<'a> {
 }
 
 fn load_kdmapi_lib() -> Library {
+    // First try the directory of the current executable so the user can bundle
+    // the .so next to the binary without LD_LIBRARY_PATH.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join(LIB_NAME);
+            // Safety: Library::new loads a shared library from the filesystem
+            if let Ok(lib) = unsafe { Library::new(&bundled) } {
+                return lib;
+            }
+        }
+    }
+    // Fall back to the system search path (LD_LIBRARY_PATH, /usr/lib, etc.)
     // Safety: Library::new loads a shared library from the filesystem
     unsafe { Library::new(LIB_NAME).unwrap() }
 }
