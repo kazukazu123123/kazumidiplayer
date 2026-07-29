@@ -111,7 +111,7 @@ impl PlayerHandle {
     pub fn spawn(
         rx_main: Receiver<PlayerCommand>,
         tx_main_feedback: Sender<PlayerFeedback>,
-        kdmapi: KDMAPIStream<'static>,
+        kdmapi: Option<KDMAPIStream>,
     ) -> Self {
         let state = Arc::new(AtomicU32::new(PlayerState::Stopped as u32));
         let position_ns = Arc::new(AtomicU64::new(0));
@@ -250,7 +250,9 @@ impl PlayerHandle {
                         }
                         PlayerCommand::LoadFile(path) => {
                             player.send_all_notes_off();
-                            player.stream.send_direct_data(0xFF);
+                            if let Some(ref stream) = player.stream {
+                                stream.send_direct_data(0xFF);
+                            }
                             player.data = None;
                             player.tracks.clear();
                             player.state = PlayerState::Loading;
@@ -423,7 +425,6 @@ impl PlayerHandle {
                             // Safety: data.as_ptr() returns a valid pointer to the C MIDI struct
                             ns_to_tick(unsafe { &*data.as_ptr() }, player.seek_position_ns);
 
-                        let stream = &mut player.stream;
                         let rpn_msb = &mut player.channel_rpn_msb;
                         let rpn_lsb = &mut player.channel_rpn_lsb;
                         let pb_range = &mut player.channel_pitch_bend_range;
@@ -439,7 +440,7 @@ impl PlayerHandle {
                                 if track.pend_tick <= cur_tick {
                                     if track.pend_status != 0xFF {
                                         send_midi_event_with_override(
-                                            stream,
+                                            player.stream.as_mut(),
                                             track.pend_status,
                                             track.pend_p1,
                                             track.pend_p2,
@@ -496,7 +497,7 @@ impl PlayerHandle {
                                 }
                                 if track.cursor.abs_tick <= cur_tick {
                                     send_midi_event_with_override(
-                                        stream,
+                                        player.stream.as_mut(),
                                         track.cursor.status,
                                         track.cursor.param1,
                                         track.cursor.param2,
@@ -674,7 +675,7 @@ impl PlayerHandle {
 }
 
 pub struct MIDIPlayer {
-    pub stream: KDMAPIStream<'static>,
+    pub stream: Option<KDMAPIStream>,
     pub data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub state: PlayerState,
     pub seek_position_ns: u64,
@@ -690,13 +691,19 @@ pub struct MIDIPlayer {
 
 impl MIDIPlayer {
     fn send_message(&mut self, msg: u32) {
-        self.stream.send_direct_data(msg);
+        if let Some(ref stream) = self.stream {
+            stream.send_direct_data(msg);
+        }
     }
 
     fn send_all_notes_off(&mut self) {
+        let stream = match self.stream.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
         for ch in 0..16u32 {
-            self.stream.send_direct_data((0xB0 | ch) | (123 << 8) | (0 << 16));
-            self.stream.send_direct_data((0xB0 | ch) | (120 << 8) | (0 << 16));
+            stream.send_direct_data((0xB0 | ch) | (123 << 8) | (0 << 16));
+            stream.send_direct_data((0xB0 | ch) | (120 << 8) | (0 << 16));
         }
     }
 
@@ -706,9 +713,11 @@ impl MIDIPlayer {
     /// the next notes would sound detuned until that channel's next 0xE0 event.
     fn reset_playback_state(&mut self) {
         self.send_all_notes_off();
-        for ch in 0..16u32 {
-            self.stream.send_direct_data((0xB0 | ch) | (121 << 8) | (0 << 16));
-            self.stream.send_direct_data((0xE0 | ch) | (0 << 8) | (64 << 16));
+        if let Some(ref stream) = self.stream {
+            for ch in 0..16u32 {
+                stream.send_direct_data((0xB0 | ch) | (121 << 8) | (0 << 16));
+                stream.send_direct_data((0xE0 | ch) | (0 << 8) | (64 << 16));
+            }
         }
         // Reset-all-controllers leaves RPN selection undefined and may drop the
         // pitch bend sensitivity we programmed, so re-establish both.
@@ -749,7 +758,7 @@ impl MIDIPlayer {
     }
 
     pub fn new(
-        kdmapi: KDMAPIStream<'static>,
+        kdmapi: Option<KDMAPIStream>,
         pitch_bend_override: Arc<AtomicBool>,
         pitch_bend_multiplier: Arc<AtomicU8>,
         unlimited_output: Arc<AtomicBool>,
@@ -842,7 +851,7 @@ impl MIDIPlayer {
 }
 
 fn send_midi_event_with_override(
-    stream: &mut KDMAPIStream<'static>,
+    stream: Option<&mut KDMAPIStream>,
     status: u8,
     p1: u8,
     p2: u8,
@@ -886,8 +895,10 @@ fn send_midi_event_with_override(
         }
     }
 
-    let midi_msg = status as u32 | ((out_p1 as u32) << 8) | ((out_p2 as u32) << 16);
-    stream.send_direct_data(midi_msg);
+    if let Some(stream) = stream {
+        let midi_msg = status as u32 | ((out_p1 as u32) << 8) | ((out_p2 as u32) << 16);
+        stream.send_direct_data(midi_msg);
+    }
 }
 
 /// Read the requested playback speed, clamped to the supported range.

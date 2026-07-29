@@ -150,6 +150,8 @@ pub struct AppState {
     // Systems
     pub blur_requester: BlurRequester,
     pub overlay_manager: OverlayManager<AppOverlay>,
+    pub kdmapi_missing: bool,
+    pub kdmapi_missing_timer: f32,
 }
 
 pub const OVERLAY_FADE_DURATION: f32 = 0.2;
@@ -253,6 +255,8 @@ impl AppState {
             // Systems
             blur_requester: BlurRequester::new(),
             overlay_manager: OverlayManager::new(OVERLAY_FADE_DURATION),
+            kdmapi_missing: false,
+            kdmapi_missing_timer: 0.0,
         }
     }
 

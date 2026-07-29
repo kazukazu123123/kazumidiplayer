@@ -158,17 +158,20 @@ fn main() {
 
     rl.set_exit_key(None);
 
-    let kdmapi = get_kdmapi();
-    if !kdmapi.is_kdmapi_available() {
-        panic!(
-            "KDMAPI (OmniMIDI) is not available. Please ensure OmniMIDI is installed and configured."
-        );
-    }
-    let stream = kdmapi.open_stream();
-
     let (tx_commands_to_player, rx_commands_from_main) = mpsc::channel::<PlayerCommand>();
     let (tx_feedback_to_main, rx_feedback_from_player) = mpsc::channel::<PlayerFeedback>();
-    let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, stream);
+
+    let engine = match get_kdmapi().filter(|k| k.is_kdmapi_available()) {
+        Some(kdmapi) => {
+            let stream = kdmapi.open_stream();
+            PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, Some(stream))
+        }
+        None => {
+            eprintln!("[WARN] KDMAPI (OmniMIDI) is not available. Running without audio output.");
+            app_state.kdmapi_missing = true;
+            PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, None)
+        }
+    };
 
     let mut render_texture = rl
         .load_render_texture(
@@ -1494,6 +1497,16 @@ fn main() {
                 &toast.progress,
                 toast.parse_bps,
                 toast.parse_eps,
+            );
+        }
+
+        if app_state.kdmapi_missing {
+            app_state.kdmapi_missing_timer += dt;
+            ui::draw_kdmapi_missing_banner(
+                &mut d,
+                screen_width,
+                screen_height,
+                app_state.kdmapi_missing_timer,
             );
         }
 

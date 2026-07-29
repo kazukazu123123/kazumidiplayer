@@ -273,6 +273,36 @@ pub fn draw_player_crashed_overlay(
     );
 }
 
+/// Non-blocking banner drawn when OmniMIDI / KDMAPI was not found.
+/// Fades out after 5 seconds. Unlike the PlayerCrashed overlay the UI stays
+/// fully interactive.
+pub fn draw_kdmapi_missing_banner(
+    d: &mut RaylibDrawHandle,
+    screen_width: i32,
+    _screen_height: i32,
+    timer: f32,
+) {
+    const DURATION: f32 = 5.0;
+    const FADE: f32 = 0.8;
+    let alpha = if timer < DURATION {
+        210
+    } else {
+        let t = (timer - DURATION) / FADE;
+        (210.0 * (1.0 - t).clamp(0.0, 1.0)) as u8
+    };
+    if alpha == 0 {
+        return;
+    }
+    d.draw_rectangle(0, 0, screen_width, 28, Color::new(60, 30, 30, alpha));
+    d.draw_text(
+        "KDMAPI (OmniMIDI) not found, audio output disabled",
+        16,
+        6,
+        16,
+        Color::new(255, 180, 180, alpha),
+    );
+}
+
 /// `camera` decides where and at what scale it lands.
 pub fn draw_loading_panel(
     d: &mut RaylibDrawHandle,
