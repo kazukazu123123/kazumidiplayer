@@ -332,6 +332,12 @@ fn main() {
         animate_toggle(app_state.shake_enabled, &mut app_state.shake_animation, dt, anim_speed);
         animate_toggle(app_state.integrate_keyboard, &mut app_state.keyboard_animation, dt, anim_speed);
         animate_toggle(app_state.autoplay_on_load, &mut app_state.autoplay_animation, dt, anim_speed);
+        animate_toggle(
+            app_state.pitch_bend_window_enabled,
+            &mut app_state.pitch_bend_window_animation,
+            dt,
+            anim_speed,
+        );
         animate_toggle(app_state.pitch_bend_override_enabled, &mut app_state.pitch_bend_override_animation, dt, anim_speed);
         animate_toggle(app_state.unlimited_output_enabled, &mut app_state.unlimited_output_animation, dt, anim_speed);
         animate_toggle(app_state.show_stats, &mut app_state.show_stats_animation, dt, anim_speed);
@@ -749,6 +755,7 @@ fn main() {
                 // reserve extra vertical padding for bending.
                 let needs_bend = wid == piano_keyboard_window_handle
                     || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
+                let needs_bend = needs_bend && app_state.pitch_bend_window_enabled;
                 let padding = if needs_bend {
                     compute_kb_bend_padding(base_w as f32, pitch_bend_range) as i32
                 } else {
@@ -1242,6 +1249,7 @@ fn main() {
 
                 let needs_bend = wid == piano_keyboard_window_handle
                     || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
+                let needs_bend = needs_bend && app_state.pitch_bend_window_enabled;
                 if needs_bend {
                     let win_w = (window.rectangle.width + 2 * bt) as f32;
                     let win_h = (window.rectangle.height + 2 * bt) as f32;
@@ -1402,6 +1410,8 @@ fn main() {
                             wheel,
                             &mut app_state.autoplay_on_load,
                             app_state.autoplay_animation,
+                            &mut app_state.pitch_bend_window_enabled,
+                            app_state.pitch_bend_window_animation,
                             &mut app_state.pitch_bend_override_enabled,
                             app_state.pitch_bend_override_animation,
                             &mut app_state.pitch_bend_multiplier,

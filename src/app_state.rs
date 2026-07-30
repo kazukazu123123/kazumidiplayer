@@ -119,6 +119,8 @@ pub struct AppState {
     pub keyboard_animation: f32,
     pub autoplay_on_load: bool,
     pub autoplay_animation: f32,
+    pub pitch_bend_window_enabled: bool,
+    pub pitch_bend_window_animation: f32,
     pub pitch_bend_override_enabled: bool,
     pub pitch_bend_override_animation: f32,
     pub pitch_bend_multiplier: u8, // 1-127 (semitones)
@@ -224,6 +226,8 @@ impl AppState {
             keyboard_animation: 0.0,
             autoplay_on_load: false,
             autoplay_animation: 0.0,
+            pitch_bend_window_enabled: true,
+            pitch_bend_window_animation: 1.0,
             pitch_bend_override_enabled: false,
             pitch_bend_override_animation: 0.0,
             pitch_bend_multiplier: 12, // default 12 semitones

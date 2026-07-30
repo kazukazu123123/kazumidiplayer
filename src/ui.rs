@@ -503,6 +503,8 @@ pub fn draw_settings_overlay(
     mouse_wheel: f32,
     autoplay_on_load: &mut bool,
     autoplay_animation: f32,
+    pitch_bend_window_enabled: &mut bool,
+    pitch_bend_window_animation: f32,
     pitch_bend_override: &mut bool,
     pitch_bend_override_animation: f32,
     pitch_bend_multiplier: &mut u8,
@@ -564,6 +566,7 @@ pub fn draw_settings_overlay(
     // Pre-calculate content height for scrollbar
     let mut measure_layout = VerticalLayout::new(content_top, 5.0);
     measure_layout.next(18.0);
+    measure_layout.next(30.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
@@ -757,6 +760,24 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *unlimited_output = !*unlimited_output;
+                }
+            }
+
+            // Pitch Bend Window Toggle
+            let y = layout.next(30.0);
+            let pitch_bend_window_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            if is_visible(pitch_bend_window_rect.y, pitch_bend_window_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    pitch_bend_window_rect,
+                    "Pitch Bend Window",
+                    pitch_bend_window_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *pitch_bend_window_enabled = !*pitch_bend_window_enabled;
                 }
             }
 
