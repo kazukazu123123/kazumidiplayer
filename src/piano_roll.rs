@@ -1095,7 +1095,6 @@ pub fn draw_piano_roll_chunk(
 ) {
     let current_tick = ns_to_tick(data, playback_position_ns);
     let speed = note_speed.max(MIN_NOTE_SPEED);
-    let bottom = area.y + area.height;
     let height = area.height;
     // Scale the visible span with the window height so pixels-per-time stays constant:
     // a taller window shows more future, it does not stretch notes.
@@ -1117,15 +1116,23 @@ pub fn draw_piano_roll_chunk(
         let span =
             (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
         for (r, slot) in row_tick.iter_mut().enumerate() {
-            let progress = ((bottom - (top_y + r as f32)) / height).clamp(0.0, 1.0);
-            *slot = current_tick.saturating_add((progress * span as f32) as u32);
+            let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
+            *slot = if r == height_px {
+                current_tick
+            } else {
+                current_tick.saturating_add((progress * span as f32) as u32)
+            };
         }
         current_tick.saturating_add(span)
     } else {
         let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
         for (r, slot) in row_tick.iter_mut().enumerate() {
-            let progress = ((bottom - (top_y + r as f32)) / height).clamp(0.0, 1.0);
-            let ns = playback_position_ns.saturating_add((progress * span_ns as f32) as u64);
+            let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
+            let ns = if r == height_px {
+                playback_position_ns
+            } else {
+                playback_position_ns.saturating_add((progress * span_ns as f32) as u64)
+            };
             *slot = ns_to_tick(data, ns);
         }
         ns_to_tick(data, playback_position_ns.saturating_add(span_ns))
