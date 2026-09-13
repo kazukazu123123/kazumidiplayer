@@ -1,15 +1,15 @@
 use crate::blur_requester::BlurRequester;
 use crate::midi_parser_worker::ParseProgress;
 use crate::overlay_manager::OverlayManager;
-use crate::player::{PlayerCommand, PlayerFeedback, PlayerState, PlayerHandle};
+use crate::player::{PlayerCommand, PlayerFeedback, PlayerHandle, PlayerState};
 use crate::shaking::ShakeState;
 use crate::ui_components::piano_keyboard;
 use crate::utils::get_note_color_by_track_channel;
 use crate::window_manager::{self, InputEvent};
 use raylib::prelude::*;
 use std::collections::VecDeque;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Instant;
 
 /// Hardware thread count: both the parse-threads default and the slider's maximum.
@@ -126,6 +126,9 @@ pub struct AppState {
     pub pitch_bend_multiplier: u8, // 1-127 (semitones)
     pub unlimited_output_enabled: bool,
     pub unlimited_output_animation: f32,
+    pub midi_ev_buffer_size: u32,
+    pub midi_ev_catch_up: bool,
+    pub midi_ev_catch_up_animation: f32,
 
     // UI (non-editor)
     pub last_input_event: Option<InputEvent>,
@@ -134,6 +137,8 @@ pub struct AppState {
     pub settings_scrollbar_drag_start_y: f32,
     pub settings_scrollbar_drag_start_scroll: f32,
     pub settings_pb_multiplier_slider_dragging: bool,
+    pub settings_midi_ev_buffer_size_slider:
+        crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_scan_delay_slider_dragging: bool,
     pub settings_parse_threads_slider_dragging: bool,
     pub speed_slider_dragging: bool,
@@ -233,6 +238,9 @@ impl AppState {
             pitch_bend_multiplier: 12, // default 12 semitones
             unlimited_output_enabled: false,
             unlimited_output_animation: 0.0,
+            midi_ev_buffer_size: crate::player::DEFAULT_MIDI_EV_BUFFER_SIZE,
+            midi_ev_catch_up: false,
+            midi_ev_catch_up_animation: 0.0,
 
             // UI (non-editor)
             last_input_event: None,
@@ -241,6 +249,8 @@ impl AppState {
             settings_scrollbar_drag_start_y: 0.0,
             settings_scrollbar_drag_start_scroll: 0.0,
             settings_pb_multiplier_slider_dragging: false,
+            settings_midi_ev_buffer_size_slider:
+                crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_scan_delay_slider_dragging: false,
             settings_parse_threads_slider_dragging: false,
             speed_slider_dragging: false,
@@ -392,11 +402,7 @@ impl AppState {
         }
     }
 
-    pub fn handle_file_drop(
-        &mut self,
-        path: &str,
-        tx_commands: &mpsc::Sender<PlayerCommand>,
-    ) {
+    pub fn handle_file_drop(&mut self, path: &str, tx_commands: &mpsc::Sender<PlayerCommand>) {
         // With the player gone the load command has no reader; accepting the file would
         // only spin the loading overlay forever.
         if self.overlay_manager.current_kind() == Some(AppOverlay::PlayerCrashed) {
@@ -408,7 +414,9 @@ impl AppState {
         self.parse_toast = None;
         self.current_progress = None;
         self.midi_data = None;
-        tx_commands.send(PlayerCommand::LoadFile(path.to_string())).ok();
+        tx_commands
+            .send(PlayerCommand::LoadFile(path.to_string()))
+            .ok();
     }
 
     pub fn update_player_state(&mut self, st: PlayerState) {
@@ -417,11 +425,7 @@ impl AppState {
         }
     }
 
-    pub fn handle_keyboard_seek(
-        &mut self,
-        new_position_ns: u64,
-        engine: &PlayerHandle,
-    ) {
+    pub fn handle_keyboard_seek(&mut self, new_position_ns: u64, engine: &PlayerHandle) {
         engine.send(PlayerCommand::Seek(new_position_ns));
     }
 
@@ -431,11 +435,7 @@ impl AppState {
         engine.send(PlayerCommand::Seek(preview_ns));
     }
 
-    pub fn update_seek_preview(
-        &mut self,
-        seek_ns: u64,
-        engine: &PlayerHandle,
-    ) {
+    pub fn update_seek_preview(&mut self, seek_ns: u64, engine: &PlayerHandle) {
         // Only send Seek to the engine when the position changes meaningfully
         // to avoid flooding the player with seek commands every frame.
         let should_seek = match self.last_seek_sent_ns {

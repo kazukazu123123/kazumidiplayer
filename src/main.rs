@@ -13,7 +13,7 @@ mod utils;
 mod window_manager;
 
 use app_state::AppState;
-use player::{PlayerCommand, PlayerFeedback, PlayerState, PlayerHandle};
+use player::{PlayerCommand, PlayerFeedback, PlayerHandle, PlayerState};
 use raylib::prelude::*;
 use std::sync::mpsc;
 
@@ -21,7 +21,11 @@ use crate::kdmapi::get_kdmapi;
 use crate::window_manager::WindowManager;
 
 fn insert_char_at(text: &mut String, char_pos: usize, c: char) {
-    let byte_pos = text.char_indices().nth(char_pos).map(|(i, _)| i).unwrap_or(text.len());
+    let byte_pos = text
+        .char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
     text.insert(byte_pos, c);
 }
 
@@ -328,19 +332,60 @@ fn main() {
 
         // Update toggle animations
         let anim_speed = 10.0;
-        animate_toggle(app_state.is_tick_based, &mut app_state.tick_based_animation, dt, anim_speed);
-        animate_toggle(app_state.shake_enabled, &mut app_state.shake_animation, dt, anim_speed);
-        animate_toggle(app_state.integrate_keyboard, &mut app_state.keyboard_animation, dt, anim_speed);
-        animate_toggle(app_state.autoplay_on_load, &mut app_state.autoplay_animation, dt, anim_speed);
+        animate_toggle(
+            app_state.is_tick_based,
+            &mut app_state.tick_based_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.shake_enabled,
+            &mut app_state.shake_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.integrate_keyboard,
+            &mut app_state.keyboard_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.autoplay_on_load,
+            &mut app_state.autoplay_animation,
+            dt,
+            anim_speed,
+        );
         animate_toggle(
             app_state.pitch_bend_window_enabled,
             &mut app_state.pitch_bend_window_animation,
             dt,
             anim_speed,
         );
-        animate_toggle(app_state.pitch_bend_override_enabled, &mut app_state.pitch_bend_override_animation, dt, anim_speed);
-        animate_toggle(app_state.unlimited_output_enabled, &mut app_state.unlimited_output_animation, dt, anim_speed);
-        animate_toggle(app_state.show_stats, &mut app_state.show_stats_animation, dt, anim_speed);
+        animate_toggle(
+            app_state.pitch_bend_override_enabled,
+            &mut app_state.pitch_bend_override_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.unlimited_output_enabled,
+            &mut app_state.unlimited_output_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.midi_ev_catch_up,
+            &mut app_state.midi_ev_catch_up_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.show_stats,
+            &mut app_state.show_stats_animation,
+            dt,
+            anim_speed,
+        );
 
         // Notes-per-second as a 1-second moving average of the player's note-on
         // counter: snapshot (clock, notes) each frame, drop samples older than 1s,
@@ -357,7 +402,10 @@ fn main() {
             {
                 // Keep one sample just past the 1s boundary so the window stays full.
                 if app_state.nps_samples.len() > 1
-                    && app_state.nps_samples.get(1).map_or(false, |&(t, _)| clock - t > 1.0)
+                    && app_state
+                        .nps_samples
+                        .get(1)
+                        .map_or(false, |&(t, _)| clock - t > 1.0)
                 {
                     app_state.nps_samples.pop_front();
                 } else {
@@ -606,7 +654,8 @@ fn main() {
             }
         }
 
-        if (rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL) || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL))
+        if (rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+            || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL))
             && rl.is_key_pressed(KeyboardKey::KEY_O)
         {
             if let Some(path) = rfd::FileDialog::new()
@@ -674,7 +723,11 @@ fn main() {
                 }
             }
             if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
-                insert_char_at(&mut app_state.editor_text, app_state.editor_cursor_pos, '\n');
+                insert_char_at(
+                    &mut app_state.editor_text,
+                    app_state.editor_cursor_pos,
+                    '\n',
+                );
                 app_state.editor_cursor_pos += 1;
             }
             if rl.is_key_pressed(KeyboardKey::KEY_LEFT) {
@@ -685,10 +738,12 @@ fn main() {
                 app_state.editor_cursor_pos = (app_state.editor_cursor_pos + 1).min(max_pos);
             }
             if rl.is_key_pressed(KeyboardKey::KEY_UP) {
-                app_state.editor_cursor_pos = move_cursor_up(&app_state.editor_text, app_state.editor_cursor_pos);
+                app_state.editor_cursor_pos =
+                    move_cursor_up(&app_state.editor_text, app_state.editor_cursor_pos);
             }
             if rl.is_key_pressed(KeyboardKey::KEY_DOWN) {
-                app_state.editor_cursor_pos = move_cursor_down(&app_state.editor_text, app_state.editor_cursor_pos);
+                app_state.editor_cursor_pos =
+                    move_cursor_down(&app_state.editor_text, app_state.editor_cursor_pos);
             }
 
             app_state.editor_cursor_blink_timer += dt;
@@ -768,8 +823,7 @@ fn main() {
                 if rt_w_u > 0 && rt_h_u > 0 {
                     let needs_recreate = match content_rts.get(&wid) {
                         Some(rt) => {
-                            rt.texture.width as u32 != rt_w_u
-                                || rt.texture.height as u32 != rt_h_u
+                            rt.texture.width as u32 != rt_w_u || rt.texture.height as u32 != rt_h_u
                         }
                         None => true,
                     };
@@ -820,12 +874,8 @@ fn main() {
                     wm_border_color.b,
                     wm_border_color.a,
                 );
-                let bg_color = Color::new(
-                    wm_bg_color.r,
-                    wm_bg_color.g,
-                    wm_bg_color.b,
-                    wm_bg_color.a,
-                );
+                let bg_color =
+                    Color::new(wm_bg_color.r, wm_bg_color.g, wm_bg_color.b, wm_bg_color.a);
 
                 let win_org = bt;
                 let fw = content_w as i32 + 2 * bt;
@@ -834,7 +884,13 @@ fn main() {
                 // Border strips (shifted down by padding to leave room for bending)
                 d_rt.draw_rectangle(0, padding, fw, bt, border_color);
                 d_rt.draw_rectangle(0, fh - bt + padding, fw, bt, border_color);
-                d_rt.draw_rectangle(0, bt + padding, bt, titlebar_h + content_h as i32, border_color);
+                d_rt.draw_rectangle(
+                    0,
+                    bt + padding,
+                    bt,
+                    titlebar_h + content_h as i32,
+                    border_color,
+                );
                 d_rt.draw_rectangle(
                     fw - bt,
                     bt + padding,
@@ -861,7 +917,13 @@ fn main() {
                     wm_tb_inactive
                 };
                 let tb_color = Color::new(wm_tb.r, wm_tb.g, wm_tb.b, 255);
-                d_rt.draw_rectangle(win_org, win_org + padding, content_w as i32, titlebar_h, tb_color);
+                d_rt.draw_rectangle(
+                    win_org,
+                    win_org + padding,
+                    content_w as i32,
+                    titlebar_h,
+                    tb_color,
+                );
                 d_rt.draw_text(
                     &window.title,
                     win_org + 3,
@@ -879,12 +941,8 @@ fn main() {
                 // Apply a single content-area scissor for this window.
                 // Individual content renderers no longer need to manage clipping themselves.
                 {
-                    let mut d_scissor = d_rt.begin_scissor_mode(
-                        cx as i32,
-                        cy as i32,
-                        cw as i32,
-                        ch as i32,
-                    );
+                    let mut d_scissor =
+                        d_rt.begin_scissor_mode(cx as i32, cy as i32, cw as i32, ch as i32);
 
                     match wid {
                         id if id == piano_roll_window_handle => {
@@ -923,9 +981,8 @@ fn main() {
                                     // the scan's latency. Every extra screenful of lookahead is
                                     // another screenful of notes resident, which on a dense MIDI
                                     // is measured in hundreds of megabytes.
-                                    let target = top_tick
-                                        .saturating_add(span / 4)
-                                        .min(parser_data.max_tick);
+                                    let target =
+                                        top_tick.saturating_add(span / 4).min(parser_data.max_tick);
 
                                     // Rebuild the window on a new file, or on a seek that lands
                                     // outside it: backwards (behind what we already retired) or
@@ -935,8 +992,7 @@ fn main() {
                                         None => true,
                                     };
                                     let seeked = current_tick < piano_roll_last_tick
-                                        || current_tick
-                                            > piano_roll_last_tick.saturating_add(span);
+                                        || current_tick > piano_roll_last_tick.saturating_add(span);
                                     piano_roll_last_tick = current_tick;
 
                                     // Zooming in shrinks the visible span, leaving notes generated
@@ -1020,8 +1076,7 @@ fn main() {
                                 && local_mouse.y < cy + ch;
 
                             let is_input_blocked = app_state.overlay_manager.blocks_input();
-                            let current_event = if active_window_id
-                                == Some(controls_window_handle)
+                            let current_event = if active_window_id == Some(controls_window_handle)
                                 && is_inside_content
                                 && !is_input_blocked
                             {
@@ -1043,12 +1098,10 @@ fn main() {
                                         )
                                     }
                                     window_manager::InputEvent::MouseUp(p) => {
-                                        window_manager::InputEvent::MouseUp(
-                                            window_manager::Point {
-                                                x: p.x - (window.rectangle.left() - bt),
-                                                y: p.y - (window.rectangle.top() - bt),
-                                            },
-                                        )
+                                        window_manager::InputEvent::MouseUp(window_manager::Point {
+                                            x: p.x - (window.rectangle.left() - bt),
+                                            y: p.y - (window.rectangle.top() - bt),
+                                        })
                                     }
                                 })
                             } else {
@@ -1063,8 +1116,7 @@ fn main() {
                                 Some(local_mouse)
                             };
 
-                            let weighted_pos =
-                                app_state.get_weighted_time(playback_position_ns);
+                            let weighted_pos = app_state.get_weighted_time(playback_position_ns);
                             let total_weighted = app_state.get_weighted_time(duration_ns);
 
                             ui::draw_progress_bar(
@@ -1097,8 +1149,7 @@ fn main() {
                                 current_event,
                                 gen_frac,
                             ) {
-                                let clamped_mouse_x =
-                                    local_mouse.x.clamp(seek_x, seek_x + seek_w);
+                                let clamped_mouse_x = local_mouse.x.clamp(seek_x, seek_x + seek_w);
                                 let t = (clamped_mouse_x - seek_x) / seek_w;
                                 let seek_ns = (t as f64 * duration_ns as f64) as u64;
                                 app_state.start_seeking(seek_ns, &engine);
@@ -1127,21 +1178,16 @@ fn main() {
                             }
 
                             // Drag handling does not draw, so it can stay inside the scissor block.
-                            if app_state.is_dragging_seek
-                                && !app_state.overlay_manager.is_active()
+                            if app_state.is_dragging_seek && !app_state.overlay_manager.is_active()
                             {
-                                if d_scissor.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT)
-                                {
+                                if d_scissor.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
                                     let seek_x = cx + 10.0;
                                     let seek_w = cw - 20.0;
                                     let clamped_mouse_x =
                                         local_mouse.x.clamp(seek_x, seek_x + seek_w);
                                     let t = (clamped_mouse_x - seek_x) / seek_w;
                                     let seek_ns = (t as f64 * duration_ns as f64) as u64;
-                                    app_state.update_seek_preview(
-                                        seek_ns,
-                                        &engine,
-                                    );
+                                    app_state.update_seek_preview(seek_ns, &engine);
                                 }
 
                                 if d_scissor
@@ -1197,9 +1243,10 @@ fn main() {
             // Drawn as a translucent panel; fades with its animation.
             let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
             if stats_alpha > 0.01 {
-                let lines = [
-                    format!("NPS   {}", group_thousands(app_state.nps_value.round() as u64)),
-                ];
+                let lines = [format!(
+                    "NPS   {}",
+                    group_thousands(app_state.nps_value.round() as u64)
+                )];
                 let font_size = 18;
                 let pad = 8;
                 let line_h = 22;
@@ -1257,21 +1304,16 @@ fn main() {
                     let window_top_uv = padding / rt_h;
                     let window_bottom_uv = 1.0 - padding / rt_h;
 
-                    window_bend_shader.set_shader_value(
-                        wb_bend_loc,
-                        pitch_bend_normalized.clamp(-1.0, 1.0),
-                    );
-                    window_bend_shader.set_shader_value(
-                        wb_bend_range_loc,
-                        pitch_bend_range.max(0.0),
-                    );
+                    window_bend_shader
+                        .set_shader_value(wb_bend_loc, pitch_bend_normalized.clamp(-1.0, 1.0));
+                    window_bend_shader
+                        .set_shader_value(wb_bend_range_loc, pitch_bend_range.max(0.0));
                     window_bend_shader.set_shader_value(wb_max_bend_loc, 15.0f32);
                     window_bend_shader.set_shader_value(wb_win_width_loc, win_w);
                     window_bend_shader.set_shader_value(wb_win_height_loc, win_h);
                     window_bend_shader.set_shader_value(wb_curve_power_loc, 2.5f32);
                     window_bend_shader.set_shader_value(wb_window_top_uv_loc, window_top_uv);
-                    window_bend_shader
-                        .set_shader_value(wb_window_bottom_uv_loc, window_bottom_uv);
+                    window_bend_shader.set_shader_value(wb_window_bottom_uv_loc, window_bottom_uv);
 
                     {
                         let mut d_sh = d_rt.begin_shader_mode(&mut window_bend_shader);
@@ -1321,8 +1363,8 @@ fn main() {
 
             for request in blur_requests {
                 let uv_x = request.blur_region.x / screen_w;
-                let uv_y = (screen_h - request.blur_region.y - request.blur_region.height)
-                    / screen_h;
+                let uv_y =
+                    (screen_h - request.blur_region.y - request.blur_region.height) / screen_h;
                 let uv_w = request.blur_region.width / screen_w;
                 let uv_h = request.blur_region.height / screen_h;
 
@@ -1391,6 +1433,8 @@ fn main() {
                         let prev_pb_override = app_state.pitch_bend_override_enabled;
                         let prev_pb_multiplier = app_state.pitch_bend_multiplier;
                         let prev_unlimited_output = app_state.unlimited_output_enabled;
+                        let prev_midi_ev_buffer_size = app_state.midi_ev_buffer_size;
+                        let prev_midi_ev_catch_up = app_state.midi_ev_catch_up;
                         let prev_parse_threads = app_state.parse_threads;
                         if ui::draw_settings_overlay(
                             d,
@@ -1417,10 +1461,14 @@ fn main() {
                             &mut app_state.pitch_bend_multiplier,
                             &mut app_state.unlimited_output_enabled,
                             app_state.unlimited_output_animation,
+                            &mut app_state.midi_ev_buffer_size,
                             &mut app_state.settings_scrollbar_dragging,
                             &mut app_state.settings_scrollbar_drag_start_y,
                             &mut app_state.settings_scrollbar_drag_start_scroll,
                             &mut app_state.settings_pb_multiplier_slider_dragging,
+                            &mut app_state.settings_midi_ev_buffer_size_slider,
+                            &mut app_state.midi_ev_catch_up,
+                            app_state.midi_ev_catch_up_animation,
                             &mut app_state.parse_threads,
                             &mut app_state.settings_parse_threads_slider_dragging,
                             &mut app_state.scan_delay_ms,
@@ -1438,6 +1486,12 @@ fn main() {
                         }
                         if app_state.unlimited_output_enabled != prev_unlimited_output {
                             engine.set_unlimited_output(app_state.unlimited_output_enabled);
+                        }
+                        if app_state.midi_ev_buffer_size != prev_midi_ev_buffer_size {
+                            engine.set_midi_ev_buffer_size(app_state.midi_ev_buffer_size);
+                        }
+                        if app_state.midi_ev_catch_up != prev_midi_ev_catch_up {
+                            engine.set_midi_ev_catch_up(app_state.midi_ev_catch_up);
                         }
                         if app_state.parse_threads != prev_parse_threads {
                             engine.set_parse_threads(app_state.parse_threads);
@@ -1489,7 +1543,10 @@ fn main() {
                             close_requested = true;
                         }
                         if apply {
-                            println!("[TextEditor] Apply clicked. Content:\n{}", app_state.editor_text);
+                            println!(
+                                "[TextEditor] Apply clicked. Content:\n{}",
+                                app_state.editor_text
+                            );
                         }
                     }
                 },

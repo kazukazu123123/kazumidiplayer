@@ -1,11 +1,14 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::kazumidiparser_cursor::{
+    TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, tick_to_ns,
+};
 use crate::kdmapi::KDMAPIStream;
-use crate::kazumidiparser_cursor::{cursor_next, ns_to_tick, seek_track_cursor, tick_to_ns, TrackCursor};
 use crate::midi_parser_worker::{MIDIParserWorker, ParserCommand, ParserFeedbackCommand};
 use crate::utils::lock_mutex;
 
@@ -18,7 +21,10 @@ pub enum PlayerState {
     Loading = 3,
 }
 
-const MAX_EVENTS_PER_FRAME: usize = 8192;
+pub const DEFAULT_MIDI_EV_BUFFER_SIZE: u32 = 8192;
+pub const MIN_MIDI_EV_BUFFER_SIZE: u32 = 1;
+pub const MAX_MIDI_EV_BUFFER_SIZE: u32 = 16_384;
+const MIDI_EV_FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 pub enum PlayerCommand {
     Play,
@@ -29,6 +35,8 @@ pub enum PlayerCommand {
     SetPitchBendOverride(bool),
     SetPitchBendMultiplier(u8),
     SetUnlimitedOutput(bool),
+    SetMidiEvBufferSize(u32),
+    SetMidiEvCatchUp(bool),
     SetSpeed(f32),
     SetParseThreads(u32),
 }
@@ -44,10 +52,20 @@ pub enum PlayerFeedback {
 pub(crate) struct TrackState {
     cursor: TrackCursor,
     pending: bool,
+    exhausted: bool,
     pend_tick: u32,
     pend_status: u8,
     pend_p1: u8,
     pend_p2: u8,
+}
+
+#[derive(Clone, Copy)]
+struct BufferedMidiEvent {
+    tick: u32,
+    track_index: u16,
+    status: u8,
+    p1: u8,
+    p2: u8,
 }
 
 // Safety: TrackState contains only u8 fields, a bool, and a TrackCursor (C struct).
@@ -116,8 +134,9 @@ impl PlayerHandle {
         let state = Arc::new(AtomicU32::new(PlayerState::Stopped as u32));
         let position_ns = Arc::new(AtomicU64::new(0));
         let duration_ns = Arc::new(AtomicU64::new(1));
-        let current_midi_data =
-            Arc::new(std::sync::Mutex::new(None::<Arc<kazumidiparser::MIDIPlayerData>>));
+        let current_midi_data = Arc::new(std::sync::Mutex::new(
+            None::<Arc<kazumidiparser::MIDIPlayerData>>,
+        ));
         let active_notes = Arc::new(std::sync::Mutex::new([None; 128]));
         let pitch_bend = Arc::new(std::sync::Mutex::new([8192u16; 16]));
         let pitch_bend_range = Arc::new(std::sync::Mutex::new([2.0f32; 16]));
@@ -168,7 +187,8 @@ impl PlayerHandle {
             let state_clone = state_for_thread;
             let position_clone = position_ns_for_thread;
             let duration_clone = duration_ns_for_thread;
-            let current_parse_cancellation_token_clone = current_parse_cancellation_token_for_thread;
+            let current_parse_cancellation_token_clone =
+                current_parse_cancellation_token_for_thread;
             let active_notes_clone = active_notes_for_thread;
             let playback_speed_clone = playback_speed_for_thread;
             let notes_played_clone = notes_played_for_thread;
@@ -193,6 +213,11 @@ impl PlayerHandle {
             // A key clears only when this drops to 0, so overlapping notes on the
             // same key (unisons/doublings) don't blank it out on the first note-off.
             let mut active_count = [0u16; 128];
+            // WinMM-like bounded submission FIFO. Events enter in global
+            // (tick, track) order and state changes happen only when they leave it.
+            let mut midi_ev_buffer_size = DEFAULT_MIDI_EV_BUFFER_SIZE as usize;
+            let mut midi_ev_catch_up = false;
+            let mut midi_ev_fifo = VecDeque::<BufferedMidiEvent>::new();
 
             let mut player = MIDIPlayer::new(
                 kdmapi_for_thread,
@@ -203,6 +228,7 @@ impl PlayerHandle {
             let mut playback_start = Instant::now();
 
             loop {
+                let frame_start = Instant::now();
                 let mut cmd_iter = rx_thread_commands.try_iter().peekable();
                 while let Some(cmd) = cmd_iter.next() {
                     match cmd {
@@ -213,12 +239,14 @@ impl PlayerHandle {
                             playback_start = Instant::now();
                         }
                         PlayerCommand::Pause => {
+                            midi_ev_fifo.clear();
                             player.send_all_notes_off();
                             player.state = PlayerState::Paused;
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
                         }
                         PlayerCommand::Stop => {
+                            midi_ev_fifo.clear();
                             player.reset_playback_state();
                             player.state = PlayerState::Stopped;
                             player.seek_position_ns = 0;
@@ -235,6 +263,7 @@ impl PlayerHandle {
                                 }
                             }
 
+                            midi_ev_fifo.clear();
                             player.reset_playback_state();
                             player.seek_position_ns = latest_pos;
                             applied_speed = read_speed(&playback_speed_clone);
@@ -249,6 +278,7 @@ impl PlayerHandle {
                             state_clone.store(player.state as u32, Ordering::SeqCst);
                         }
                         PlayerCommand::LoadFile(path) => {
+                            midi_ev_fifo.clear();
                             player.send_all_notes_off();
                             if let Some(ref stream) = player.stream {
                                 stream.send_direct_data(0xFF);
@@ -289,13 +319,31 @@ impl PlayerHandle {
                         }
                         PlayerCommand::SetPitchBendMultiplier(multiplier) => {
                             let prev = player.pitch_bend_multiplier.load(Ordering::SeqCst);
-                            player.pitch_bend_multiplier.store(multiplier, Ordering::SeqCst);
-                            if player.pitch_bend_override.load(Ordering::SeqCst) && multiplier != prev {
+                            player
+                                .pitch_bend_multiplier
+                                .store(multiplier, Ordering::SeqCst);
+                            if player.pitch_bend_override.load(Ordering::SeqCst)
+                                && multiplier != prev
+                            {
                                 player.send_pitch_bend_range_override();
                             }
                         }
                         PlayerCommand::SetUnlimitedOutput(enabled) => {
                             player.unlimited_output.store(enabled, Ordering::SeqCst);
+                        }
+                        PlayerCommand::SetMidiEvBufferSize(size) => {
+                            midi_ev_buffer_size = size
+                                .clamp(MIN_MIDI_EV_BUFFER_SIZE, MAX_MIDI_EV_BUFFER_SIZE)
+                                as usize;
+                        }
+                        PlayerCommand::SetMidiEvCatchUp(enabled) => {
+                            if !enabled && midi_ev_catch_up {
+                                // Slowdown mode adopts the currently visible delayed
+                                // position instead of retaining the wall-clock target.
+                                playback_base_ns = player.seek_position_ns;
+                                playback_start = Instant::now();
+                            }
+                            midi_ev_catch_up = enabled;
                         }
                         PlayerCommand::SetSpeed(speed) => {
                             let clamped = speed.clamp(0.05, 4.0);
@@ -329,8 +377,7 @@ impl PlayerHandle {
                                 continue;
                             }
 
-                            *lock_mutex(&current_midi_data_for_thread) =
-                                Some(data.clone());
+                            *lock_mutex(&current_midi_data_for_thread) = Some(data.clone());
 
                             player.load_parsed_data(Some(data));
                             duration_clone.store(player.get_duration_ns(), Ordering::SeqCst);
@@ -344,8 +391,7 @@ impl PlayerHandle {
                             position_clone.store(player.seek_position_ns, Ordering::SeqCst);
                             state_clone.store(player.state as u32, Ordering::SeqCst);
 
-                            let _ = tx_main_feedback_for_thread
-                                .send(PlayerFeedback::Loaded(path));
+                            let _ = tx_main_feedback_for_thread.send(PlayerFeedback::Loaded(path));
                         }
                         ParserFeedbackCommand::ParseCancelled(token) => {
                             let is_current = {
@@ -371,8 +417,8 @@ impl PlayerHandle {
                             player.state = PlayerState::Stopped;
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
-                            let _ = tx_main_feedback_for_thread
-                                .send(PlayerFeedback::ParseCancelled);
+                            let _ =
+                                tx_main_feedback_for_thread.send(PlayerFeedback::ParseCancelled);
                         }
                         ParserFeedbackCommand::ParseFailed(path, token) => {
                             let is_current = {
@@ -397,8 +443,8 @@ impl PlayerHandle {
                             player.state = PlayerState::Stopped;
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
-                            let _ = tx_main_feedback_for_thread
-                                .send(PlayerFeedback::ParseFailed(path));
+                            let _ =
+                                tx_main_feedback_for_thread.send(PlayerFeedback::ParseFailed(path));
                         }
                         ParserFeedbackCommand::Progress(progress) => {
                             let _ = tx_main_feedback_for_thread
@@ -417,128 +463,70 @@ impl PlayerHandle {
                             playback_start = Instant::now();
                             applied_speed = requested_speed;
                         }
-                        let since_anchor_ns =
-                            (playback_start.elapsed().as_nanos() as f64 * applied_speed as f64) as u64;
-                        player.seek_position_ns = playback_base_ns.saturating_add(since_anchor_ns);
+                        let position_before_fill = player.seek_position_ns;
+                        let since_anchor_ns = (playback_start.elapsed().as_nanos() as f64
+                            * applied_speed as f64)
+                            as u64;
+                        let ideal_position_ns = playback_base_ns.saturating_add(since_anchor_ns);
+                        let cur_tick = ns_to_tick(unsafe { &*data.as_ptr() }, ideal_position_ns);
+                        player.seek_position_ns = ideal_position_ns;
 
-                        let cur_tick =
-                            // Safety: data.as_ptr() returns a valid pointer to the C MIDI struct
-                            ns_to_tick(unsafe { &*data.as_ptr() }, player.seek_position_ns);
-
-                        let rpn_msb = &mut player.channel_rpn_msb;
-                        let rpn_lsb = &mut player.channel_rpn_lsb;
-                        let pb_range = &mut player.channel_pitch_bend_range;
-                        let pb_override = player.pitch_bend_override.load(Ordering::Relaxed);
-                        let pb_multiplier = player.pitch_bend_multiplier.load(Ordering::Relaxed);
-
-                        let mut events_processed = 0usize;
                         let unlimited = player.unlimited_output.load(Ordering::Relaxed);
+                        let capacity = if unlimited {
+                            usize::MAX
+                        } else {
+                            midi_ev_buffer_size
+                        };
 
+                        // A seek can land on a tempo event. Tempo changes are already
+                        // represented by the parser's tick/time map, so advance each
+                        // such cursor to its first output event before merging tracks.
                         for track in &mut player.tracks {
-                            // Process pending event from previous frame
-                            if track.pending {
-                                if track.pend_tick <= cur_tick {
-                                    if track.pend_status != 0xFF {
-                                        send_midi_event_with_override(
-                                            player.stream.as_mut(),
-                                            track.pend_status,
-                                            track.pend_p1,
-                                            track.pend_p2,
-                                            rpn_msb,
-                                            rpn_lsb,
-                                            pb_range,
-                                            pb_override,
-                                            pb_multiplier,
-                                            &mut player.midi_original_pb_range,
-                                        );
-                                        {
-                                            let mut guard = lock_mutex(&active_notes_clone);
-                                            if track.pend_p1 < 128 {
-                                                let key = track.pend_p1 as usize;
-                                                let msg_type = track.pend_status & 0xF0;
-                                                if msg_type == 0x90 && track.pend_p2 > 0 {
-                                                    active_count[key] += 1;
-                                                    notes_played_count += 1;
-                                                    guard[key] =
-                                                        Some((track.cursor.track_index, track.pend_status & 0x0F));
-                                                } else if msg_type == 0x80
-                                                    || (msg_type == 0x90 && track.pend_p2 == 0)
-                                                {
-                                                    if active_count[key] > 0 {
-                                                        active_count[key] -= 1;
-                                                    }
-                                                    if active_count[key] == 0 {
-                                                        guard[key] = None;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        {
-                                            let msg_type = track.pend_status & 0xF0;
-                                            if msg_type == 0xE0 {
-                                                let channel = (track.pend_status & 0x0F) as usize;
-                                                let pb = (track.pend_p1 as u16) | ((track.pend_p2 as u16) << 7);
-                                                lock_mutex(&pitch_bend_clone)[channel.clamp(0, 15)] = pb;
-                                            }
-                                        }
+                            if !track.pending && !track.exhausted {
+                                loop {
+                                    if !unsafe { cursor_next(&mut track.cursor) } {
+                                        track.exhausted = true;
+                                        break;
                                     }
-                                    track.pending = false;
-                                    events_processed += 1;
+                                    if !track.cursor.is_tempo {
+                                        track.pending = true;
+                                        track.pend_tick = track.cursor.abs_tick;
+                                        track.pend_status = track.cursor.status;
+                                        track.pend_p1 = track.cursor.param1;
+                                        track.pend_p2 = track.cursor.param2;
+                                        break;
+                                    }
                                 }
                             }
+                        }
 
-                            while !track.pending && (unlimited || events_processed < MAX_EVENTS_PER_FRAME) {
+                        // Fill the bounded FIFO from all tracks in timestamp order. Track
+                        // index is the stable tie-breaker for simultaneous events.
+                        while midi_ev_fifo.len() < capacity {
+                            let next_track = player
+                                .tracks
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, track)| track.pending && track.pend_tick <= cur_tick)
+                                .min_by_key(|(index, track)| (track.pend_tick, *index))
+                                .map(|(index, _)| index);
+                            let Some(track_index) = next_track else { break };
+                            let track = &mut player.tracks[track_index];
+                            midi_ev_fifo.push_back(BufferedMidiEvent {
+                                tick: track.pend_tick,
+                                track_index: track.cursor.track_index,
+                                status: track.pend_status,
+                                p1: track.pend_p1,
+                                p2: track.pend_p2,
+                            });
+
+                            track.pending = false;
+                            loop {
                                 if !unsafe { cursor_next(&mut track.cursor) } {
+                                    track.exhausted = true;
                                     break;
                                 }
-                                events_processed += 1;
-                                if track.cursor.is_tempo {
-                                    continue;
-                                }
-                                if track.cursor.abs_tick <= cur_tick {
-                                    send_midi_event_with_override(
-                                        player.stream.as_mut(),
-                                        track.cursor.status,
-                                        track.cursor.param1,
-                                        track.cursor.param2,
-                                        rpn_msb,
-                                        rpn_lsb,
-                                        pb_range,
-                                        pb_override,
-                                        pb_multiplier,
-                                        &mut player.midi_original_pb_range,
-                                    );
-                                    {
-                                        let mut guard = lock_mutex(&active_notes_clone);
-                                        if track.cursor.param1 < 128 {
-                                            let key = track.cursor.param1 as usize;
-                                            let msg_type = track.cursor.status & 0xF0;
-                                            if msg_type == 0x90 && track.cursor.param2 > 0 {
-                                                active_count[key] += 1;
-                                                notes_played_count += 1;
-                                                guard[key] =
-                                                    Some((track.cursor.track_index, track.cursor.status & 0x0F));
-                                            } else if msg_type == 0x80
-                                                || (msg_type == 0x90 && track.cursor.param2 == 0)
-                                            {
-                                                if active_count[key] > 0 {
-                                                    active_count[key] -= 1;
-                                                }
-                                                if active_count[key] == 0 {
-                                                    guard[key] = None;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    {
-                                        let msg_type = track.cursor.status & 0xF0;
-                                        if msg_type == 0xE0 {
-                                            let channel = (track.cursor.status & 0x0F) as usize;
-                                            let pb = (track.cursor.param1 as u16) | ((track.cursor.param2 as u16) << 7);
-                                            lock_mutex(&pitch_bend_clone)[channel.clamp(0, 15)] = pb;
-                                        }
-                                    }
-                                } else {
+                                if !track.cursor.is_tempo {
                                     track.pending = true;
                                     track.pend_tick = track.cursor.abs_tick;
                                     track.pend_status = track.cursor.status;
@@ -549,10 +537,89 @@ impl PlayerHandle {
                             }
                         }
 
+                        // A full FIFO only means backpressure when at least one more due
+                        // event remains. Slowdown re-anchors song time here; Catch Up
+                        // deliberately leaves the ideal wall-clock anchor untouched.
+                        let backlog_due = player
+                            .tracks
+                            .iter()
+                            .any(|track| track.pending && track.pend_tick <= cur_tick);
+                        let catch_up_backlog = midi_ev_catch_up && backlog_due;
+                        if !unlimited && midi_ev_fifo.len() == capacity && backlog_due {
+                            // Both modes expose the delayed position while the FIFO is
+                            // saturated. Slowdown also moves the clock anchor back;
+                            // Catch Up keeps the original anchor so the position jumps
+                            // to the wall-clock target as soon as the backlog is gone.
+                            player.seek_position_ns = position_before_fill;
+                            if !midi_ev_catch_up {
+                                playback_base_ns = position_before_fill;
+                                playback_start = Instant::now();
+                            }
+                        }
+
+                        // WinMM consumes submitted events in FIFO order. All observable
+                        // MIDI state is updated here, never while events are queued.
+                        let mut last_sent_tick = None;
+                        while let Some(event) = midi_ev_fifo.pop_front() {
+                            last_sent_tick = Some(event.tick);
+                            send_midi_event_with_override(
+                                player.stream.as_mut(),
+                                event.status,
+                                event.p1,
+                                event.p2,
+                                &mut player.channel_rpn_msb,
+                                &mut player.channel_rpn_lsb,
+                                &mut player.channel_pitch_bend_range,
+                                player.pitch_bend_override.load(Ordering::Relaxed),
+                                player.pitch_bend_multiplier.load(Ordering::Relaxed),
+                                &mut player.midi_original_pb_range,
+                            );
+                            let msg_type = event.status & 0xF0;
+                            if event.p1 < 128 {
+                                let key = event.p1 as usize;
+                                let mut guard = lock_mutex(&active_notes_clone);
+                                if msg_type == 0x90 && event.p2 > 0 {
+                                    active_count[key] = active_count[key].saturating_add(1);
+                                    notes_played_count += 1;
+                                    guard[key] = Some((event.track_index, event.status & 0x0F));
+                                } else if msg_type == 0x80 || (msg_type == 0x90 && event.p2 == 0) {
+                                    active_count[key] = active_count[key].saturating_sub(1);
+                                    if active_count[key] == 0 {
+                                        guard[key] = None;
+                                    }
+                                }
+                            }
+                            if msg_type == 0xE0 {
+                                let channel = (event.status & 0x0F) as usize;
+                                let bend = (event.p1 as u16) | ((event.p2 as u16) << 7);
+                                lock_mutex(&pitch_bend_clone)[channel] = bend;
+                            }
+                        }
+
+                        if catch_up_backlog {
+                            // Publish each submitted chunk's frontier immediately.
+                            // Catch-up can run through many chunks before the normal
+                            // end-of-loop store, which otherwise makes the UI look
+                            // frozen until the entire backlog disappears.
+                            if let Some(tick) = last_sent_tick {
+                                player.seek_position_ns = tick_to_ns(
+                                    unsafe { &*data.as_ptr() },
+                                    tick,
+                                )
+                                .min(ideal_position_ns);
+                                position_clone.store(player.seek_position_ns, Ordering::SeqCst);
+                            }
+                        }
+
                         let max_tick = unsafe { (*data.as_ptr()).max_tick };
-                        // Safety: data.as_ptr() is valid, non-null, with properly initialized fields
                         let max_ns = tick_to_ns(unsafe { &*data.as_ptr() }, max_tick);
-                        if player.seek_position_ns >= max_ns {
+                        let drained = player
+                            .tracks
+                            .iter()
+                            .all(|track| track.exhausted && !track.pending)
+                            && midi_ev_fifo.is_empty();
+                        if player.seek_position_ns >= max_ns && drained {
+                            player.seek_position_ns = max_ns;
                             player.state = PlayerState::Stopped;
                             player.reset_playback_state();
                             *lock_mutex(&active_notes_clone) = [None; 128];
@@ -569,8 +636,15 @@ impl PlayerHandle {
 
                 if player.state != PlayerState::Playing {
                     thread::sleep(Duration::from_millis(10));
-                } else {
-                    std::thread::yield_now();
+                } else if let Some(remaining) =
+                    MIDI_EV_FRAME_DURATION.checked_sub(frame_start.elapsed())
+                {
+                    // Every mode gets one FIFO submission window per output frame.
+                    // Catch Up keeps the ideal wall clock while these paced chunks
+                    // drain the backlog, then jumps to it once caught up. Skipping
+                    // this wait drained the backlog in a tight loop, so no lag was
+                    // ever visible regardless of the configured buffer size.
+                    thread::sleep(remaining);
                 }
             }
         });
@@ -604,15 +678,33 @@ impl PlayerHandle {
     }
 
     pub fn set_pitch_bend_override(&self, enabled: bool) {
-        let _ = self.tx_command.send(PlayerCommand::SetPitchBendOverride(enabled));
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetPitchBendOverride(enabled));
     }
 
     pub fn set_pitch_bend_multiplier(&self, multiplier: u8) {
-        let _ = self.tx_command.send(PlayerCommand::SetPitchBendMultiplier(multiplier));
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetPitchBendMultiplier(multiplier));
     }
 
     pub fn set_unlimited_output(&self, enabled: bool) {
-        let _ = self.tx_command.send(PlayerCommand::SetUnlimitedOutput(enabled));
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetUnlimitedOutput(enabled));
+    }
+
+    pub fn set_midi_ev_buffer_size(&self, size: u32) {
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetMidiEvBufferSize(size));
+    }
+
+    pub fn set_midi_ev_catch_up(&self, enabled: bool) {
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetMidiEvCatchUp(enabled));
     }
 
     pub fn set_speed(&self, speed: f32) {
@@ -621,7 +713,9 @@ impl PlayerHandle {
 
     /// Takes effect on the next load; a parse already in flight keeps its count.
     pub fn set_parse_threads(&self, threads: u32) {
-        let _ = self.tx_command.send(PlayerCommand::SetParseThreads(threads));
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetParseThreads(threads));
     }
 
     /// Running total of note-ons triggered for the current file.
@@ -728,7 +822,10 @@ impl MIDIPlayer {
     }
 
     pub fn send_pitch_bend_range_override(&mut self) {
-        let multiplier = self.pitch_bend_multiplier.load(Ordering::SeqCst).clamp(1, 127);
+        let multiplier = self
+            .pitch_bend_multiplier
+            .load(Ordering::SeqCst)
+            .clamp(1, 127);
         for ch in 0..16 {
             self.send_message((0xB0 | ch as u32) | (101 << 8) | (0 << 16));
             self.send_message((0xB0 | ch as u32) | (100 << 8) | (0 << 16));
@@ -818,6 +915,7 @@ impl MIDIPlayer {
                 let cursor = unsafe { seek_track_cursor(&*data.as_ptr(), i as u16, 0) };
                 self.tracks.push(TrackState {
                     pending: cursor.has_event && !cursor.is_tempo,
+                    exhausted: !cursor.has_event,
                     pend_tick: cursor.abs_tick,
                     pend_status: cursor.status,
                     pend_p1: cursor.param1,
@@ -835,10 +933,10 @@ impl MIDIPlayer {
             // Safety: data.as_ptr() valid for the lifetime of this call
             let num_tracks = data.header().tracks as usize;
             for i in 0..num_tracks {
-                let cursor =
-                    unsafe { seek_track_cursor(&*data.as_ptr(), i as u16, target_tick) };
+                let cursor = unsafe { seek_track_cursor(&*data.as_ptr(), i as u16, target_tick) };
                 self.tracks.push(TrackState {
                     pending: cursor.has_event && !cursor.is_tempo,
+                    exhausted: !cursor.has_event,
                     pend_tick: cursor.abs_tick,
                     pend_status: cursor.status,
                     pend_p1: cursor.param1,
@@ -905,6 +1003,3 @@ fn send_midi_event_with_override(
 fn read_speed(speed: &Arc<AtomicU32>) -> f32 {
     f32::from_bits(speed.load(Ordering::Relaxed)).clamp(0.05, 4.0)
 }
-
-
-

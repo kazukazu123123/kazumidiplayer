@@ -1,5 +1,8 @@
 use crate::player::{PlayerCommand, PlayerState};
 use crate::ui_components::button::draw_button;
+use crate::ui_components::numeric_slider::{
+    NumericSliderInput, NumericSliderState, draw_u32_numeric_slider,
+};
 use crate::ui_components::scrollbar::draw_scrollbar;
 use crate::ui_components::toggle::draw_toggle;
 use crate::utils::{cubic_bezier, format_bytes, format_count, format_count_short, format_time};
@@ -256,7 +259,13 @@ pub fn draw_player_crashed_overlay(
 
     let title = Color::new(255, 110, 110, a(255.0));
     let body = Color::new(225, 215, 215, a(255.0));
-    d.draw_text("Player thread crashed", x as i32 + 20, y as i32 + 22, 24, title);
+    d.draw_text(
+        "Player thread crashed",
+        x as i32 + 20,
+        y as i32 + 22,
+        24,
+        title,
+    );
     d.draw_text(
         "Playback, seeking and loading no longer work.",
         x as i32 + 20,
@@ -365,7 +374,11 @@ pub fn draw_loading_panel(
                 bar_y,
                 bar_w,
                 bar_h,
-                &[(0.0, progress_value, Color::new(0, 120, 215, (255.0 * eased_t) as u8))],
+                &[(
+                    0.0,
+                    progress_value,
+                    Color::new(0, 120, 215, (255.0 * eased_t) as u8),
+                )],
                 Some(&progress_text),
                 Color::new(80, 80, 80, (255.0 * eased_t) as u8),
             );
@@ -418,14 +431,7 @@ pub fn draw_loading_panel(
                     (clip_br.y - clip_tl.y) as i32,
                 );
 
-                d_clip.draw_text_ex(
-                    &font,
-                    label,
-                    Vector2::new(x, y),
-                    12.0,
-                    spacing,
-                    label_color,
-                );
+                d_clip.draw_text_ex(&font, label, Vector2::new(x, y), 12.0, spacing, label_color);
                 d_clip.draw_text_ex(
                     &font,
                     value,
@@ -510,10 +516,14 @@ pub fn draw_settings_overlay(
     pitch_bend_multiplier: &mut u8,
     unlimited_output: &mut bool,
     unlimited_output_animation: f32,
+    midi_ev_buffer_size: &mut u32,
     scrollbar_dragging: &mut bool,
     scrollbar_drag_start_y: &mut f32,
     scrollbar_drag_start_scroll: &mut f32,
     pb_multiplier_slider_dragging: &mut bool,
+    midi_ev_buffer_size_slider: &mut NumericSliderState,
+    midi_ev_catch_up: &mut bool,
+    midi_ev_catch_up_animation: f32,
     parse_threads: &mut u32,
     parse_threads_slider_dragging: &mut bool,
     scan_delay_ms: &mut u32,
@@ -521,6 +531,19 @@ pub fn draw_settings_overlay(
     show_stats: &mut bool,
     show_stats_animation: f32,
 ) -> bool {
+    // Capture text-entry input before entering drawing modes.
+    let mut numeric_typed = Vec::new();
+    while let Some(ch) = d.get_char_pressed() {
+        numeric_typed.push(ch);
+    }
+    let numeric_backspace = d.is_key_pressed(KeyboardKey::KEY_BACKSPACE);
+    let numeric_enter = d.is_key_pressed(KeyboardKey::KEY_ENTER);
+    let numeric_escape = d.is_key_pressed(KeyboardKey::KEY_ESCAPE);
+    let numeric_shift =
+        d.is_key_down(KeyboardKey::KEY_LEFT_SHIFT) || d.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
+    let numeric_control = d.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+        || d.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+
     // Ease-out cubic: 1 - (1 - t)^3
     let eased_t = 1.0 - (1.0 - alpha_factor).powi(3);
 
@@ -551,7 +574,11 @@ pub fn draw_settings_overlay(
     }
     impl VerticalLayout {
         fn new(start_y: f32, margin: f32) -> Self {
-            Self { y: start_y, margin, max_bottom: start_y }
+            Self {
+                y: start_y,
+                margin,
+                max_bottom: start_y,
+            }
         }
         fn next(&mut self, height: f32) -> f32 {
             let y = self.y;
@@ -573,6 +600,8 @@ pub fn draw_settings_overlay(
     measure_layout.next(30.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
+    measure_layout.next(52.0); // MIDI EV Buffer Size slider
+    measure_layout.next(30.0); // EV backlog mode toggle
     if *pitch_bend_override {
         measure_layout.next(38.0);
     }
@@ -619,9 +648,14 @@ pub fn draw_settings_overlay(
             None
         };
 
-        // Scroll with mouse wheel when hovering the panel content area
+        // Scroll with mouse wheel when hovering the panel content area. The numeric
+        // EV control owns the wheel while hovered for exact stepping.
         let scroll_area_rect = Rectangle::new(0.0, content_top, panel_rect.width, viewport_height);
-        if scroll_area_rect.check_collision_point_rec(mouse_world_pos) && mouse_wheel != 0.0 {
+        let midi_ev_rect = Rectangle::new(20.0, 248.0 - *scroll_y, 275.0, 52.0);
+        if scroll_area_rect.check_collision_point_rec(mouse_world_pos)
+            && !midi_ev_rect.check_collision_point_rec(mouse_world_pos)
+            && mouse_wheel != 0.0
+        {
             let scroll_speed = 30.0;
             *scroll_y = (*scroll_y - mouse_wheel * scroll_speed).clamp(0.0, max_scroll);
         }
@@ -653,7 +687,8 @@ pub fn draw_settings_overlay(
         // Scissor: clip scrollable content to the content area
         {
             let clip_tl = d2d.get_world_to_screen2D(Vector2::new(0.0, content_top), camera);
-            let clip_br = d2d.get_world_to_screen2D(Vector2::new(panel_rect.width, content_bottom), camera);
+            let clip_br =
+                d2d.get_world_to_screen2D(Vector2::new(panel_rect.width, content_bottom), camera);
             let sx = clip_tl.x as i32;
             let sy_scissor = clip_tl.y as i32;
             let sw = (clip_br.x - clip_tl.x) as i32;
@@ -763,6 +798,55 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // MIDI events consumed per 60 Hz output frame.
+            {
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "MIDI EV Buffer Size",
+                        midi_ev_buffer_size,
+                        crate::player::MIN_MIDI_EV_BUFFER_SIZE,
+                        crate::player::MAX_MIDI_EV_BUFFER_SIZE,
+                        midi_ev_buffer_size_slider,
+                        &input,
+                        eased_t,
+                    );
+                }
+            }
+
+            // Choose whether a full event buffer slows song time or only delays MIDI
+            // output until it can catch back up to the wall-clock position.
+            let y = layout.next(30.0);
+            let catch_up_rect = Rectangle::new(20.0, sy(y), 275.0, 30.0);
+            if is_visible(catch_up_rect.y, catch_up_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    catch_up_rect,
+                    "EV Backlog: Catch Up",
+                    midi_ev_catch_up_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *midi_ev_catch_up = !*midi_ev_catch_up;
+                }
+            }
+
             // Pitch Bend Window Toggle
             let y = layout.next(30.0);
             let pitch_bend_window_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
@@ -829,11 +913,16 @@ pub fn draw_settings_overlay(
                     let t = ((*pitch_bend_multiplier as f32 - 1.0) / 126.0).clamp(0.0, 1.0);
                     let thumb_x = slider_rect.x + t * slider_rect.width;
                     let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                    d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
+                    d_scissor.draw_rectangle_rec(
+                        thumb_rect,
+                        Color::new(0, 120, 215, (255.0 * eased_t) as u8),
+                    );
 
                     // Start drag on click
                     if let Some(cp) = click_pos {
-                        if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
+                        if thumb_rect.check_collision_point_rec(cp)
+                            || slider_rect.check_collision_point_rec(cp)
+                        {
                             *pb_multiplier_slider_dragging = true;
                         }
                     }
@@ -841,7 +930,9 @@ pub fn draw_settings_overlay(
                     // Ongoing drag: value follows the mouse even outside the slider rect
                     if *pb_multiplier_slider_dragging {
                         if is_mouse_down {
-                            let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
+                            let clamped_x = mouse_world_pos
+                                .x
+                                .clamp(slider_rect.x, slider_rect.x + slider_rect.width);
                             let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
                             *pitch_bend_multiplier = (new_t * 126.0 + 1.0).round() as u8;
                         } else {
@@ -896,10 +987,15 @@ pub fn draw_settings_overlay(
                     };
                     let thumb_x = slider_rect.x + t * slider_rect.width;
                     let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                    d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
+                    d_scissor.draw_rectangle_rec(
+                        thumb_rect,
+                        Color::new(0, 120, 215, (255.0 * eased_t) as u8),
+                    );
 
                     if let Some(cp) = click_pos {
-                        if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
+                        if thumb_rect.check_collision_point_rec(cp)
+                            || slider_rect.check_collision_point_rec(cp)
+                        {
                             *parse_threads_slider_dragging = true;
                         }
                     }
@@ -907,7 +1003,9 @@ pub fn draw_settings_overlay(
                     if *parse_threads_slider_dragging {
                         if is_mouse_down {
                             if span > 0.0 {
-                                let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
+                                let clamped_x = mouse_world_pos
+                                    .x
+                                    .clamp(slider_rect.x, slider_rect.x + slider_rect.width);
                                 let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
                                 *parse_threads = (new_t * span).round() as u32 + 1;
                             }
@@ -974,17 +1072,24 @@ pub fn draw_settings_overlay(
                     let t = (*scan_delay_ms as f32 / SCAN_DELAY_MAX).clamp(0.0, 1.0);
                     let thumb_x = slider_rect.x + t * slider_rect.width;
                     let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                    d_scissor.draw_rectangle_rec(thumb_rect, Color::new(0, 120, 215, (255.0 * eased_t) as u8));
+                    d_scissor.draw_rectangle_rec(
+                        thumb_rect,
+                        Color::new(0, 120, 215, (255.0 * eased_t) as u8),
+                    );
 
                     if let Some(cp) = click_pos {
-                        if thumb_rect.check_collision_point_rec(cp) || slider_rect.check_collision_point_rec(cp) {
+                        if thumb_rect.check_collision_point_rec(cp)
+                            || slider_rect.check_collision_point_rec(cp)
+                        {
                             *scan_delay_slider_dragging = true;
                         }
                     }
 
                     if *scan_delay_slider_dragging {
                         if is_mouse_down {
-                            let clamped_x = mouse_world_pos.x.clamp(slider_rect.x, slider_rect.x + slider_rect.width);
+                            let clamped_x = mouse_world_pos
+                                .x
+                                .clamp(slider_rect.x, slider_rect.x + slider_rect.width);
                             let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
                             *scan_delay_ms = (new_t * SCAN_DELAY_MAX).round() as u32;
                         } else {
@@ -993,7 +1098,6 @@ pub fn draw_settings_overlay(
                     }
                 }
             }
-
         }
 
         // Close button (fixed coordinates, outside scroll area)
@@ -1014,7 +1118,6 @@ pub fn draw_settings_overlay(
                 close_clicked = true;
             }
         }
-
     }
 
     close_clicked
@@ -1101,7 +1204,10 @@ pub fn draw_text_editor_overlay(
 
         // Text area background
         let text_area_rect = Rectangle::new(text_area_x, text_area_y, text_area_w, text_area_h);
-        d2d.draw_rectangle_rec(text_area_rect, Color::new(30, 30, 30, (255.0 * eased_t) as u8));
+        d2d.draw_rectangle_rec(
+            text_area_rect,
+            Color::new(30, 30, 30, (255.0 * eased_t) as u8),
+        );
         let text_area_border = if *focused {
             Color::new(0, 170, 255, (255.0 * eased_t) as u8)
         } else {
@@ -1118,7 +1224,10 @@ pub fn draw_text_editor_overlay(
         // Scissor for text area
         {
             let clip_tl = d2d.get_world_to_screen2D(Vector2::new(text_area_x, text_area_y), camera);
-            let clip_br = d2d.get_world_to_screen2D(Vector2::new(text_area_x + text_area_w, text_area_y + text_area_h), camera);
+            let clip_br = d2d.get_world_to_screen2D(
+                Vector2::new(text_area_x + text_area_w, text_area_y + text_area_h),
+                camera,
+            );
             let sx = clip_tl.x as i32;
             let sy_scissor = clip_tl.y as i32;
             let sw = (clip_br.x - clip_tl.x) as i32;
@@ -1179,7 +1288,12 @@ pub fn draw_text_editor_overlay(
         }
 
         // Scrollbar (drawn after scissored text so it's always on top)
-        let track_rect = Rectangle::new(text_area_x + text_area_w - 9.0, text_area_y + 1.0, 8.0, text_area_h - 2.0);
+        let track_rect = Rectangle::new(
+            text_area_x + text_area_w - 9.0,
+            text_area_y + 1.0,
+            8.0,
+            text_area_h - 2.0,
+        );
         let scrollbar_interacted = draw_scrollbar(
             &mut d2d,
             track_rect,
