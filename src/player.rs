@@ -641,14 +641,17 @@ impl PlayerHandle {
 
                 if player.state != PlayerState::Playing {
                     thread::sleep(Duration::from_millis(10));
+                } else if player.unlimited_output.load(Ordering::Relaxed) {
+                    // Unlimited mode must not inherit the normal 60 Hz submission
+                    // cadence. Run continuously so events become due and are sent at
+                    // their actual timestamps instead of in 16.7 ms batches.
+                    thread::yield_now();
                 } else if let Some(remaining) =
                     MIDI_EV_FRAME_DURATION.checked_sub(frame_start.elapsed())
                 {
-                    // Every mode gets one FIFO submission window per output frame.
+                    // Bounded modes get one FIFO submission window per output frame.
                     // Catch Up keeps the ideal wall clock while these paced chunks
-                    // drain the backlog, then jumps to it once caught up. Skipping
-                    // this wait drained the backlog in a tight loop, so no lag was
-                    // ever visible regardless of the configured buffer size.
+                    // drain the backlog, then jumps to it once caught up.
                     thread::sleep(remaining);
                 }
             }
