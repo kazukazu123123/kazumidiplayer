@@ -1,6 +1,8 @@
 use libloading::Library;
-use std::sync::atomic::AtomicBool;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, OnceLock};
+use std::thread;
 
 #[cfg(target_os = "windows")]
 const LIB_NAME: &str = "OmniMIDI.dll";
@@ -28,18 +30,42 @@ impl KDMAPIBinds {
     pub fn open_stream(&'static self) -> KDMAPIStream {
         if self
             .is_stream_open
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
             panic!("KDMAPI stream is already open");
         }
-        // Safety: FFI call to OmniMIDI; panics if stream initialization fails
-        unsafe {
-            let result = (self.initialize_kdmapi_stream)();
-            if result == 0 {
-                panic!("Failed to initialize KDMAPI stream");
-            }
-            KDMAPIStream { binds: self }
+        // Safety: FFI call to OmniMIDI; panics if stream initialization fails.
+        let result = unsafe { (self.initialize_kdmapi_stream)() };
+        if result == 0 {
+            self.is_stream_open.store(false, Ordering::SeqCst);
+            panic!("Failed to initialize KDMAPI stream");
         }
+
+        let (tx, rx) = mpsc::channel();
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = generation.clone();
+        thread::spawn(move || {
+            while let Ok(command) = rx.recv() {
+                match command {
+                    KDMAPICommand::Data(data, event_generation) => {
+                        // A file load advances the generation. Once a blocked FFI call
+                        // returns, discard all output still queued for the old file.
+                        if event_generation == worker_generation.load(Ordering::Acquire) {
+                            // Safety: this dedicated worker is the only thread calling
+                            // SendDirectData for this stream.
+                            unsafe { (self.send_direct_data)(data) };
+                        }
+                    }
+                    KDMAPICommand::Shutdown => break,
+                }
+            }
+            // Safety: stream lifetime ends on the same dedicated FFI worker.
+            unsafe { (self.terminate_kdmapi_stream)() };
+            self.is_stream_open.store(false, Ordering::SeqCst);
+        });
+
+        KDMAPIStream { tx, generation }
     }
 }
 
@@ -72,26 +98,34 @@ fn load_kdmapi_binds(lib: &Library) -> Option<KDMAPIBinds> {
     })
 }
 
+enum KDMAPICommand {
+    Data(u32, u64),
+    Shutdown,
+}
+
 pub struct KDMAPIStream {
-    binds: &'static KDMAPIBinds,
+    tx: Sender<KDMAPICommand>,
+    generation: Arc<AtomicU64>,
 }
 
 impl KDMAPIStream {
+    /// Queue output without letting a blocked OmniMIDI call stall playback or loading.
     pub fn send_direct_data(&self, data: u32) -> u32 {
-        // Safety: FFI call to OmniMIDI's send function
-        unsafe { (self.binds.send_direct_data)(data) }
+        let generation = self.generation.load(Ordering::Acquire);
+        let _ = self.tx.send(KDMAPICommand::Data(data, generation));
+        0
+    }
+
+    /// Make output already queued for the previous file obsolete.
+    pub fn invalidate_pending(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
 impl Drop for KDMAPIStream {
     fn drop(&mut self) {
-        // Safety: FFI call to close the OmniMIDI stream
-        unsafe {
-            (self.binds.terminate_kdmapi_stream)();
-        }
-        self.binds
-            .is_stream_open
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Never wait here: OmniMIDI may currently be stuck inside SendDirectData.
+        let _ = self.tx.send(KDMAPICommand::Shutdown);
     }
 }
 

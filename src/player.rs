@@ -279,6 +279,11 @@ impl PlayerHandle {
                         }
                         PlayerCommand::LoadFile(path) => {
                             midi_ev_fifo.clear();
+                            if let Some(ref stream) = player.stream {
+                                // Do not let output queued for the old file delay its
+                                // replacement after a blocked KDMAPI call recovers.
+                                stream.invalidate_pending();
+                            }
                             player.send_all_notes_off();
                             if let Some(ref stream) = player.stream {
                                 stream.send_direct_data(0xFF);
