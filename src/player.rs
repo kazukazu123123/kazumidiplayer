@@ -355,6 +355,13 @@ impl PlayerHandle {
                         PlayerCommand::SetLegacyMidiOutput(enabled) => {
                             legacy_midi_output = enabled;
                             midi_ev_fifo.clear();
+                            if enabled {
+                                // Legacy output must start without asynchronous buffered
+                                // sends left in front of its first blocking event.
+                                if let Some(ref stream) = player.stream {
+                                    stream.invalidate_pending();
+                                }
+                            }
                         }
                         PlayerCommand::SetSpeed(speed) => {
                             let clamped = speed.clamp(0.05, 4.0);
@@ -483,17 +490,111 @@ impl PlayerHandle {
                         player.seek_position_ns = ideal_position_ns;
 
                         let unlimited = player.unlimited_output.load(Ordering::Relaxed);
+                        // Legacy mode reproduces the pre-buffer loop's hard-coded
+                        // 8192-event pass and continuous cadence. The temporary queue
+                        // is drained in this same pass, so no EV backlog is retained.
                         let capacity = if unlimited {
                             usize::MAX
+                        } else if legacy_midi_output {
+                            8192
                         } else {
                             midi_ev_buffer_size
                         };
 
-                        // A seek can land on a tempo event. Tempo changes are already
-                        // represented by the parser's tick/time map, so advance each
-                        // such cursor to its first output event before merging tracks.
-                        for track in &mut player.tracks {
-                            if !track.pending && !track.exhausted {
+                        // Buffered mode normalizes every cursor to a pending output event
+                        // before the global merge. Legacy mode must not do this: its old
+                        // per-track loop counted every cursor advance itself.
+                        if !legacy_midi_output {
+                            for track in &mut player.tracks {
+                                if !track.pending && !track.exhausted {
+                                    loop {
+                                        if !unsafe { cursor_next(&mut track.cursor) } {
+                                            track.exhausted = true;
+                                            break;
+                                        }
+                                        if !track.cursor.is_tempo {
+                                            track.pending = true;
+                                            track.pend_tick = track.cursor.abs_tick;
+                                            track.pend_status = track.cursor.status;
+                                            track.pend_p1 = track.cursor.param1;
+                                            track.pend_p2 = track.cursor.param2;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if legacy_midi_output {
+                            // Exact pre-buffer traversal: tracks are visited in file
+                            // order, the 8192 ceiling counts cursor advances (including
+                            // tempo/future events), and a future event is kept pending
+                            // for the next tight-loop pass.
+                            let mut events_processed = 0usize;
+                            for track in &mut player.tracks {
+                                if track.pending && track.pend_tick <= cur_tick {
+                                    midi_ev_fifo.push_back(BufferedMidiEvent {
+                                        tick: track.pend_tick,
+                                        track_index: track.cursor.track_index,
+                                        status: track.pend_status,
+                                        p1: track.pend_p1,
+                                        p2: track.pend_p2,
+                                    });
+                                    track.pending = false;
+                                    events_processed += 1;
+                                }
+
+                                while !track.pending
+                                    && (unlimited || events_processed < 8192)
+                                    && !track.exhausted
+                                {
+                                    if !unsafe { cursor_next(&mut track.cursor) } {
+                                        track.exhausted = true;
+                                        break;
+                                    }
+                                    events_processed += 1;
+                                    if track.cursor.is_tempo {
+                                        continue;
+                                    }
+                                    if track.cursor.abs_tick <= cur_tick {
+                                        midi_ev_fifo.push_back(BufferedMidiEvent {
+                                            tick: track.cursor.abs_tick,
+                                            track_index: track.cursor.track_index,
+                                            status: track.cursor.status,
+                                            p1: track.cursor.param1,
+                                            p2: track.cursor.param2,
+                                        });
+                                    } else {
+                                        track.pending = true;
+                                        track.pend_tick = track.cursor.abs_tick;
+                                        track.pend_status = track.cursor.status;
+                                        track.pend_p1 = track.cursor.param1;
+                                        track.pend_p2 = track.cursor.param2;
+                                    }
+                                }
+                            }
+                        } else {
+                            // Fill the bounded FIFO from all tracks in timestamp order.
+                            // Track index is the stable tie-breaker for simultaneous events.
+                            while midi_ev_fifo.len() < capacity {
+                                let next_track = player
+                                    .tracks
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, track)| track.pending && track.pend_tick <= cur_tick)
+                                    .min_by_key(|(index, track)| (track.pend_tick, *index))
+                                    .map(|(index, _)| index);
+                                let Some(track_index) = next_track else { break };
+                                let track = &mut player.tracks[track_index];
+                                midi_ev_fifo.push_back(BufferedMidiEvent {
+                                    tick: track.pend_tick,
+                                    track_index: track.cursor.track_index,
+                                    status: track.pend_status,
+                                    p1: track.pend_p1,
+                                    p2: track.pend_p2,
+                                });
+
+                                track.pending = false;
                                 loop {
                                     if !unsafe { cursor_next(&mut track.cursor) } {
                                         track.exhausted = true;
@@ -551,6 +652,7 @@ impl PlayerHandle {
                                 player.pitch_bend_override.load(Ordering::Relaxed),
                                 player.pitch_bend_multiplier.load(Ordering::Relaxed),
                                 &mut player.midi_original_pb_range,
+                                legacy_midi_output,
                             );
                             let msg_type = event.status & 0xF0;
                             if event.p1 < 128 {
@@ -952,6 +1054,7 @@ fn send_midi_event_with_override(
     pb_override: bool,
     pb_multiplier: u8,
     midi_original_pb_range: &mut [u8; 16],
+    blocking_output: bool,
 ) {
     let msg_type = status & 0xF0;
     let channel = (status & 0x0F) as usize;
@@ -988,7 +1091,11 @@ fn send_midi_event_with_override(
 
     if let Some(stream) = stream {
         let midi_msg = status as u32 | ((out_p1 as u32) << 8) | ((out_p2 as u32) << 16);
-        stream.send_direct_data(midi_msg);
+        if blocking_output {
+            stream.send_direct_data_blocking(midi_msg);
+        } else {
+            stream.send_direct_data(midi_msg);
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use libloading::Library;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -48,13 +48,20 @@ impl KDMAPIBinds {
         thread::spawn(move || {
             while let Ok(command) = rx.recv() {
                 match command {
-                    KDMAPICommand::Data(data, event_generation) => {
+                    KDMAPICommand::Data(data, event_generation, completion) => {
                         // A file load advances the generation. Once a blocked FFI call
                         // returns, discard all output still queued for the old file.
-                        if event_generation == worker_generation.load(Ordering::Acquire) {
+                        let result = if event_generation
+                            == worker_generation.load(Ordering::Acquire)
+                        {
                             // Safety: this dedicated worker is the only thread calling
                             // SendDirectData for this stream.
-                            unsafe { (self.send_direct_data)(data) };
+                            unsafe { (self.send_direct_data)(data) }
+                        } else {
+                            0
+                        };
+                        if let Some(completion) = completion {
+                            let _ = completion.send(result);
                         }
                     }
                     KDMAPICommand::Shutdown => break,
@@ -99,7 +106,7 @@ fn load_kdmapi_binds(lib: &Library) -> Option<KDMAPIBinds> {
 }
 
 enum KDMAPICommand {
-    Data(u32, u64),
+    Data(u32, u64, Option<SyncSender<u32>>),
     Shutdown,
 }
 
@@ -112,8 +119,25 @@ impl KDMAPIStream {
     /// Queue output without letting a blocked OmniMIDI call stall playback or loading.
     pub fn send_direct_data(&self, data: u32) -> u32 {
         let generation = self.generation.load(Ordering::Acquire);
-        let _ = self.tx.send(KDMAPICommand::Data(data, generation));
+        let _ = self
+            .tx
+            .send(KDMAPICommand::Data(data, generation, None));
         0
+    }
+
+    /// Submit one event and wait for OmniMIDI's SendDirectData call to return.
+    /// This reproduces the synchronous output behavior used before EV buffering.
+    pub fn send_direct_data_blocking(&self, data: u32) -> u32 {
+        let generation = self.generation.load(Ordering::Acquire);
+        let (tx_completion, rx_completion) = mpsc::sync_channel(0);
+        if self
+            .tx
+            .send(KDMAPICommand::Data(data, generation, Some(tx_completion)))
+            .is_err()
+        {
+            return 0;
+        }
+        rx_completion.recv().unwrap_or(0)
     }
 
     /// Make output already queued for the previous file obsolete.

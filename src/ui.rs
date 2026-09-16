@@ -657,7 +657,7 @@ pub fn draw_settings_overlay(
         let mouse_world_y = (mouse_pos.y - camera.offset.y) / scale + camera.target.y;
         let mouse_world_pos = Vector2::new(mouse_world_x, mouse_world_y);
 
-        let click_pos = if let Some(InputEvent::MouseDown(p)) = input_event {
+        let mut click_pos = if let Some(InputEvent::MouseDown(p)) = input_event {
             let mouse_world_x = (p.x as f32 - camera.offset.x) / scale + camera.target.x;
             let mouse_world_y = (p.y as f32 - camera.offset.y) / scale + camera.target.y;
             Some(Vector2::new(mouse_world_x, mouse_world_y))
@@ -950,6 +950,7 @@ pub fn draw_settings_overlay(
             if is_visible(sy(y), 52.0) {
                 let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
                 midi_ev_mode_combo_rect = Some(combo_rect);
+                let was_open = midi_ev_mode_combo.open;
                 draw_combo_box(
                     &mut d_scissor,
                     combo_rect,
@@ -960,6 +961,28 @@ pub fn draw_settings_overlay(
                     click_pos,
                     eased_t,
                 );
+
+                // The popup overlays later settings, so clicks handled by its header
+                // or option list must not continue into controls underneath it.
+                if let Some(click) = click_pos {
+                    let header = Rectangle::new(
+                        combo_rect.x,
+                        combo_rect.y + 20.0,
+                        combo_rect.width,
+                        28.0,
+                    );
+                    let popup = Rectangle::new(
+                        header.x,
+                        header.y + header.height,
+                        header.width,
+                        28.0 * 3.0,
+                    );
+                    if header.check_collision_point_rec(click)
+                        || (was_open && popup.check_collision_point_rec(click))
+                    {
+                        click_pos = None;
+                    }
+                }
             }
 
             // Pitch Bend Window Toggle
