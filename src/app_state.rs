@@ -112,6 +112,16 @@ pub struct AppState {
 
     // Animation
     pub tick_based_animation: f32,
+    /// Pulses the piano-roll zoom in time with the MIDI tempo.
+    pub beat_bounce_enabled: bool,
+    pub beat_bounce_animation: f32,
+    /// Peak piano-roll zoom added at the start of a pulse, in percent (0..=25).
+    pub beat_bounce_amount: u32,
+    /// Rhythmic note value used for each pulse: 4 = quarter, 8 = eighth, etc.
+    pub beat_bounce_note_value: u32,
+    /// Shift each pulse by half of the selected note interval.
+    pub beat_bounce_offbeat: bool,
+    pub beat_bounce_offbeat_animation: f32,
     pub shake_enabled: bool,
     pub shake_animation: f32,
     pub shake_state: ShakeState,
@@ -137,6 +147,10 @@ pub struct AppState {
     pub settings_scrollbar_drag_start_y: f32,
     pub settings_scrollbar_drag_start_scroll: f32,
     pub settings_pb_multiplier_slider_dragging: bool,
+    pub settings_beat_bounce_amount_slider:
+        crate::ui_components::numeric_slider::NumericSliderState,
+    pub settings_beat_bounce_note_value_slider:
+        crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_midi_ev_buffer_size_slider:
         crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_scan_delay_slider_dragging: bool,
@@ -224,6 +238,12 @@ impl AppState {
 
             // Animation
             tick_based_animation: 0.0,
+            beat_bounce_enabled: false,
+            beat_bounce_animation: 0.0,
+            beat_bounce_amount: 8,
+            beat_bounce_note_value: 4,
+            beat_bounce_offbeat: false,
+            beat_bounce_offbeat_animation: 0.0,
             shake_enabled: false,
             shake_animation: 0.0,
             shake_state: ShakeState::new(),
@@ -249,6 +269,10 @@ impl AppState {
             settings_scrollbar_drag_start_y: 0.0,
             settings_scrollbar_drag_start_scroll: 0.0,
             settings_pb_multiplier_slider_dragging: false,
+            settings_beat_bounce_amount_slider:
+                crate::ui_components::numeric_slider::NumericSliderState::default(),
+            settings_beat_bounce_note_value_slider:
+                crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_midi_ev_buffer_size_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_scan_delay_slider_dragging: false,

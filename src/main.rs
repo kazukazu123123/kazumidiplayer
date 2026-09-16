@@ -111,6 +111,30 @@ fn animate_toggle(condition: bool, value: &mut f32, dt: f32, speed: f32) {
     }
 }
 
+/// Piano-roll speed multiplier for Beat Bounce. MIDI ticks make the phase follow
+/// tempo changes automatically. `note_value` is the denominator in 1/N note.
+fn beat_bounce_multiplier(
+    data: &kazumidiparser::KazuMIDIParserData,
+    position_ns: u64,
+    playing: bool,
+    amount_percent: u32,
+    note_value: u32,
+    offbeat: bool,
+    animation: f32,
+) -> f32 {
+    if !playing || animation <= 0.0 || amount_percent == 0 {
+        return 1.0;
+    }
+    let division = (data.header.division as u32).max(1);
+    let tick = kazumidiparser_cursor::ns_to_tick(data, position_ns) as f64;
+    let period_ticks = division as f64 * 4.0 / note_value.clamp(1, 64) as f64;
+    let phase_offset = if offbeat { period_ticks * 0.5 } else { 0.0 };
+    let phase = ((tick + phase_offset) % period_ticks) / period_ticks;
+    // A quick attack at each selected note boundary and a smooth decay.
+    let pulse = (1.0 - phase as f32).powi(4);
+    1.0 + amount_percent.min(25) as f32 / 100.0 * pulse * animation
+}
+
 // Vertical padding required so a bent Piano Keyboard window can extend
 // beyond its original rectangle without clipping.
 fn compute_kb_bend_padding(win_width: f32, pitch_bend_range: f32) -> f32 {
@@ -335,6 +359,18 @@ fn main() {
         animate_toggle(
             app_state.is_tick_based,
             &mut app_state.tick_based_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.beat_bounce_enabled,
+            &mut app_state.beat_bounce_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.beat_bounce_offbeat,
+            &mut app_state.beat_bounce_offbeat_animation,
             dt,
             anim_speed,
         );
@@ -1043,7 +1079,16 @@ fn main() {
                                             playback_position_ns,
                                             roll_area,
                                             app_state.is_tick_based,
-                                            app_state.note_speed,
+                                            app_state.note_speed
+                                                * beat_bounce_multiplier(
+                                                    parser_data,
+                                                    playback_position_ns,
+                                                    st == PlayerState::Playing,
+                                                    app_state.beat_bounce_amount,
+                                                    app_state.beat_bounce_note_value,
+                                                    app_state.beat_bounce_offbeat,
+                                                    app_state.beat_bounce_animation,
+                                                ),
                                             chunk,
                                         );
                                     });
@@ -1446,6 +1491,14 @@ fn main() {
                             is_mouse_down,
                             &mut app_state.is_tick_based,
                             app_state.tick_based_animation,
+                            &mut app_state.beat_bounce_enabled,
+                            app_state.beat_bounce_animation,
+                            &mut app_state.beat_bounce_amount,
+                            &mut app_state.settings_beat_bounce_amount_slider,
+                            &mut app_state.beat_bounce_note_value,
+                            &mut app_state.settings_beat_bounce_note_value_slider,
+                            &mut app_state.beat_bounce_offbeat,
+                            app_state.beat_bounce_offbeat_animation,
                             &mut app_state.shake_enabled,
                             app_state.shake_animation,
                             &mut app_state.integrate_keyboard,

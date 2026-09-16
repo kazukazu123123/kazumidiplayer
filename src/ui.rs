@@ -501,6 +501,14 @@ pub fn draw_settings_overlay(
     is_mouse_down: bool,
     is_tick_based: &mut bool,
     tick_based_animation: f32,
+    beat_bounce_enabled: &mut bool,
+    beat_bounce_animation: f32,
+    beat_bounce_amount: &mut u32,
+    beat_bounce_amount_slider: &mut NumericSliderState,
+    beat_bounce_note_value: &mut u32,
+    beat_bounce_note_value_slider: &mut NumericSliderState,
+    beat_bounce_offbeat: &mut bool,
+    beat_bounce_offbeat_animation: f32,
     shake_enabled: &mut bool,
     shake_animation: f32,
     integrate_keyboard: &mut bool,
@@ -593,8 +601,14 @@ pub fn draw_settings_overlay(
     // Pre-calculate content height for scrollbar
     let mut measure_layout = VerticalLayout::new(content_top, 5.0);
     measure_layout.next(18.0);
-    measure_layout.next(30.0);
-    measure_layout.next(30.0);
+    measure_layout.next(30.0); // Tick Based Mode
+    measure_layout.next(30.0); // Beat Bounce
+    if *beat_bounce_enabled {
+        measure_layout.next(52.0); // Beat Bounce Amount
+        measure_layout.next(52.0); // Beat Bounce Note Value
+        measure_layout.next(30.0); // Beat Bounce Offbeat
+    }
+    measure_layout.next(30.0); // Shaking Window
     measure_layout.next(30.0);
     measure_layout.next(30.0);
     measure_layout.next(30.0);
@@ -651,9 +665,18 @@ pub fn draw_settings_overlay(
         // Scroll with mouse wheel when hovering the panel content area. The numeric
         // EV control owns the wheel while hovered for exact stepping.
         let scroll_area_rect = Rectangle::new(0.0, content_top, panel_rect.width, viewport_height);
-        let midi_ev_rect = Rectangle::new(20.0, 248.0 - *scroll_y, 275.0, 52.0);
+        let conditional_beat_height = if *beat_bounce_enabled { 149.0 } else { 0.0 };
+        let beat_amount_rect = Rectangle::new(20.0, 143.0 - *scroll_y, 275.0, 144.0);
+        let midi_ev_rect = Rectangle::new(
+            20.0,
+            283.0 + conditional_beat_height - *scroll_y,
+            275.0,
+            52.0,
+        );
         if scroll_area_rect.check_collision_point_rec(mouse_world_pos)
             && !midi_ev_rect.check_collision_point_rec(mouse_world_pos)
+            && !(*beat_bounce_enabled
+                && beat_amount_rect.check_collision_point_rec(mouse_world_pos))
             && mouse_wheel != 0.0
         {
             let scroll_speed = 30.0;
@@ -723,6 +746,97 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *is_tick_based = !*is_tick_based;
+                }
+            }
+
+            // Beat Bounce pulses only the piano-roll zoom at the selected note interval.
+            let y = layout.next(30.0);
+            let beat_bounce_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            if is_visible(beat_bounce_rect.y, beat_bounce_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    beat_bounce_rect,
+                    "Beat Bounce",
+                    beat_bounce_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *beat_bounce_enabled = !*beat_bounce_enabled;
+                }
+            }
+
+            if *beat_bounce_enabled {
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "Beat Bounce Amount (%)",
+                        beat_bounce_amount,
+                        0,
+                        25,
+                        beat_bounce_amount_slider,
+                        &input,
+                        eased_t,
+                    );
+                }
+
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "Beat Interval (1/N Note)",
+                        beat_bounce_note_value,
+                        1,
+                        64,
+                        beat_bounce_note_value_slider,
+                        &input,
+                        eased_t,
+                    );
+                }
+
+                let y = layout.next(30.0);
+                let offbeat_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+                if is_visible(offbeat_rect.y, offbeat_rect.height) {
+                    if draw_toggle(
+                        &mut d_scissor,
+                        offbeat_rect,
+                        "Offbeat",
+                        beat_bounce_offbeat_animation,
+                        true,
+                        eased_t,
+                        click_pos,
+                        Some(mouse_world_pos),
+                    ) {
+                        *beat_bounce_offbeat = !*beat_bounce_offbeat;
+                    }
                 }
             }
 
