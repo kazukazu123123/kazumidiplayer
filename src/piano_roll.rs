@@ -1057,6 +1057,24 @@ fn rasterize_column(
                 break;
             }
         }
+
+        // A very long note can sit at the front of the queue and keep all the
+        // shorter notes after it from being retired. Once more than MAX_LOOKBACK
+        // of those later notes have ended, the bounded reverse search above no
+        // longer reaches the long note and it appears to vanish. Check the oldest
+        // edge as a bounded fallback; held notes reconstructed by a seek also live
+        // here, so this covers both normal playback and roll regeneration without
+        // turning a dense rest into an unbounded scan on every pixel.
+        if owner[r] == u32::MAX && prefix > MAX_LOOKBACK {
+            let oldest_end = prefix.min(MAX_LOOKBACK);
+            for (index, n) in b.notes.range(..oldest_end).enumerate().rev() {
+                if n.end_tick >= t_lo {
+                    col[r] = pack(get_note_color_by_index(n.color));
+                    owner[r] = index as u32;
+                    break;
+                }
+            }
+        }
     }
 
     // Outline each note's visible extent, top and bottom. Per run of one owner rather

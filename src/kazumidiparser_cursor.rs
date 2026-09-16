@@ -337,8 +337,9 @@ pub struct HeldNote {
 /// open on its (channel, key), so overlapping notes survive as separate notes
 /// instead of truncating each other.
 ///
-/// Notes whose note-on lies before the keyframe used for the jump are not detected,
-/// so a very long note spanning a keyframe boundary can still be missed.
+/// This deliberately scans from the track start instead of jumping to a keyframe.
+/// Keyframes do not contain held-note state, so jumping can lose a long note whose
+/// note-on lies before the keyframe and make it disappear after a roll rebuild.
 ///
 /// # Safety
 /// Same requirements as `seek_track_cursor`.
@@ -384,9 +385,8 @@ pub unsafe fn seek_track_cursor_with_held(
     }
 
     unsafe {
-        jump_to_keyframe(data, &mut cursor, target_tick);
-
-        // Walk to the target, tracking note on/off so we know what is held.
+        // Walk from the track start to the target, tracking note on/off so the
+        // held-note set is complete even when a note spans one or more keyframes.
         while cursor_next(&mut cursor) {
             if cursor.is_tempo {
                 continue;
