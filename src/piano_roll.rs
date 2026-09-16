@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::kazumidiparser_cursor::{
     cursor_next, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held, TrackCursor,
 };
-use crate::ui_components::piano_keyboard::get_keyboard_note_regions;
+use crate::ui_components::piano_keyboard::{get_keyboard_note_regions, is_black_key};
 use crate::utils::get_note_color_by_index;
 
 /// How much of the future is visible, when the vertical axis is time based.
@@ -1203,27 +1203,36 @@ pub fn draw_piano_roll_chunk(
     // The left and right edges are drawn per run rather than per note: every note on
     // a key spans the key's full width, so those two edges are the same two columns
     // of pixels for all of them.
-    for (note, col) in cols.chunks(height_px).enumerate() {
-        let (rx, rw) = regions[note];
-        let x = area.x + rx;
-        let mut yy = 0usize;
-        while yy < height_px {
-            let p = col[yy];
-            if p == 0 {
-                yy += 1;
+    // White-key regions overlap the neighbouring black-key regions. MIDI note order
+    // alternates between them, so a single ascending pass lets the next white key
+    // paint over the preceding black key. Match a physical keyboard's z-order:
+    // render every white-key column first, then all black-key columns on top.
+    for black_pass in [false, true] {
+        for (note, col) in cols.chunks(height_px).enumerate() {
+            if is_black_key(note as u8) != black_pass {
                 continue;
             }
-            let run_start = yy;
-            while yy < height_px && col[yy] == p {
-                yy += 1;
+            let (rx, rw) = regions[note];
+            let x = area.x + rx;
+            let mut yy = 0usize;
+            while yy < height_px {
+                let p = col[yy];
+                if p == 0 {
+                    yy += 1;
+                    continue;
+                }
+                let run_start = yy;
+                while yy < height_px && col[yy] == p {
+                    yy += 1;
+                }
+                let unpack = |v: u32| Color::new((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
+                let y = top_y + run_start as f32;
+                let h = (yy - run_start) as f32;
+                d.draw_rectangle_rec(Rectangle::new(x, y, rw, h), unpack(p));
+                let edge = unpack(darken(p));
+                d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
+                d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
             }
-            let unpack = |v: u32| Color::new((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
-            let y = top_y + run_start as f32;
-            let h = (yy - run_start) as f32;
-            d.draw_rectangle_rec(Rectangle::new(x, y, rw, h), unpack(p));
-            let edge = unpack(darken(p));
-            d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
-            d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
         }
     }
 }
