@@ -37,6 +37,7 @@ pub enum PlayerCommand {
     SetUnlimitedOutput(bool),
     SetMidiEvBufferSize(u32),
     SetMidiEvCatchUp(bool),
+    SetLegacyMidiOutput(bool),
     SetSpeed(f32),
     SetParseThreads(u32),
 }
@@ -217,6 +218,7 @@ impl PlayerHandle {
             // (tick, track) order and state changes happen only when they leave it.
             let mut midi_ev_buffer_size = DEFAULT_MIDI_EV_BUFFER_SIZE as usize;
             let mut midi_ev_catch_up = false;
+            let mut legacy_midi_output = true;
             let mut midi_ev_fifo = VecDeque::<BufferedMidiEvent>::new();
 
             let mut player = MIDIPlayer::new(
@@ -349,6 +351,10 @@ impl PlayerHandle {
                                 playback_start = Instant::now();
                             }
                             midi_ev_catch_up = enabled;
+                        }
+                        PlayerCommand::SetLegacyMidiOutput(enabled) => {
+                            legacy_midi_output = enabled;
+                            midi_ev_fifo.clear();
                         }
                         PlayerCommand::SetSpeed(speed) => {
                             let clamped = speed.clamp(0.05, 4.0);
@@ -505,43 +511,6 @@ impl PlayerHandle {
                             }
                         }
 
-                        // Fill the bounded FIFO from all tracks in timestamp order. Track
-                        // index is the stable tie-breaker for simultaneous events.
-                        while midi_ev_fifo.len() < capacity {
-                            let next_track = player
-                                .tracks
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, track)| track.pending && track.pend_tick <= cur_tick)
-                                .min_by_key(|(index, track)| (track.pend_tick, *index))
-                                .map(|(index, _)| index);
-                            let Some(track_index) = next_track else { break };
-                            let track = &mut player.tracks[track_index];
-                            midi_ev_fifo.push_back(BufferedMidiEvent {
-                                tick: track.pend_tick,
-                                track_index: track.cursor.track_index,
-                                status: track.pend_status,
-                                p1: track.pend_p1,
-                                p2: track.pend_p2,
-                            });
-
-                            track.pending = false;
-                            loop {
-                                if !unsafe { cursor_next(&mut track.cursor) } {
-                                    track.exhausted = true;
-                                    break;
-                                }
-                                if !track.cursor.is_tempo {
-                                    track.pending = true;
-                                    track.pend_tick = track.cursor.abs_tick;
-                                    track.pend_status = track.cursor.status;
-                                    track.pend_p1 = track.cursor.param1;
-                                    track.pend_p2 = track.cursor.param2;
-                                    break;
-                                }
-                            }
-                        }
-
                         // A full FIFO only means backpressure when at least one more due
                         // event remains. Slowdown re-anchors song time here; Catch Up
                         // deliberately leaves the ideal wall-clock anchor untouched.
@@ -549,8 +518,12 @@ impl PlayerHandle {
                             .tracks
                             .iter()
                             .any(|track| track.pending && track.pend_tick <= cur_tick);
-                        let catch_up_backlog = midi_ev_catch_up && backlog_due;
-                        if !unlimited && midi_ev_fifo.len() == capacity && backlog_due {
+                        let catch_up_backlog = !legacy_midi_output && midi_ev_catch_up && backlog_due;
+                        if !legacy_midi_output
+                            && !unlimited
+                            && midi_ev_fifo.len() == capacity
+                            && backlog_due
+                        {
                             // Both modes expose the delayed position while the FIFO is
                             // saturated. Slowdown also moves the clock anchor back;
                             // Catch Up keeps the original anchor so the position jumps
@@ -623,7 +596,9 @@ impl PlayerHandle {
                             .iter()
                             .all(|track| track.exhausted && !track.pending)
                             && midi_ev_fifo.is_empty();
-                        if player.seek_position_ns >= max_ns && drained {
+                        if player.seek_position_ns >= max_ns
+                            && (legacy_midi_output || drained)
+                        {
                             player.seek_position_ns = max_ns;
                             player.state = PlayerState::Stopped;
                             player.reset_playback_state();
@@ -641,6 +616,10 @@ impl PlayerHandle {
 
                 if player.state != PlayerState::Playing {
                     thread::sleep(Duration::from_millis(10));
+                } else if legacy_midi_output {
+                    // This was the pre-buffer cadence: run continuously and let the
+                    // hard-coded per-pass event ceiling provide the only throttling.
+                    thread::yield_now();
                 } else if player.unlimited_output.load(Ordering::Relaxed) {
                     // Unlimited mode must not inherit the normal 60 Hz submission
                     // cadence. Run continuously so events become due and are sent at
@@ -713,6 +692,12 @@ impl PlayerHandle {
         let _ = self
             .tx_command
             .send(PlayerCommand::SetMidiEvCatchUp(enabled));
+    }
+
+    pub fn set_legacy_midi_output(&self, enabled: bool) {
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetLegacyMidiOutput(enabled));
     }
 
     pub fn set_speed(&self, speed: f32) {

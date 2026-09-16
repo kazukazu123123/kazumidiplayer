@@ -1,5 +1,8 @@
 use crate::player::{PlayerCommand, PlayerState};
 use crate::ui_components::button::draw_button;
+use crate::ui_components::combo_box::{
+    ComboBoxState, draw_combo_box, draw_combo_box_popup,
+};
 use crate::ui_components::numeric_slider::{
     NumericSliderInput, NumericSliderState, draw_u32_numeric_slider,
 };
@@ -530,8 +533,8 @@ pub fn draw_settings_overlay(
     scrollbar_drag_start_scroll: &mut f32,
     pb_multiplier_slider_dragging: &mut bool,
     midi_ev_buffer_size_slider: &mut NumericSliderState,
-    midi_ev_catch_up: &mut bool,
-    midi_ev_catch_up_animation: f32,
+    midi_ev_mode: &mut usize,
+    midi_ev_mode_combo: &mut ComboBoxState,
     parse_threads: &mut u32,
     parse_threads_slider_dragging: &mut bool,
     scan_delay_ms: &mut u32,
@@ -615,7 +618,7 @@ pub fn draw_settings_overlay(
     measure_layout.next(30.0);
     measure_layout.next(30.0);
     measure_layout.next(52.0); // MIDI EV Buffer Size slider
-    measure_layout.next(30.0); // EV backlog mode toggle
+    measure_layout.next(52.0); // EV buffer mode combo box
     if *pitch_bend_override {
         measure_layout.next(38.0);
     }
@@ -709,6 +712,7 @@ pub fn draw_settings_overlay(
 
         // Scissor: clip scrollable content to the content area
         {
+            let mut midi_ev_mode_combo_rect = None;
             let clip_tl = d2d.get_world_to_screen2D(Vector2::new(0.0, content_top), camera);
             let clip_br =
                 d2d.get_world_to_screen2D(Vector2::new(panel_rect.width, content_bottom), camera);
@@ -942,23 +946,20 @@ pub fn draw_settings_overlay(
                 }
             }
 
-            // Choose whether a full event buffer slows song time or only delays MIDI
-            // output until it can catch back up to the wall-clock position.
-            let y = layout.next(30.0);
-            let catch_up_rect = Rectangle::new(20.0, sy(y), 275.0, 30.0);
-            if is_visible(catch_up_rect.y, catch_up_rect.height) {
-                if draw_toggle(
+            let y = layout.next(52.0);
+            if is_visible(sy(y), 52.0) {
+                let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
+                midi_ev_mode_combo_rect = Some(combo_rect);
+                draw_combo_box(
                     &mut d_scissor,
-                    catch_up_rect,
-                    "EV Backlog: Catch Up",
-                    midi_ev_catch_up_animation,
-                    true,
-                    eased_t,
+                    combo_rect,
+                    "EV Buffer Mode",
+                    &["Legacy (No Buffer)", "Buffered: Slowdown", "Buffered: Catch Up"],
+                    midi_ev_mode,
+                    midi_ev_mode_combo,
                     click_pos,
-                    Some(mouse_world_pos),
-                ) {
-                    *midi_ev_catch_up = !*midi_ev_catch_up;
-                }
+                    eased_t,
+                );
             }
 
             // Pitch Bend Window Toggle
@@ -1211,6 +1212,18 @@ pub fn draw_settings_overlay(
                         }
                     }
                 }
+            }
+
+            // Popup is deliberately drawn last so it floats above the controls below it.
+            if let Some(combo_rect) = midi_ev_mode_combo_rect {
+                draw_combo_box_popup(
+                    &mut d_scissor,
+                    combo_rect,
+                    &["Legacy (No Buffer)", "Buffered: Slowdown", "Buffered: Catch Up"],
+                    midi_ev_mode_combo,
+                    mouse_world_pos,
+                    eased_t,
+                );
             }
         }
 

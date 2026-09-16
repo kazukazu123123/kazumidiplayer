@@ -411,12 +411,6 @@ fn main() {
             anim_speed,
         );
         animate_toggle(
-            app_state.midi_ev_catch_up,
-            &mut app_state.midi_ev_catch_up_animation,
-            dt,
-            anim_speed,
-        );
-        animate_toggle(
             app_state.show_stats,
             &mut app_state.show_stats_animation,
             dt,
@@ -1479,7 +1473,7 @@ fn main() {
                         let prev_pb_multiplier = app_state.pitch_bend_multiplier;
                         let prev_unlimited_output = app_state.unlimited_output_enabled;
                         let prev_midi_ev_buffer_size = app_state.midi_ev_buffer_size;
-                        let prev_midi_ev_catch_up = app_state.midi_ev_catch_up;
+                        let prev_midi_ev_mode = app_state.midi_ev_mode;
                         let prev_parse_threads = app_state.parse_threads;
                         if ui::draw_settings_overlay(
                             d,
@@ -1520,8 +1514,8 @@ fn main() {
                             &mut app_state.settings_scrollbar_drag_start_scroll,
                             &mut app_state.settings_pb_multiplier_slider_dragging,
                             &mut app_state.settings_midi_ev_buffer_size_slider,
-                            &mut app_state.midi_ev_catch_up,
-                            app_state.midi_ev_catch_up_animation,
+                            &mut app_state.midi_ev_mode,
+                            &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,
                             &mut app_state.settings_parse_threads_slider_dragging,
                             &mut app_state.scan_delay_ms,
@@ -1543,8 +1537,9 @@ fn main() {
                         if app_state.midi_ev_buffer_size != prev_midi_ev_buffer_size {
                             engine.set_midi_ev_buffer_size(app_state.midi_ev_buffer_size);
                         }
-                        if app_state.midi_ev_catch_up != prev_midi_ev_catch_up {
-                            engine.set_midi_ev_catch_up(app_state.midi_ev_catch_up);
+                        if app_state.midi_ev_mode != prev_midi_ev_mode {
+                            engine.set_legacy_midi_output(app_state.midi_ev_mode == 0);
+                            engine.set_midi_ev_catch_up(app_state.midi_ev_mode == 2);
                         }
                         if app_state.parse_threads != prev_parse_threads {
                             engine.set_parse_threads(app_state.parse_threads);
