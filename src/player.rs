@@ -593,7 +593,7 @@ impl PlayerHandle {
                                         player.pitch_bend_override.load(Ordering::Relaxed),
                                         player.pitch_bend_multiplier.load(Ordering::Relaxed),
                                         &mut player.midi_original_pb_range,
-                                        legacy_midi_output,
+                                        true,
                                         &active_notes_clone,
                                         &mut active_count,
                                         &mut notes_played_count,
