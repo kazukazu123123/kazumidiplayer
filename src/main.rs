@@ -417,30 +417,18 @@ fn main() {
             anim_speed,
         );
 
-        // Notes-per-second as a 1-second moving average of the player's note-on
-        // counter: snapshot (clock, notes) each frame, drop samples older than 1s,
-        // and divide the note delta by the actual time span they cover.
         app_state.stats_clock += dt;
         {
             let now_notes = engine.notes_played();
             let clock = app_state.stats_clock;
             app_state.nps_samples.push_back((clock, now_notes));
-            while app_state
-                .nps_samples
-                .front()
-                .map_or(false, |&(t, _)| clock - t > 1.0)
+            while app_state.nps_samples.len() > 1
+                && app_state
+                    .nps_samples
+                    .get(1)
+                    .map_or(false, |&(t, _)| clock - t > 1.0)
             {
-                // Keep one sample just past the 1s boundary so the window stays full.
-                if app_state.nps_samples.len() > 1
-                    && app_state
-                        .nps_samples
-                        .get(1)
-                        .map_or(false, |&(t, _)| clock - t > 1.0)
-                {
-                    app_state.nps_samples.pop_front();
-                } else {
-                    break;
-                }
+                app_state.nps_samples.pop_front();
             }
             if let (Some(&(t0, n0)), Some(&(t1, n1))) =
                 (app_state.nps_samples.front(), app_state.nps_samples.back())
@@ -453,6 +441,13 @@ fn main() {
                 };
             }
         }
+        app_state.tempo_us_value = engine
+            .get_midi_data()
+            .map(|data| {
+                let parser_data = unsafe { &*data.as_ptr() };
+                kazumidiparser_cursor::tempo_us_at_ns(parser_data, playback_position_ns)
+            })
+            .unwrap_or(500_000);
 
         // Shaking Window Logic
         app_state.shake_state.update(
@@ -1275,14 +1270,29 @@ fn main() {
             // Drawn as a translucent panel; fades with its animation.
             let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
             if stats_alpha > 0.01 {
-                let lines = [format!(
-                    "NPS   {}",
-                    group_thousands(app_state.nps_value.round() as u64)
-                )];
+                let tempo_us = app_state.tempo_us_value.max(1);
+                let bpm = (60_000_000.0 / tempo_us as f64).round() as u64;
+                let total = app_state
+                    .midi_data
+                    .as_ref()
+                    .map(|data| data.total_note_on_events())
+                    .unwrap_or(0);
+                let lines = [
+                    format!(
+                        "NPS   {}",
+                        group_thousands(app_state.nps_value.round() as u64)
+                    ),
+                    format!(
+                        "NOTES {} / {}",
+                        group_thousands(engine.notes_played()),
+                        group_thousands(total)
+                    ),
+                    format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
+                ];
                 let font_size = 18;
                 let pad = 8;
                 let line_h = 22;
-                let panel_w = 170;
+                let panel_w = 330;
                 let panel_h = pad * 2 + line_h * lines.len() as i32;
                 let px = screen_width - panel_w - 10;
                 let py = 10;

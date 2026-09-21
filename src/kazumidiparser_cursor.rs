@@ -489,6 +489,34 @@ pub fn tick_to_ns(data: &KazuMIDIParserData, tick: u32) -> u64 {
     }
 }
 
+/// The active tempo in microseconds per quarter note at the given absolute
+/// playback time in nanoseconds (e.g. 500_000 = 120 BPM). Before the file's first
+/// tempo event the SMF default rate applies, same as `tick_to_ns`/`ns_to_tick`
+/// assume for the stretch before `tempo_ns[0]`.
+#[inline]
+pub fn tempo_us_at_ns(data: &KazuMIDIParserData, ns: u64) -> u32 {
+    if data.tempo_count == 0 || data.tempo_ns.is_null() {
+        return DEFAULT_TEMPO_US as u32;
+    }
+    unsafe {
+        if ns < *data.tempo_ns {
+            return DEFAULT_TEMPO_US as u32;
+        }
+        // Largest i with tempo_ns[i] <= ns (tempo_ns is ascending).
+        let mut lo = 0usize;
+        let mut hi = data.tempo_count;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if *data.tempo_ns.add(mid) <= ns {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        *data.tempo_val.add(lo)
+    }
+}
+
 #[inline]
 pub fn ns_to_tick(data: &KazuMIDIParserData, ns: u64) -> u32 {
     if ns == 0 {

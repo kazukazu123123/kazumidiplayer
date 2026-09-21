@@ -99,13 +99,10 @@ pub struct AppState {
     // Statistics overlay
     pub show_stats: bool,
     pub show_stats_animation: f32,
-    /// Monotonic clock (seconds) advanced each frame, used to window NPS samples.
     pub stats_clock: f32,
-    /// Ring of `(clock, notes_played)` snapshots kept for a ~1s window so NPS is a
-    /// moving average rather than a jumpy instantaneous delta.
     pub nps_samples: VecDeque<(f32, u64)>,
-    /// Most recent notes-per-second value shown in the stats overlay.
     pub nps_value: f32,
+    pub tempo_us_value: u32,
     pub tick_map: Option<Vec<(u64, u32, u64)>>,
     pub midi_data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub last_seek_sent_ns: Option<u64>,
@@ -233,6 +230,7 @@ impl AppState {
             stats_clock: 0.0,
             nps_samples: VecDeque::new(),
             nps_value: 0.0,
+            tempo_us_value: 500_000,
             tick_map: None,
             midi_data: None,
             last_seek_sent_ns: None,
@@ -440,6 +438,7 @@ impl AppState {
         self.parse_toast = None;
         self.current_progress = None;
         self.midi_data = None;
+        self.tick_map = None;
         tx_commands
             .send(PlayerCommand::LoadFile(path.to_string()))
             .ok();
