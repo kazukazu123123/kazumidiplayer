@@ -542,10 +542,14 @@ impl PlayerHandle {
                         player.seek_position_ns = ideal_position_ns;
 
                         let unlimited = player.unlimited_output.load(Ordering::Relaxed);
+                        // Unlimited has one unambiguous path: globally ordered,
+                        // synchronous direct dispatch. Keep the selected EV mode only
+                        // for when Unlimited is turned off again.
+                        let use_legacy_traversal = legacy_midi_output && !unlimited;
                         // Legacy mode reproduces the pre-buffer loop's hard-coded
                         // 8192-event pass and continuous cadence. The temporary queue
                         // is drained in this same pass, so no EV backlog is retained.
-                        let capacity = if legacy_midi_output {
+                        let capacity = if use_legacy_traversal {
                             8192
                         } else {
                             midi_ev_buffer_size
@@ -555,7 +559,7 @@ impl PlayerHandle {
                         // Buffered mode normalizes every cursor to a pending output event
                         // before the global merge. Legacy mode must not do this: its old
                         // per-track loop counted every cursor advance itself.
-                        if !legacy_midi_output {
+                        if !use_legacy_traversal {
                             for track in &mut player.tracks {
                                 if !track.pending && !track.exhausted {
                                     loop {
@@ -605,7 +609,7 @@ impl PlayerHandle {
                             }};
                         }
 
-                        if legacy_midi_output {
+                        if use_legacy_traversal {
                             // Exact pre-buffer traversal: tracks are visited in file
                             // order, the 8192 ceiling counts cursor advances (including
                             // tempo/future events), and a future event is kept pending
@@ -702,8 +706,8 @@ impl PlayerHandle {
                             .iter()
                             .any(|track| track.pending && track.pend_tick <= cur_tick);
                         let catch_up_backlog =
-                            !legacy_midi_output && midi_ev_catch_up && backlog_due;
-                        if !legacy_midi_output
+                            !use_legacy_traversal && midi_ev_catch_up && backlog_due;
+                        if !use_legacy_traversal
                             && !unlimited
                             && midi_ev_fifo.len() == capacity
                             && backlog_due
@@ -732,7 +736,7 @@ impl PlayerHandle {
                                 player.pitch_bend_override.load(Ordering::Relaxed),
                                 player.pitch_bend_multiplier.load(Ordering::Relaxed),
                                 &mut player.midi_original_pb_range,
-                                legacy_midi_output,
+                                use_legacy_traversal,
                                 &active_notes_clone,
                                 &mut active_count,
                                 &mut notes_played_count,
@@ -760,7 +764,7 @@ impl PlayerHandle {
                             .iter()
                             .all(|track| track.exhausted && !track.pending)
                             && midi_ev_fifo.is_empty();
-                        if player.seek_position_ns >= max_ns && (legacy_midi_output || drained) {
+                        if player.seek_position_ns >= max_ns && (use_legacy_traversal || drained) {
                             player.seek_position_ns = max_ns;
                             player.state = PlayerState::Stopped;
                             player.reset_playback_state();

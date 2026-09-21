@@ -32,13 +32,25 @@ pub fn draw_u32_numeric_slider(
     state: &mut NumericSliderState,
     input: &NumericSliderInput,
     alpha: f32,
+    enabled: bool,
+    disabled_text: Option<&str>,
 ) -> bool {
     *value = (*value).clamp(min, max);
-    let text_color = Color::new(240, 240, 240, (255.0 * alpha) as u8);
-    let track_color = Color::new(80, 80, 80, (255.0 * alpha) as u8);
-    let accent = Color::new(0, 120, 215, (255.0 * alpha) as u8);
+    if !enabled {
+        state.dragging = false;
+        state.editing = false;
+    }
+    let opacity = if enabled { 1.0 } else { 0.45 };
+    let text_color = Color::new(240, 240, 240, (255.0 * alpha * opacity) as u8);
+    let track_color = Color::new(80, 80, 80, (255.0 * alpha * opacity) as u8);
+    let accent = if enabled {
+        Color::new(0, 120, 215, (255.0 * alpha) as u8)
+    } else {
+        Color::new(95, 95, 95, (255.0 * alpha * opacity) as u8)
+    };
     let slider = Rectangle::new(rect.x, rect.y + 28.0, 140.0, 20.0);
-    let value_box = Rectangle::new(rect.x + 148.0, rect.y + 20.0, 68.0, 28.0);
+    let value_box_width = if enabled { 68.0 } else { 127.0 };
+    let value_box = Rectangle::new(rect.x + 148.0, rect.y + 20.0, value_box_width, 28.0);
     let minus = Rectangle::new(rect.x + 222.0, rect.y + 20.0, 24.0, 28.0);
     let plus = Rectangle::new(rect.x + 251.0, rect.y + 20.0, 24.0, 28.0);
 
@@ -69,7 +81,9 @@ pub fn draw_u32_numeric_slider(
     } else {
         ""
     };
-    let value_text = if state.editing {
+    let value_text = if !enabled {
+        disabled_text.unwrap_or("Disabled").to_owned()
+    } else if state.editing {
         shown.to_owned()
     } else {
         value.to_string()
@@ -78,31 +92,33 @@ pub fn draw_u32_numeric_slider(
         &value_text,
         value_box.x as i32 + 5,
         value_box.y as i32 + 6,
-        16,
+        if enabled { 16 } else { 14 },
         text_color,
     );
 
-    for (button, text) in [(minus, "-"), (plus, "+")] {
-        let hover = button.check_collision_point_rec(input.mouse_pos);
-        d.draw_rectangle_rec(
-            button,
-            if hover {
-                Color::new(70, 70, 74, (255.0 * alpha) as u8)
-            } else {
-                Color::new(55, 55, 58, (255.0 * alpha) as u8)
-            },
-        );
-        d.draw_rectangle_lines_ex(button, 1.0, track_color);
-        d.draw_text(
-            text,
-            button.x as i32 + 7,
-            button.y as i32 + 4,
-            18,
-            text_color,
-        );
+    if enabled {
+        for (button, text) in [(minus, "-"), (plus, "+")] {
+            let hover = button.check_collision_point_rec(input.mouse_pos);
+            d.draw_rectangle_rec(
+                button,
+                if hover {
+                    Color::new(70, 70, 74, (255.0 * alpha) as u8)
+                } else {
+                    Color::new(55, 55, 58, (255.0 * alpha) as u8)
+                },
+            );
+            d.draw_rectangle_lines_ex(button, 1.0, track_color);
+            d.draw_text(
+                text,
+                button.x as i32 + 7,
+                button.y as i32 + 4,
+                18,
+                text_color,
+            );
+        }
     }
 
-    if let Some(click) = input.click_pos {
+    if enabled && let Some(click) = input.click_pos {
         if slider.check_collision_point_rec(click) {
             state.dragging = true;
             state.editing = false;
@@ -123,7 +139,7 @@ pub fn draw_u32_numeric_slider(
         }
     }
 
-    if state.dragging {
+    if enabled && state.dragging {
         if input.mouse_down {
             let x = input.mouse_pos.x.clamp(slider.x, slider.x + slider.width);
             let t = (x - slider.x) / slider.width;
@@ -134,7 +150,7 @@ pub fn draw_u32_numeric_slider(
     }
 
     let value_box_hovered = value_box.check_collision_point_rec(input.mouse_pos);
-    if value_box_hovered && input.wheel != 0.0 {
+    if enabled && value_box_hovered && input.wheel != 0.0 {
         let step = if input.control {
             100
         } else if input.shift {
@@ -152,7 +168,7 @@ pub fn draw_u32_numeric_slider(
         }
     }
 
-    if state.editing {
+    if enabled && state.editing {
         for ch in &input.typed {
             if ch.is_ascii_digit() && state.edit_text.len() < 10 {
                 state.edit_text.push(*ch);
@@ -172,5 +188,5 @@ pub fn draw_u32_numeric_slider(
         }
     }
 
-    value_box_hovered && input.wheel != 0.0
+    enabled && value_box_hovered && input.wheel != 0.0
 }

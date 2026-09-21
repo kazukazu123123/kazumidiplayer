@@ -796,6 +796,8 @@ pub fn draw_settings_overlay(
                         beat_bounce_amount_slider,
                         &input,
                         eased_t,
+                        true,
+                        None,
                     );
                 }
 
@@ -823,6 +825,8 @@ pub fn draw_settings_overlay(
                         beat_bounce_note_value_slider,
                         &input,
                         eased_t,
+                        true,
+                        None,
                     );
                 }
 
@@ -932,16 +936,35 @@ pub fn draw_settings_overlay(
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
+                    let slider_enabled = !*unlimited_output && *midi_ev_mode != 0;
+                    let mut fixed_value = if *midi_ev_mode == 0 { 8192 } else { 1 };
+                    let displayed_value = if slider_enabled {
+                        &mut *midi_ev_buffer_size
+                    } else {
+                        &mut fixed_value
+                    };
+                    let label = if *midi_ev_mode == 0 {
+                        "Events Per Pass"
+                    } else {
+                        "MIDI EV Buffer Size"
+                    };
+                    let disabled_text = if *unlimited_output {
+                        "Bypassed (Direct)"
+                    } else {
+                        "8192 (Fixed)"
+                    };
                     draw_u32_numeric_slider(
                         &mut d_scissor,
                         Rectangle::new(20.0, sy(y), 275.0, 52.0),
-                        "MIDI EV Buffer Size",
-                        midi_ev_buffer_size,
+                        label,
+                        displayed_value,
                         crate::player::MIN_MIDI_EV_BUFFER_SIZE,
                         crate::player::MAX_MIDI_EV_BUFFER_SIZE,
                         midi_ev_buffer_size_slider,
                         &input,
                         eased_t,
+                        slider_enabled,
+                        Some(disabled_text),
                     );
                 }
             }
@@ -950,7 +973,7 @@ pub fn draw_settings_overlay(
             if is_visible(sy(y), 52.0) {
                 let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
                 midi_ev_mode_combo_rect = Some(combo_rect);
-                let was_open = midi_ev_mode_combo.open;
+                let was_open = midi_ev_mode_combo.open && !*unlimited_output;
                 draw_combo_box(
                     &mut d_scissor,
                     combo_rect,
@@ -960,6 +983,8 @@ pub fn draw_settings_overlay(
                     midi_ev_mode_combo,
                     click_pos,
                     eased_t,
+                    !*unlimited_output,
+                    Some("Bypassed (Direct)"),
                 );
 
                 // The popup overlays later settings, so clicks handled by its header

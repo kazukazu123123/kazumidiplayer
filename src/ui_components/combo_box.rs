@@ -15,12 +15,18 @@ pub fn draw_combo_box(
     state: &mut ComboBoxState,
     click_pos: Option<Vector2>,
     alpha: f32,
+    enabled: bool,
+    disabled_text: Option<&str>,
 ) -> bool {
     if options.is_empty() {
         return false;
     }
     *selected = (*selected).min(options.len() - 1);
-    let a = (255.0 * alpha) as u8;
+    if !enabled {
+        state.open = false;
+    }
+    let opacity = if enabled { 1.0 } else { 0.45 };
+    let a = (255.0 * alpha * opacity) as u8;
     let text = Color::new(240, 240, 240, a);
     let border = Color::new(100, 100, 100, a);
     let box_rect = Rectangle::new(rect.x, rect.y + 20.0, rect.width, 28.0);
@@ -28,11 +34,30 @@ pub fn draw_combo_box(
     d.draw_text(label, rect.x as i32, rect.y as i32, 16, text);
     d.draw_rectangle_rec(box_rect, Color::new(30, 30, 30, a));
     d.draw_rectangle_lines_ex(box_rect, 1.0, border);
-    d.draw_text(options[*selected], box_rect.x as i32 + 7, box_rect.y as i32 + 6, 16, text);
-    d.draw_text("v", (box_rect.x + box_rect.width - 18.0) as i32, box_rect.y as i32 + 5, 16, text);
+    let shown = if enabled {
+        options[*selected]
+    } else {
+        disabled_text.unwrap_or("Disabled")
+    };
+    d.draw_text(
+        shown,
+        box_rect.x as i32 + 7,
+        box_rect.y as i32 + 6,
+        16,
+        text,
+    );
+    if enabled {
+        d.draw_text(
+            "v",
+            (box_rect.x + box_rect.width - 18.0) as i32,
+            box_rect.y as i32 + 5,
+            16,
+            text,
+        );
+    }
 
     let mut changed = false;
-    if let Some(click) = click_pos {
+    if enabled && let Some(click) = click_pos {
         if box_rect.check_collision_point_rec(click) {
             state.open = !state.open;
         } else if state.open {
