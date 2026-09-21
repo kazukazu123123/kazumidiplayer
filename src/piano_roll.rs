@@ -990,6 +990,27 @@ fn first_note_above(notes: &VecDeque<RollNote>, limit: u32) -> usize {
 /// scan the whole bucket for every row of the gap.
 const MAX_LOOKBACK: usize = 64;
 
+/// Color of the topmost note sounding at `tick`, using the same bounded lookup as
+/// the roll rasterizer. A sustained note can keep millions of already-ended notes
+/// behind it in the queue, so an unbounded scan here would stall the render loop.
+pub(crate) fn sounding_color_at(notes: &VecDeque<RollNote>, tick: u32) -> Option<u16> {
+    let prefix = first_note_above(notes, tick);
+    for n in notes.range(..prefix).rev().take(MAX_LOOKBACK) {
+        if n.end_tick > tick {
+            return Some(n.color);
+        }
+    }
+
+    if prefix > MAX_LOOKBACK {
+        for n in notes.range(..prefix.min(MAX_LOOKBACK)).rev() {
+            if n.end_tick > tick {
+                return Some(n.color);
+            }
+        }
+    }
+    None
+}
+
 /// Fill one key's column by asking each pixel which note it shows, rather than by
 /// painting every note and letting them cover each other up.
 ///
@@ -1169,34 +1190,24 @@ pub fn draw_piano_roll_chunk(
     let mut cols: Vec<u32> = vec![0u32; 128 * height_px];
     let mut owners: Vec<u32> = vec![u32::MAX; 128 * height_px];
 
-    let worker_count = (crate::app_state::cpu_threads().max(1) as usize).min(128);
-    let mut assignments: Vec<Vec<(usize, &mut [u32], &mut [u32])>> =
-        (0..worker_count).map(|_| Vec::new()).collect();
+    // This is only 128 * window-height pixels. Spawning a full set of scoped OS
+    // threads every frame cost more than the rasterization itself, caused scheduler
+    // spikes, and made every thread reserve a stack. Keep the hot path on the render
+    // thread; the expensive MIDI scan remains on its persistent worker.
     for (key, (col, own)) in cols
         .chunks_mut(height_px)
         .zip(owners.chunks_mut(height_px))
         .enumerate()
     {
-        assignments[key % worker_count].push((key, col, own));
+        rasterize_column(
+            &chunk.notes_by_key[key],
+            col,
+            own,
+            &row_tick,
+            current_tick,
+            effective_top,
+        );
     }
-
-    let row_tick_ref = &row_tick[..];
-    thread::scope(|scope| {
-        for mine in assignments {
-            scope.spawn(move || {
-                for (key, col, own) in mine {
-                    rasterize_column(
-                        &chunk.notes_by_key[key],
-                        col,
-                        own,
-                        row_tick_ref,
-                        current_tick,
-                        effective_top,
-                    );
-                }
-            });
-        }
-    });
 
     // Emit one rectangle per contiguous same-color run.
     //

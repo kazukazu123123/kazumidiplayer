@@ -620,17 +620,10 @@ fn main() {
                         // key shows the same color as the topmost overlapping note.
                         // The queue front is already the earliest still-live note,
                         // since passed notes are retired, so no cursor is needed.
-                        let mut chosen: Option<u16> = None;
-                        for n in bucket.notes.iter() {
-                            // Copy out of the packed struct by value.
-                            let start_tick = n.start_tick;
-                            if start_tick > current_tick {
-                                break;
-                            }
-                            if n.end_tick > current_tick {
-                                chosen = Some(n.color);
-                            }
-                        }
+                        // Later notes paint over earlier ones. This lookup is bounded:
+                        // the old forward scan visited every past note on every frame
+                        // and became a major stutter on dense files with sustained notes.
+                        let chosen = piano_roll::sounding_color_at(&bucket.notes, current_tick);
                         drop(bucket);
                         if let Some(color) = chosen {
                             let (r, g, b) = utils::get_note_color_by_index(color);
