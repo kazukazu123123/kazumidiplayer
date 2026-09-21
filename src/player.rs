@@ -69,6 +69,58 @@ struct BufferedMidiEvent {
     p2: u8,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_midi_event(
+    event: BufferedMidiEvent,
+    stream: Option<&mut KDMAPIStream>,
+    channel_rpn_msb: &mut [u8; 16],
+    channel_rpn_lsb: &mut [u8; 16],
+    channel_pitch_bend_range: &mut [f32; 16],
+    pitch_bend_override: bool,
+    pitch_bend_multiplier: u8,
+    midi_original_pb_range: &mut [u8; 16],
+    blocking_output: bool,
+    active_notes: &std::sync::Mutex<[Option<(u16, u8)>; 128]>,
+    active_count: &mut [u16; 128],
+    notes_played_count: &mut u64,
+    pitch_bend: &std::sync::Mutex<[u16; 16]>,
+) {
+    send_midi_event_with_override(
+        stream,
+        event.status,
+        event.p1,
+        event.p2,
+        channel_rpn_msb,
+        channel_rpn_lsb,
+        channel_pitch_bend_range,
+        pitch_bend_override,
+        pitch_bend_multiplier,
+        midi_original_pb_range,
+        blocking_output,
+    );
+
+    let msg_type = event.status & 0xF0;
+    if event.p1 < 128 {
+        let key = event.p1 as usize;
+        let mut guard = lock_mutex(active_notes);
+        if msg_type == 0x90 && event.p2 > 0 {
+            active_count[key] = active_count[key].saturating_add(1);
+            *notes_played_count += 1;
+            guard[key] = Some((event.track_index, event.status & 0x0F));
+        } else if msg_type == 0x80 || (msg_type == 0x90 && event.p2 == 0) {
+            active_count[key] = active_count[key].saturating_sub(1);
+            if active_count[key] == 0 {
+                guard[key] = None;
+            }
+        }
+    }
+    if msg_type == 0xE0 {
+        let channel = (event.status & 0x0F) as usize;
+        let bend = (event.p1 as u16) | ((event.p2 as u16) << 7);
+        lock_mutex(pitch_bend)[channel] = bend;
+    }
+}
+
 // Safety: TrackState contains only u8 fields, a bool, and a TrackCursor (C struct).
 // All fields are trivially Copy/Send.
 unsafe impl Send for TrackState {}
@@ -493,13 +545,12 @@ impl PlayerHandle {
                         // Legacy mode reproduces the pre-buffer loop's hard-coded
                         // 8192-event pass and continuous cadence. The temporary queue
                         // is drained in this same pass, so no EV backlog is retained.
-                        let capacity = if unlimited {
-                            usize::MAX
-                        } else if legacy_midi_output {
+                        let capacity = if legacy_midi_output {
                             8192
                         } else {
                             midi_ev_buffer_size
                         };
+                        let mut last_sent_tick = None;
 
                         // Buffered mode normalizes every cursor to a pending output event
                         // before the global merge. Legacy mode must not do this: its old
@@ -525,6 +576,35 @@ impl PlayerHandle {
                             }
                         }
 
+                        // Unlimited output bypasses the EV FIFO completely. The same
+                        // traversal/order rules still apply, but due events go straight
+                        // to KDMAPI instead of accumulating in an unbounded VecDeque.
+                        macro_rules! submit_event {
+                            ($event:expr) => {{
+                                let event = $event;
+                                if unlimited {
+                                    last_sent_tick = Some(event.tick);
+                                    dispatch_midi_event(
+                                        event,
+                                        player.stream.as_mut(),
+                                        &mut player.channel_rpn_msb,
+                                        &mut player.channel_rpn_lsb,
+                                        &mut player.channel_pitch_bend_range,
+                                        player.pitch_bend_override.load(Ordering::Relaxed),
+                                        player.pitch_bend_multiplier.load(Ordering::Relaxed),
+                                        &mut player.midi_original_pb_range,
+                                        legacy_midi_output,
+                                        &active_notes_clone,
+                                        &mut active_count,
+                                        &mut notes_played_count,
+                                        &pitch_bend_clone,
+                                    );
+                                } else {
+                                    midi_ev_fifo.push_back(event);
+                                }
+                            }};
+                        }
+
                         if legacy_midi_output {
                             // Exact pre-buffer traversal: tracks are visited in file
                             // order, the 8192 ceiling counts cursor advances (including
@@ -533,7 +613,7 @@ impl PlayerHandle {
                             let mut events_processed = 0usize;
                             for track in &mut player.tracks {
                                 if track.pending && track.pend_tick <= cur_tick {
-                                    midi_ev_fifo.push_back(BufferedMidiEvent {
+                                    submit_event!(BufferedMidiEvent {
                                         tick: track.pend_tick,
                                         track_index: track.cursor.track_index,
                                         status: track.pend_status,
@@ -557,7 +637,7 @@ impl PlayerHandle {
                                         continue;
                                     }
                                     if track.cursor.abs_tick <= cur_tick {
-                                        midi_ev_fifo.push_back(BufferedMidiEvent {
+                                        submit_event!(BufferedMidiEvent {
                                             tick: track.cursor.abs_tick,
                                             track_index: track.cursor.track_index,
                                             status: track.cursor.status,
@@ -581,12 +661,14 @@ impl PlayerHandle {
                                     .tracks
                                     .iter()
                                     .enumerate()
-                                    .filter(|(_, track)| track.pending && track.pend_tick <= cur_tick)
+                                    .filter(|(_, track)| {
+                                        track.pending && track.pend_tick <= cur_tick
+                                    })
                                     .min_by_key(|(index, track)| (track.pend_tick, *index))
                                     .map(|(index, _)| index);
                                 let Some(track_index) = next_track else { break };
                                 let track = &mut player.tracks[track_index];
-                                midi_ev_fifo.push_back(BufferedMidiEvent {
+                                submit_event!(BufferedMidiEvent {
                                     tick: track.pend_tick,
                                     track_index: track.cursor.track_index,
                                     status: track.pend_status,
@@ -619,7 +701,8 @@ impl PlayerHandle {
                             .tracks
                             .iter()
                             .any(|track| track.pending && track.pend_tick <= cur_tick);
-                        let catch_up_backlog = !legacy_midi_output && midi_ev_catch_up && backlog_due;
+                        let catch_up_backlog =
+                            !legacy_midi_output && midi_ev_catch_up && backlog_due;
                         if !legacy_midi_output
                             && !unlimited
                             && midi_ev_fifo.len() == capacity
@@ -636,16 +719,13 @@ impl PlayerHandle {
                             }
                         }
 
-                        // WinMM consumes submitted events in FIFO order. All observable
-                        // MIDI state is updated here, never while events are queued.
-                        let mut last_sent_tick = None;
+                        // Bounded modes drain their FIFO here. Unlimited events were
+                        // already dispatched directly by `submit_event!` above.
                         while let Some(event) = midi_ev_fifo.pop_front() {
                             last_sent_tick = Some(event.tick);
-                            send_midi_event_with_override(
+                            dispatch_midi_event(
+                                event,
                                 player.stream.as_mut(),
-                                event.status,
-                                event.p1,
-                                event.p2,
                                 &mut player.channel_rpn_msb,
                                 &mut player.channel_rpn_lsb,
                                 &mut player.channel_pitch_bend_range,
@@ -653,27 +733,11 @@ impl PlayerHandle {
                                 player.pitch_bend_multiplier.load(Ordering::Relaxed),
                                 &mut player.midi_original_pb_range,
                                 legacy_midi_output,
+                                &active_notes_clone,
+                                &mut active_count,
+                                &mut notes_played_count,
+                                &pitch_bend_clone,
                             );
-                            let msg_type = event.status & 0xF0;
-                            if event.p1 < 128 {
-                                let key = event.p1 as usize;
-                                let mut guard = lock_mutex(&active_notes_clone);
-                                if msg_type == 0x90 && event.p2 > 0 {
-                                    active_count[key] = active_count[key].saturating_add(1);
-                                    notes_played_count += 1;
-                                    guard[key] = Some((event.track_index, event.status & 0x0F));
-                                } else if msg_type == 0x80 || (msg_type == 0x90 && event.p2 == 0) {
-                                    active_count[key] = active_count[key].saturating_sub(1);
-                                    if active_count[key] == 0 {
-                                        guard[key] = None;
-                                    }
-                                }
-                            }
-                            if msg_type == 0xE0 {
-                                let channel = (event.status & 0x0F) as usize;
-                                let bend = (event.p1 as u16) | ((event.p2 as u16) << 7);
-                                lock_mutex(&pitch_bend_clone)[channel] = bend;
-                            }
                         }
 
                         if catch_up_backlog {
@@ -682,11 +746,9 @@ impl PlayerHandle {
                             // end-of-loop store, which otherwise makes the UI look
                             // frozen until the entire backlog disappears.
                             if let Some(tick) = last_sent_tick {
-                                player.seek_position_ns = tick_to_ns(
-                                    unsafe { &*data.as_ptr() },
-                                    tick,
-                                )
-                                .min(ideal_position_ns);
+                                player.seek_position_ns =
+                                    tick_to_ns(unsafe { &*data.as_ptr() }, tick)
+                                        .min(ideal_position_ns);
                                 position_clone.store(player.seek_position_ns, Ordering::SeqCst);
                             }
                         }
@@ -698,9 +760,7 @@ impl PlayerHandle {
                             .iter()
                             .all(|track| track.exhausted && !track.pending)
                             && midi_ev_fifo.is_empty();
-                        if player.seek_position_ns >= max_ns
-                            && (legacy_midi_output || drained)
-                        {
+                        if player.seek_position_ns >= max_ns && (legacy_midi_output || drained) {
                             player.seek_position_ns = max_ns;
                             player.state = PlayerState::Stopped;
                             player.reset_playback_state();
