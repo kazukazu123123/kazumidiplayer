@@ -298,6 +298,8 @@ fn main() {
     let mut piano_roll_max_target = 0u32;
     let mut pitch_bend_window_offset = 0;
     let mut pitch_bend_window_y_offset = 0;
+    let mut pitch_bend_spring_position = Vector2::zero();
+    let mut pitch_bend_spring_velocity = Vector2::zero();
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -339,15 +341,28 @@ fn main() {
         let pitch_bend_normalized = engine.get_pitch_bend_normalized();
         let pitch_bend_range = engine.get_pitch_bend_range();
         if !rl.is_window_maximized() && !rl.is_window_minimized() && !rl.is_window_fullscreen() {
-            let offset = if app_state.pitch_bend_move_window_enabled {
-                (pitch_bend_normalized.clamp(-1.0, 1.0)
+            let target_x = if app_state.pitch_bend_move_window_enabled {
+                pitch_bend_normalized.clamp(-1.0, 1.0)
                     * (pitch_bend_range.max(0.0) / 12.0)
-                    * 40.0)
-                    .round() as i32
+                    * 40.0
             } else {
-                0
+                0.0
             };
-            let y_offset = ((offset as f32 / 10.0).sin() * 20.0).round() as i32;
+            let target = Vector2::new(target_x, (target_x / 10.0).sin() * 20.0);
+            let [mass, stiffness, damping] = app_state.pitch_bend_spring_parameters;
+            // Small semi-implicit integration steps keep stiff springs stable.
+            let dt = rl.get_frame_time().clamp(0.0, 0.1);
+            let steps = (dt / 0.001).ceil().max(1.0) as u32;
+            let step = dt / steps as f32;
+            for _ in 0..steps {
+                let acceleration = ((target - pitch_bend_spring_position) * stiffness as f32
+                    - pitch_bend_spring_velocity * damping as f32)
+                    * (1.0 / mass.max(1) as f32);
+                pitch_bend_spring_velocity += acceleration * step;
+                pitch_bend_spring_position += pitch_bend_spring_velocity * step;
+            }
+            let offset = pitch_bend_spring_position.x.round() as i32;
+            let y_offset = pitch_bend_spring_position.y.round() as i32;
             if offset != pitch_bend_window_offset || y_offset != pitch_bend_window_y_offset {
                 // Apply only the offset delta so manual window moves are preserved.
                 let position = rl.get_window_position();
@@ -1537,6 +1552,8 @@ fn main() {
                             app_state.pitch_bend_window_animation,
                             &mut app_state.pitch_bend_move_window_enabled,
                             app_state.pitch_bend_move_window_animation,
+                            &mut app_state.pitch_bend_spring_parameters,
+                            &mut app_state.pitch_bend_spring_sliders,
                             &mut app_state.pitch_bend_override_enabled,
                             app_state.pitch_bend_override_animation,
                             &mut app_state.pitch_bend_multiplier,

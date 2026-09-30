@@ -524,6 +524,8 @@ pub fn draw_settings_overlay(
     pitch_bend_window_animation: f32,
     pitch_bend_move_window_enabled: &mut bool,
     pitch_bend_move_window_animation: f32,
+    pitch_bend_spring_parameters: &mut [u32; 3],
+    pitch_bend_spring_sliders: &mut [NumericSliderState; 3],
     pitch_bend_override: &mut bool,
     pitch_bend_override_animation: f32,
     pitch_bend_multiplier: &mut u8,
@@ -622,6 +624,11 @@ pub fn draw_settings_overlay(
     measure_layout.next(52.0); // MIDI EV Buffer Size slider
     measure_layout.next(52.0); // EV buffer mode combo box
     measure_layout.next(30.0); // Pitch Bend OS Window Movement
+    if *pitch_bend_move_window_enabled {
+        for _ in 0..3 {
+            measure_layout.next(52.0);
+        }
+    }
     if *pitch_bend_override {
         measure_layout.next(38.0);
     }
@@ -1046,6 +1053,43 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *pitch_bend_move_window_enabled = !*pitch_bend_move_window_enabled;
+                }
+            }
+
+            if *pitch_bend_move_window_enabled {
+                for (index, (label, min, max)) in [
+                    ("Spring Mass", 1, 20),
+                    ("Spring Stiffness", 1, 1000),
+                    ("Spring Damping", 0, 200),
+                ].into_iter().enumerate() {
+                    let y = layout.next(52.0);
+                    if is_visible(sy(y), 52.0) {
+                        let input = NumericSliderInput {
+                            click_pos,
+                            mouse_pos: mouse_world_pos,
+                            mouse_down: is_mouse_down,
+                            wheel: mouse_wheel,
+                            shift: numeric_shift,
+                            control: numeric_control,
+                            typed: numeric_typed.clone(),
+                            backspace: numeric_backspace,
+                            enter: numeric_enter,
+                            escape: numeric_escape,
+                        };
+                        draw_u32_numeric_slider(
+                            &mut d_scissor,
+                            Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                            label,
+                            &mut pitch_bend_spring_parameters[index],
+                            min,
+                            max,
+                            &mut pitch_bend_spring_sliders[index],
+                            &input,
+                            eased_t,
+                            true,
+                            None,
+                        );
+                    }
                 }
             }
 
