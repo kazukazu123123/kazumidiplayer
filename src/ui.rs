@@ -522,6 +522,8 @@ pub fn draw_settings_overlay(
     autoplay_animation: f32,
     pitch_bend_window_enabled: &mut bool,
     pitch_bend_window_animation: f32,
+    pitch_bend_move_window_enabled: &mut bool,
+    pitch_bend_move_window_animation: f32,
     pitch_bend_override: &mut bool,
     pitch_bend_override_animation: f32,
     pitch_bend_multiplier: &mut u8,
@@ -619,6 +621,7 @@ pub fn draw_settings_overlay(
     measure_layout.next(30.0);
     measure_layout.next(52.0); // MIDI EV Buffer Size slider
     measure_layout.next(52.0); // EV buffer mode combo box
+    measure_layout.next(30.0); // Pitch Bend OS Window Movement
     if *pitch_bend_override {
         measure_layout.next(38.0);
     }
@@ -1025,6 +1028,24 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *pitch_bend_window_enabled = !*pitch_bend_window_enabled;
+                }
+            }
+
+            // Pitch Bend OS Window Movement Toggle
+            let y = layout.next(30.0);
+            let pb_move_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            if is_visible(pb_move_rect.y, pb_move_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    pb_move_rect,
+                    "PB Move OS Window",
+                    pitch_bend_move_window_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *pitch_bend_move_window_enabled = !*pitch_bend_move_window_enabled;
                 }
             }
 

@@ -296,6 +296,8 @@ fn main() {
     // anywhere below it, so this is what says whether the window is holding more than
     // the current zoom needs. How far the scan actually got does not.
     let mut piano_roll_max_target = 0u32;
+    let mut pitch_bend_window_offset = 0;
+    let mut pitch_bend_window_y_offset = 0;
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -336,6 +338,27 @@ fn main() {
         let playback_position_ns = engine.position_ns();
         let pitch_bend_normalized = engine.get_pitch_bend_normalized();
         let pitch_bend_range = engine.get_pitch_bend_range();
+        if !rl.is_window_maximized() && !rl.is_window_minimized() && !rl.is_window_fullscreen() {
+            let offset = if app_state.pitch_bend_move_window_enabled {
+                (pitch_bend_normalized.clamp(-1.0, 1.0)
+                    * (pitch_bend_range.max(0.0) / 12.0)
+                    * 40.0)
+                    .round() as i32
+            } else {
+                0
+            };
+            let y_offset = ((offset as f32 / 10.0).sin() * 20.0).round() as i32;
+            if offset != pitch_bend_window_offset || y_offset != pitch_bend_window_y_offset {
+                // Apply only the offset delta so manual window moves are preserved.
+                let position = rl.get_window_position();
+                rl.set_window_position(
+                    position.x.round() as i32 + offset - pitch_bend_window_offset,
+                    position.y.round() as i32 + y_offset - pitch_bend_window_y_offset,
+                );
+                pitch_bend_window_offset = offset;
+                pitch_bend_window_y_offset = y_offset;
+            }
+        }
         let mut duration_ns = engine.duration_ns();
 
         let is_loading = st == PlayerState::Loading || app_state.is_loading;
@@ -389,6 +412,12 @@ fn main() {
         animate_toggle(
             app_state.autoplay_on_load,
             &mut app_state.autoplay_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.pitch_bend_move_window_enabled,
+            &mut app_state.pitch_bend_move_window_animation,
             dt,
             anim_speed,
         );
@@ -1506,6 +1535,8 @@ fn main() {
                             app_state.autoplay_animation,
                             &mut app_state.pitch_bend_window_enabled,
                             app_state.pitch_bend_window_animation,
+                            &mut app_state.pitch_bend_move_window_enabled,
+                            app_state.pitch_bend_move_window_animation,
                             &mut app_state.pitch_bend_override_enabled,
                             app_state.pitch_bend_override_animation,
                             &mut app_state.pitch_bend_multiplier,
