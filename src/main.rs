@@ -1563,7 +1563,7 @@ fn main() {
                             &mut app_state.settings_scrollbar_dragging,
                             &mut app_state.settings_scrollbar_drag_start_y,
                             &mut app_state.settings_scrollbar_drag_start_scroll,
-                            &mut app_state.settings_pb_multiplier_slider_dragging,
+                            &mut app_state.settings_pb_multiplier_slider,
                             &mut app_state.settings_midi_ev_buffer_size_slider,
                             &mut app_state.midi_ev_mode,
                             &mut app_state.settings_midi_ev_mode_combo,

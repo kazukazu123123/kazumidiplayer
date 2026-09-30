@@ -147,7 +147,7 @@ pub struct AppState {
     pub settings_scrollbar_dragging: bool,
     pub settings_scrollbar_drag_start_y: f32,
     pub settings_scrollbar_drag_start_scroll: f32,
-    pub settings_pb_multiplier_slider_dragging: bool,
+    pub settings_pb_multiplier_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_beat_bounce_amount_slider:
         crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_beat_bounce_note_value_slider:
@@ -274,7 +274,7 @@ impl AppState {
             settings_scrollbar_dragging: false,
             settings_scrollbar_drag_start_y: 0.0,
             settings_scrollbar_drag_start_scroll: 0.0,
-            settings_pb_multiplier_slider_dragging: false,
+            settings_pb_multiplier_slider: Default::default(),
             settings_beat_bounce_amount_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_beat_bounce_note_value_slider:

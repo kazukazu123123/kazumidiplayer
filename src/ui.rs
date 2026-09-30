@@ -535,7 +535,7 @@ pub fn draw_settings_overlay(
     scrollbar_dragging: &mut bool,
     scrollbar_drag_start_y: &mut f32,
     scrollbar_drag_start_scroll: &mut f32,
-    pb_multiplier_slider_dragging: &mut bool,
+    pb_multiplier_slider: &mut NumericSliderState,
     midi_ev_buffer_size_slider: &mut NumericSliderState,
     midi_ev_mode: &mut usize,
     midi_ev_mode_combo: &mut ComboBoxState,
@@ -630,7 +630,7 @@ pub fn draw_settings_overlay(
         }
     }
     if *pitch_bend_override {
-        measure_layout.next(38.0);
+        measure_layout.next(52.0);
     }
     measure_layout.next(18.0); // "Parsing:" label
     measure_layout.next(38.0); // Parse Threads slider
@@ -1119,54 +1119,35 @@ pub fn draw_settings_overlay(
 
             // Pitch Bend Multiplier Slider (only visible when override is on)
             if *pitch_bend_override {
-                let y = layout.next(38.0);
-                if is_visible(sy(y), 38.0) {
-                    let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
-                    let label = format!("PB Multiplier: {}", *pitch_bend_multiplier);
-                    d_scissor.draw_text_ex(
-                        &font,
-                        &label,
-                        Vector2::new(slider_rect.x, sy(y)),
-                        16.0,
-                        1.0,
-                        text_color,
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    let mut multiplier = *pitch_bend_multiplier as u32;
+                    draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "PB Multiplier",
+                        &mut multiplier,
+                        1,
+                        127,
+                        pb_multiplier_slider,
+                        &input,
+                        eased_t,
+                        true,
+                        None,
                     );
-                    d_scissor.draw_rectangle(
-                        slider_rect.x as i32,
-                        (slider_rect.y + 8.0) as i32,
-                        slider_rect.width as i32,
-                        4,
-                        Color::new(80, 80, 80, (255.0 * eased_t) as u8),
-                    );
-                    let t = ((*pitch_bend_multiplier as f32 - 1.0) / 126.0).clamp(0.0, 1.0);
-                    let thumb_x = slider_rect.x + t * slider_rect.width;
-                    let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                    d_scissor.draw_rectangle_rec(
-                        thumb_rect,
-                        Color::new(0, 120, 215, (255.0 * eased_t) as u8),
-                    );
-
-                    // Start drag on click
-                    if let Some(cp) = click_pos {
-                        if thumb_rect.check_collision_point_rec(cp)
-                            || slider_rect.check_collision_point_rec(cp)
-                        {
-                            *pb_multiplier_slider_dragging = true;
-                        }
-                    }
-
-                    // Ongoing drag: value follows the mouse even outside the slider rect
-                    if *pb_multiplier_slider_dragging {
-                        if is_mouse_down {
-                            let clamped_x = mouse_world_pos
-                                .x
-                                .clamp(slider_rect.x, slider_rect.x + slider_rect.width);
-                            let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
-                            *pitch_bend_multiplier = (new_t * 126.0 + 1.0).round() as u8;
-                        } else {
-                            *pb_multiplier_slider_dragging = false;
-                        }
-                    }
+                    *pitch_bend_multiplier = multiplier.clamp(1, 127) as u8;
                 }
             }
 
