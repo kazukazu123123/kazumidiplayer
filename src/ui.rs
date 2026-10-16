@@ -491,7 +491,15 @@ pub fn draw_parse_toast(
         zoom: 1.0,
     };
 
-    draw_loading_panel(d, camera, alpha, "Loaded!", progress, parse_bps, parse_eps);
+    draw_loading_panel(
+        d,
+        camera,
+        alpha,
+        "Loaded!",
+        progress,
+        parse_bps,
+        parse_eps,
+    );
 }
 
 pub fn draw_settings_overlay(
