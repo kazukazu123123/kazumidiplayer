@@ -16,12 +16,6 @@ pub struct TrackCursor {
     pub tempo_val: u32,
     pub has_event: bool,
     pub skip_next_delta: bool,
-    /// Whether the optional "MTrk" header at the cursor's start position has been
-    /// looked for yet. It can only sit at the very first read, but the check used to
-    /// run on every event, costing a 4-byte compare per event across the whole file. It
-    /// also risked a false positive: MIDI data that happens to read as "MTrk"
-    /// mid-track would have skipped 8 bytes of real events.
-    pub header_checked: bool,
 }
 
 /// Safety: the pointers are into the parser's raw MIDI buffer, which is immutable
@@ -83,16 +77,11 @@ pub unsafe fn init_track_cursor(data: &KazuMIDIParserData, track_idx: u16) -> Op
     }
 
     unsafe {
-        let raw = data.raw;
-        let track_start_offset = *data.track_index.add(ti);
-        let start = raw.add(track_start_offset);
-        let len = if !data.track_lengths.is_null() {
-            *data.track_lengths.add(ti)
-        } else if ti + 1 < data.track_index_count {
-            *data.track_index.add(ti + 1) - track_start_offset
-        } else {
-            data.raw_size - track_start_offset
-        };
+        // track_index points at the first event (past the 8-byte "MTrk" chunk
+        // header) and track_lengths is the event byte count; the parser always
+        // fills both and keeps the range inside raw.
+        let start = data.raw.add(*data.track_index.add(ti));
+        let len = *data.track_lengths.add(ti);
 
         Some(TrackCursor {
             track_index: track_idx,
@@ -107,7 +96,6 @@ pub unsafe fn init_track_cursor(data: &KazuMIDIParserData, track_idx: u16) -> Op
             tempo_val: 0,
             has_event: false,
             skip_next_delta: false,
-            header_checked: false,
         })
     }
 }
@@ -120,17 +108,6 @@ pub unsafe fn init_track_cursor(data: &KazuMIDIParserData, track_idx: u16) -> Op
 #[inline]
 pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
     unsafe {
-        // Skip the MTrk header if the cursor starts on one. Once only: see
-        // `header_checked`.
-        if !c.header_checked {
-            c.header_checked = true;
-            if c.p.add(4) <= c.end {
-                let sig = std::slice::from_raw_parts(c.p, 4);
-                if sig == b"MTrk" && c.p.add(8) <= c.end {
-                    c.p = c.p.add(8);
-                }
-            }
-        }
         while c.p < c.end {
             if !c.skip_next_delta {
                 let delta = match read_varlen(&mut c.p, c.end) {
@@ -147,8 +124,14 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
                 return false;
             }
 
+            // Same rules as the parser's own cursor, so events, keyframes and
+            // counts agree: running status survives meta / SysEx, and a data byte
+            // with no status ever set is desync (stop rather than resync by luck).
             let mut status = *c.p;
             if status < 0x80 {
+                if c.running_status == 0 {
+                    return false;
+                }
                 status = c.running_status;
             } else {
                 c.p = c.p.add(1);
@@ -186,7 +169,6 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
                     return true;
                 }
             } else if status == 0xFF {
-                c.running_status = 0;
                 if c.p >= c.end {
                     return false;
                 }
@@ -196,6 +178,15 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
                     Some(d) => d,
                     None => return false,
                 };
+                // Never step past `end`, not even to form the pointer.
+                if mlen as usize > c.end.offset_from(c.p) as usize {
+                    return false;
+                }
+                // End of track: the rest of the chunk is padding, not music.
+                if mtype == 0x2F {
+                    c.p = c.end;
+                    return false;
+                }
                 if mtype == 0x51 && mlen >= 3 {
                     c.is_tempo = true;
                     c.status = 0xFF;
@@ -208,14 +199,26 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
                 }
                 c.p = c.p.add(mlen as usize);
             } else if status == 0xF0 || status == 0xF7 {
-                c.running_status = 0;
                 let slen = match read_varlen(&mut c.p, c.end) {
                     Some(d) => d,
                     None => return false,
                 };
+                if slen as usize > c.end.offset_from(c.p) as usize {
+                    return false;
+                }
                 c.p = c.p.add(slen as usize);
             } else {
-                c.p = c.p.add(1);
+                // System common: 0xF2 carries two data bytes, 0xF1 / 0xF3 one,
+                // the rest none.
+                let skip = match status {
+                    0xF2 => 2,
+                    0xF1 | 0xF3 => 1,
+                    _ => 0,
+                };
+                if skip > c.end.offset_from(c.p) as usize {
+                    return false;
+                }
+                c.p = c.p.add(skip);
             }
         }
         false
@@ -291,7 +294,6 @@ pub unsafe fn seek_track_cursor(
                 tempo_val: 0,
                 has_event: false,
                 skip_next_delta: false,
-                header_checked: false,
             };
         }
     };
@@ -373,7 +375,6 @@ pub unsafe fn seek_track_cursor_with_held(
                     tempo_val: 0,
                     has_event: false,
                     skip_next_delta: false,
-                    header_checked: false,
                 },
                 Vec::new(),
             );
@@ -557,5 +558,124 @@ pub fn ns_to_tick(data: &KazuMIDIParserData, ns: u64) -> u32 {
             / (tempo as u128).saturating_mul(1000).max(1))
         .min(u32::MAX as u128) as u32;
         base_tick.saturating_add(delta_tick)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kazumidiparser::MIDIPlayerData;
+
+    /// Walking every track with `cursor_next` (from the start, and from the last
+    /// keyframe of each track) must agree with the parser's own counts for every
+    /// file in `KZMP_TEST_MIDIS` (a directory). Skipped when it is unset.
+    #[test]
+    fn cursor_matches_parser_counts() {
+        let Ok(dir) = std::env::var("KZMP_TEST_MIDIS") else { return };
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let Ok(midi) = MIDIPlayerData::parse(&path, 0, None, None) else { continue };
+            let data = unsafe { &*midi.as_ptr() };
+            let (mut channel, mut note_on) = (0u64, 0u64);
+            for t in 0..data.header.tracks {
+                let mut c = unsafe { init_track_cursor(data, t) }.unwrap();
+                while unsafe { cursor_next(&mut c) } {
+                    if c.is_tempo {
+                        continue;
+                    }
+                    channel += 1;
+                    if c.status & 0xF0 == 0x90 && c.param2 > 0 {
+                        note_on += 1;
+                    }
+                }
+                // A seek through the last keyframe must land on the same events.
+                let kfs = midi.keyframes(t as usize);
+                if let Some(last) = kfs.last() {
+                    let mut c = unsafe { init_track_cursor(data, t) }.unwrap();
+                    unsafe { jump_to_keyframe(data, &mut c, last.abs_tick) };
+                    let mut from_kf = 0u64;
+                    while unsafe { cursor_next(&mut c) } {
+                        if !c.is_tempo {
+                            from_kf += 1;
+                        }
+                    }
+                    let mut c = unsafe { init_track_cursor(data, t) }.unwrap();
+                    let mut total = 0u64;
+                    while unsafe { cursor_next(&mut c) } {
+                        if !c.is_tempo {
+                            total += 1;
+                        }
+                    }
+                    let expected = total - (kfs.len() as u64 - 1) * 4096;
+                    assert_eq!(from_kf, expected, "{} track {t} keyframe seek", path.display());
+                }
+            }
+            println!("{}: {note_on} / {}", path.display(), midi.total_note_on_events());
+            assert_eq!(channel, midi.total_channel_events(), "{}", path.display());
+            assert_eq!(note_on, midi.total_note_on_events(), "{}", path.display());
+        }
+    }
+
+    /// Note-ons `cursor_next` sees in a one-track file with these event bytes.
+    fn note_ons(events: &[u8]) -> (u64, u64) {
+        let mut file = b"MThd       `MTrk".to_vec();
+        file.extend_from_slice(&(events.len() as u32).to_be_bytes());
+        file.extend_from_slice(events);
+        let path = std::env::temp_dir().join(format!("kzmp_cursor_{}.mid", events.len()));
+        std::fs::write(&path, &file).unwrap();
+        let midi = MIDIPlayerData::parse(&path, 1, None, None).unwrap();
+        let data = unsafe { &*midi.as_ptr() };
+        let mut c = unsafe { init_track_cursor(data, 0) }.unwrap();
+        let mut n = 0;
+        while unsafe { cursor_next(&mut c) } {
+            if c.status & 0xF0 == 0x90 && c.param2 > 0 {
+                n += 1;
+            }
+        }
+        let expected = midi.total_note_on_events();
+        drop(midi);
+        let _ = std::fs::remove_file(&path);
+        (n, expected)
+    }
+
+    #[test]
+    fn running_status_survives_meta_and_sysex() {
+        let events = [
+            0x00, 0x90, 0x3C, 0x40, // note on
+            0x00, 0xFF, 0x01, 0x01, b'x', // text meta
+            0x00, 0x3E, 0x40, // note on, running status
+            0x00, 0xF0, 0x01, 0xF7, // SysEx
+            0x00, 0x40, 0x40, // note on, running status
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        assert_eq!(note_ons(&events), (3, 3));
+    }
+
+    #[test]
+    fn stops_at_end_of_track() {
+        let events = [
+            0x00, 0x90, 0x3C, 0x40, // note on
+            0x00, 0xFF, 0x2F, 0x00, // end of track
+            0x00, 0x90, 0x3E, 0x40, // padding that reads as a note
+        ];
+        assert_eq!(note_ons(&events), (1, 1));
+    }
+
+    #[test]
+    fn oversized_meta_stops_inside_chunk() {
+        // Tempo meta claiming 0x7F bytes in a chunk that has 3.
+        let events = [0x00, 0xFF, 0x51, 0x7F, 0x07, 0xA1, 0x20];
+        let mut file = b"MThd       `MTrk".to_vec();
+        file.extend_from_slice(&(events.len() as u32).to_be_bytes());
+        file.extend_from_slice(&events);
+        let path = std::env::temp_dir().join("kzmp_cursor_oversized.mid");
+        std::fs::write(&path, &file).unwrap();
+        let midi = MIDIPlayerData::parse(&path, 1, None, None).unwrap();
+        let data = unsafe { &*midi.as_ptr() };
+        let mut c = unsafe { init_track_cursor(data, 0) }.unwrap();
+        assert!(!unsafe { cursor_next(&mut c) });
+        assert!(c.p <= c.end);
+        drop(midi);
+        let _ = std::fs::remove_file(&path);
     }
 }
