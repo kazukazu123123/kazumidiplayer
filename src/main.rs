@@ -1,5 +1,6 @@
 mod app_state;
 mod blur_requester;
+mod flip_3d;
 mod kazumidiparser_cursor;
 mod kdmapi;
 mod midi_parser_worker;
@@ -13,6 +14,7 @@ mod utils;
 mod window_manager;
 
 use app_state::AppState;
+use flip_3d::Flip3D;
 use player::{PlayerCommand, PlayerFeedback, PlayerHandle, PlayerState};
 use raylib::prelude::*;
 use std::sync::mpsc;
@@ -182,6 +184,7 @@ fn main() {
         .resizable()
         .title("KazuMIDIPlayer")
         .vsync()
+        .msaa_4x()
         .build();
 
     rl.set_exit_key(None);
@@ -300,6 +303,8 @@ fn main() {
     let mut pitch_bend_window_y_offset = 0;
     let mut pitch_bend_spring_position = Vector2::zero();
     let mut pitch_bend_spring_velocity = Vector2::zero();
+
+    let mut flip_3d = Flip3D::new();
 
     while !rl.window_should_close() {
         if rl.is_window_resized() {
@@ -599,20 +604,60 @@ fn main() {
         app_state.overlay_manager.update(dt);
         app_state.update_parse_toast(dt);
 
+        // Aero Flip 3D. Ctrl+Tab cycles forward, Ctrl+Shift+Tab backward.
+        // Releasing Ctrl (or Enter) switches to the focused window; Esc cancels.
+        let ctrl_down = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+            || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+        let shift_down = rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT)
+            || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
+        let tab_pressed = rl.is_key_pressed(KeyboardKey::KEY_TAB);
+        let overlay_blocks = app_state.overlay_manager.blocks_input()
+            || app_state.overlay_manager.get_fade_t() > 0.0;
+
+        if flip_3d.is_interactive() {
+            if overlay_blocks || rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                flip_3d.cancel();
+            } else {
+                if tab_pressed {
+                    flip_3d.cycle(if shift_down { -1 } else { 1 });
+                }
+                // Wheel up brings the card behind forward, like rolling the stack.
+                let flip_wheel = rl.get_mouse_wheel_move();
+                if flip_wheel != 0.0 {
+                    flip_3d.cycle(if flip_wheel > 0.0 { 1 } else { -1 });
+                }
+                if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                    flip_3d.click(rl.get_mouse_position(), &mut window_manager);
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_ENTER)
+                    || rl.is_key_pressed(KeyboardKey::KEY_KP_ENTER)
+                    || !ctrl_down
+                {
+                    flip_3d.commit(&mut window_manager);
+                }
+            }
+        } else if !overlay_blocks && ctrl_down && tab_pressed {
+            flip_3d.open(&window_manager, if shift_down { -1 } else { 1 });
+        }
+        flip_3d.update(dt);
+
         app_state.last_input_event = None;
         let active_window_id;
 
-        // Block interaction if overlay is active
-        if app_state.overlay_manager.blocks_input() {
+        // Block interaction if an overlay or Flip 3D is active
+        if app_state.overlay_manager.blocks_input() || flip_3d.is_active() {
             active_window_id = None;
-            if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                app_state.last_input_event =
-                    Some(window_manager::InputEvent::MouseDown(mouse_point));
-            } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-                app_state.last_input_event = Some(window_manager::InputEvent::MouseUp(mouse_point));
-            } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
-                app_state.last_input_event =
-                    Some(window_manager::InputEvent::MouseMove(mouse_point));
+            if !flip_3d.is_active() {
+                if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                    app_state.last_input_event =
+                        Some(window_manager::InputEvent::MouseDown(mouse_point));
+                } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
+                    app_state.last_input_event =
+                        Some(window_manager::InputEvent::MouseUp(mouse_point));
+                } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
+                    app_state.last_input_event =
+                        Some(window_manager::InputEvent::MouseMove(mouse_point));
+                }
             }
         } else {
             // Normal interaction with window_manager
@@ -682,7 +727,7 @@ fn main() {
         // Multiplicative steps give smooth, symmetric zoom in/out. The floor is only
         // there to keep the arithmetic alive (see MIN_NOTE_SPEED), not to bound how
         // far out you can zoom; the ceiling is the real zoom-in limit.
-        if wheel != 0.0 && !app_state.overlay_manager.blocks_input() {
+        if wheel != 0.0 && !app_state.overlay_manager.blocks_input() && !flip_3d.is_active() {
             app_state.note_speed = (app_state.note_speed * 1.1_f32.powf(wheel))
                 .clamp(piano_roll::MIN_NOTE_SPEED, piano_roll::MAX_NOTE_SPEED);
         }
@@ -690,6 +735,7 @@ fn main() {
         // Handle keyboard shortcuts only when overlay is completely closed
         if !app_state.overlay_manager.blocks_input()
             && app_state.overlay_manager.get_fade_t() == 0.0
+            && !flip_3d.is_active()
         {
             if is_midi_loaded && !is_loading {
                 if rl.is_key_pressed(KeyboardKey::KEY_SPACE) {
@@ -719,6 +765,7 @@ fn main() {
         if (rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL))
             && rl.is_key_pressed(KeyboardKey::KEY_O)
+            && !flip_3d.is_active()
         {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("MIDI Files", &["mid", "midi", "kar"])
@@ -729,7 +776,7 @@ fn main() {
             }
         }
 
-        if rl.is_key_pressed(KeyboardKey::KEY_S) {
+        if rl.is_key_pressed(KeyboardKey::KEY_S) && !flip_3d.is_active() {
             if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::Settings) {
                 app_state.overlay_manager.close();
             } else if !app_state.overlay_manager.blocks_input() {
@@ -747,7 +794,7 @@ fn main() {
             }
         }
 
-        if rl.is_key_pressed(KeyboardKey::KEY_P) {
+        if rl.is_key_pressed(KeyboardKey::KEY_P) && !flip_3d.is_active() {
             if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
                 if !app_state.editor_focused {
                     app_state.overlay_manager.close();
@@ -823,7 +870,7 @@ fn main() {
         let screen_height = rl.get_screen_height();
 
         // Cursor handling: only use window_manager cursors when overlay is NOT shown or fading
-        if app_state.overlay_manager.blocks_input() {
+        if app_state.overlay_manager.blocks_input() || flip_3d.is_active() {
             rl.set_mouse_cursor(MouseCursor::MOUSE_CURSOR_DEFAULT);
         } else {
             let cursor = window_manager.get_cursor_type(mouse_point);
@@ -1299,133 +1346,141 @@ fn main() {
         // Phase 2: Composite per-window RTs onto the global render_texture.
         {
             let mut d_rt = d.begin_texture_mode(&thread, &mut render_texture);
-            d_rt.clear_background(Color::new(31, 31, 31, 255));
 
-            let fps = 1.0 / d_rt.get_frame_time();
-            d_rt.draw_text(
-                format!("FPS: {:.2}", fps).as_str(),
-                10,
-                10,
-                20,
-                Color::WHITE,
-            );
+            if flip_3d.is_active() {
+                // Same backdrop as the desktop, so the cards land on it seamlessly.
+                // The cards themselves are drawn straight to the backbuffer below.
+                d_rt.clear_background(Color::new(31, 31, 31, 255));
+            } else {
+                d_rt.clear_background(Color::new(31, 31, 31, 255));
 
-            // Statistics overlay, pinned to the top-right corner (toggled in Settings).
-            // Drawn as a translucent panel; fades with its animation.
-            let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
-            if stats_alpha > 0.01 {
-                let tempo_us = app_state.tempo_us_value.max(1);
-                let bpm = (60_000_000.0 / tempo_us as f64).round() as u64;
-                let total = app_state
-                    .midi_data
-                    .as_ref()
-                    .map(|data| data.total_note_on_events())
-                    .unwrap_or(0);
-                let lines = [
-                    format!(
-                        "NPS   {}",
-                        group_thousands(app_state.nps_value.round() as u64)
-                    ),
-                    format!(
-                        "NOTES {} / {}",
-                        group_thousands(engine.notes_played()),
-                        group_thousands(total)
-                    ),
-                    format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
-                ];
-                let font_size = 18;
-                let pad = 8;
-                let line_h = 22;
-                let panel_w = 330;
-                let panel_h = pad * 2 + line_h * lines.len() as i32;
-                let px = screen_width - panel_w - 10;
-                let py = 10;
-                let bg_a = (180.0 * stats_alpha) as u8;
-                let border_a = (200.0 * stats_alpha) as u8;
-                let text_a = (255.0 * stats_alpha) as u8;
-                d_rt.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 24, bg_a));
-                // draw_rectangle_lines is GL-line based and rasterizes off-by-one from the
-                // filled rect, leaving a 1px sliver of fill outside the border. draw_rectangle_lines_ex
-                // draws the border as filled rects inside the rectangle bounds, so it lands
-                // exactly on the fill's edge columns/rows.
-                d_rt.draw_rectangle_lines_ex(
-                    Rectangle::new(px as f32, py as f32, panel_w as f32, panel_h as f32),
-                    1.0,
-                    Color::new(0, 135, 200, border_a),
+                let fps = 1.0 / d_rt.get_frame_time();
+                d_rt.draw_text(
+                    format!("FPS: {:.2}", fps).as_str(),
+                    10,
+                    10,
+                    20,
+                    Color::WHITE,
                 );
-                for (i, line) in lines.iter().enumerate() {
-                    d_rt.draw_text(
-                        line,
-                        px + pad,
-                        py + pad + i as i32 * line_h,
-                        font_size,
-                        Color::new(210, 225, 255, text_a),
+
+                // Statistics overlay, pinned to the top-right corner (toggled in Settings).
+                // Drawn as a translucent panel; fades with its animation.
+                let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
+                if stats_alpha > 0.01 {
+                    let tempo_us = app_state.tempo_us_value.max(1);
+                    let bpm = (60_000_000.0 / tempo_us as f64).round() as u64;
+                    let total = app_state
+                        .midi_data
+                        .as_ref()
+                        .map(|data| data.total_note_on_events())
+                        .unwrap_or(0);
+                    let lines = [
+                        format!(
+                            "NPS   {}",
+                            group_thousands(app_state.nps_value.round() as u64)
+                        ),
+                        format!(
+                            "NOTES {} / {}",
+                            group_thousands(engine.notes_played()),
+                            group_thousands(total)
+                        ),
+                        format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
+                    ];
+                    let font_size = 18;
+                    let pad = 8;
+                    let line_h = 22;
+                    let panel_w = 330;
+                    let panel_h = pad * 2 + line_h * lines.len() as i32;
+                    let px = screen_width - panel_w - 10;
+                    let py = 10;
+                    let bg_a = (180.0 * stats_alpha) as u8;
+                    let border_a = (200.0 * stats_alpha) as u8;
+                    let text_a = (255.0 * stats_alpha) as u8;
+                    d_rt.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 24, bg_a));
+                    // draw_rectangle_lines is GL-line based and rasterizes off-by-one from the
+                    // filled rect, leaving a 1px sliver of fill outside the border. draw_rectangle_lines_ex
+                    // draws the border as filled rects inside the rectangle bounds, so it lands
+                    // exactly on the fill's edge columns/rows.
+                    d_rt.draw_rectangle_lines_ex(
+                        Rectangle::new(px as f32, py as f32, panel_w as f32, panel_h as f32),
+                        1.0,
+                        Color::new(0, 135, 200, border_a),
                     );
+                    for (i, line) in lines.iter().enumerate() {
+                        d_rt.draw_text(
+                            line,
+                            px + pad,
+                            py + pad + i as i32 * line_h,
+                            font_size,
+                            Color::new(210, 225, 255, text_a),
+                        );
+                    }
                 }
-            }
 
-            for &wid in &window_ids {
-                let window = match window_manager.get_window(wid) {
-                    Some(w) if w.visible => w,
-                    _ => continue,
-                };
-                let win_rt = match content_rts.get(&wid) {
-                    Some(rt) => rt,
-                    None => continue,
-                };
+                for &wid in &window_ids {
+                    let window = match window_manager.get_window(wid) {
+                        Some(w) if w.visible => w,
+                        _ => continue,
+                    };
+                    let win_rt = match content_rts.get(&wid) {
+                        Some(rt) => rt,
+                        None => continue,
+                    };
 
-                let bt = window_manager::BORDER_THICKNESS;
-                let rt_w = win_rt.texture.width as f32;
-                let rt_h = win_rt.texture.height as f32;
-                let screen_x = (window.rectangle.left() - bt) as f32;
-                let screen_y = (window.rectangle.top() - bt) as f32;
+                    let bt = window_manager::BORDER_THICKNESS;
+                    let rt_w = win_rt.texture.width as f32;
+                    let rt_h = win_rt.texture.height as f32;
+                    let screen_x = (window.rectangle.left() - bt) as f32;
+                    let screen_y = (window.rectangle.top() - bt) as f32;
 
-                let needs_bend = wid == piano_keyboard_window_handle
-                    || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
-                let needs_bend = needs_bend && app_state.pitch_bend_window_enabled;
-                if needs_bend {
-                    let win_w = (window.rectangle.width + 2 * bt) as f32;
-                    let win_h = (window.rectangle.height + 2 * bt) as f32;
-                    let padding = *content_rt_padding.get(&wid).unwrap_or(&0.0);
-                    let window_top_uv = padding / rt_h;
-                    let window_bottom_uv = 1.0 - padding / rt_h;
+                    let needs_bend = wid == piano_keyboard_window_handle
+                        || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
+                    let needs_bend = needs_bend && app_state.pitch_bend_window_enabled;
+                    if needs_bend {
+                        let win_w = (window.rectangle.width + 2 * bt) as f32;
+                        let win_h = (window.rectangle.height + 2 * bt) as f32;
+                        let padding = *content_rt_padding.get(&wid).unwrap_or(&0.0);
+                        let window_top_uv = padding / rt_h;
+                        let window_bottom_uv = 1.0 - padding / rt_h;
 
-                    window_bend_shader
-                        .set_shader_value(wb_bend_loc, pitch_bend_normalized.clamp(-1.0, 1.0));
-                    window_bend_shader
-                        .set_shader_value(wb_bend_range_loc, pitch_bend_range.max(0.0));
-                    window_bend_shader.set_shader_value(wb_max_bend_loc, 15.0f32);
-                    window_bend_shader.set_shader_value(wb_win_width_loc, win_w);
-                    window_bend_shader.set_shader_value(wb_win_height_loc, win_h);
-                    window_bend_shader.set_shader_value(wb_curve_power_loc, 2.5f32);
-                    window_bend_shader.set_shader_value(wb_window_top_uv_loc, window_top_uv);
-                    window_bend_shader.set_shader_value(wb_window_bottom_uv_loc, window_bottom_uv);
+                        window_bend_shader
+                            .set_shader_value(wb_bend_loc, pitch_bend_normalized.clamp(-1.0, 1.0));
+                        window_bend_shader
+                            .set_shader_value(wb_bend_range_loc, pitch_bend_range.max(0.0));
+                        window_bend_shader.set_shader_value(wb_max_bend_loc, 15.0f32);
+                        window_bend_shader.set_shader_value(wb_win_width_loc, win_w);
+                        window_bend_shader.set_shader_value(wb_win_height_loc, win_h);
+                        window_bend_shader.set_shader_value(wb_curve_power_loc, 2.5f32);
+                        window_bend_shader.set_shader_value(wb_window_top_uv_loc, window_top_uv);
+                        window_bend_shader
+                            .set_shader_value(wb_window_bottom_uv_loc, window_bottom_uv);
 
-                    {
-                        let mut d_sh = d_rt.begin_shader_mode(&mut window_bend_shader);
-                        d_sh.draw_texture_rec(
+                        {
+                            let mut d_sh = d_rt.begin_shader_mode(&mut window_bend_shader);
+                            d_sh.draw_texture_rec(
+                                win_rt,
+                                Rectangle::new(0.0, 0.0, rt_w, -rt_h),
+                                Vector2::new(screen_x, screen_y - padding),
+                                Color::WHITE,
+                            );
+                        }
+
+                        // Show the original window bounds while bending.
+                        if pitch_bend_normalized.abs() > 0.001 {
+                            d_rt.draw_rectangle_lines_ex(
+                                Rectangle::new(screen_x, screen_y, win_w, win_h),
+                                2.0,
+                                Color::RED,
+                            );
+                        }
+                    } else {
+                        d_rt.draw_texture_rec(
                             win_rt,
                             Rectangle::new(0.0, 0.0, rt_w, -rt_h),
-                            Vector2::new(screen_x, screen_y - padding),
+                            Vector2::new(screen_x, screen_y),
                             Color::WHITE,
                         );
                     }
-
-                    // Show the original window bounds while bending.
-                    if pitch_bend_normalized.abs() > 0.001 {
-                        d_rt.draw_rectangle_lines_ex(
-                            Rectangle::new(screen_x, screen_y, win_w, win_h),
-                            2.0,
-                            Color::RED,
-                        );
-                    }
-                } else {
-                    d_rt.draw_texture_rec(
-                        win_rt,
-                        Rectangle::new(0.0, 0.0, rt_w, -rt_h),
-                        Vector2::new(screen_x, screen_y),
-                        Color::WHITE,
-                    );
                 }
             }
         }
@@ -1507,6 +1562,16 @@ fn main() {
             Color::WHITE,
         );
 
+        // Flip 3D draws to the backbuffer rather than render_texture because only
+        // the backbuffer is multisampled, and the tilted card edges need MSAA.
+        flip_3d.draw(
+            &mut d,
+            &window_manager,
+            &content_rts,
+            &content_rt_padding,
+            screen_width,
+            screen_height,
+        );
         let mut close_requested = false;
         app_state
             .overlay_manager
