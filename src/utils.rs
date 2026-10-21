@@ -172,11 +172,7 @@ pub fn format_count_short(n: u64) -> String {
 
 /// Format a byte count with binary units, e.g. `1536` -> `1.50KB`.
 pub fn format_bytes(n: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [
-        (1 << 30, "GB"),
-        (1 << 20, "MB"),
-        (1 << 10, "KB"),
-    ];
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
     for (scale, suffix) in UNITS {
         if n >= scale {
             let v = n as f64 / scale as f64;

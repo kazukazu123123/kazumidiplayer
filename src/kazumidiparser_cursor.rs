@@ -190,9 +190,8 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
                 if mtype == 0x51 && mlen >= 3 {
                     c.is_tempo = true;
                     c.status = 0xFF;
-                    c.tempo_val = ((*c.p as u32) << 16)
-                        | ((*c.p.add(1) as u32) << 8)
-                        | (*c.p.add(2) as u32);
+                    c.tempo_val =
+                        ((*c.p as u32) << 16) | ((*c.p.add(1) as u32) << 8) | (*c.p.add(2) as u32);
                     c.has_event = true;
                     c.p = c.p.add(mlen as usize);
                     return true;
@@ -457,9 +456,8 @@ const DEFAULT_TEMPO_US: u64 = 500_000;
 pub fn tick_to_ns(data: &KazuMIDIParserData, tick: u32) -> u64 {
     let division = (data.header.division as u64).max(1);
     // Before the first tempo change (or with no tempo at all), the default rate.
-    let default_ns = |t: u32| -> u64 {
-        (t as u128 * DEFAULT_TEMPO_US as u128 * 1000 / division as u128) as u64
-    };
+    let default_ns =
+        |t: u32| -> u64 { (t as u128 * DEFAULT_TEMPO_US as u128 * 1000 / division as u128) as u64 };
     if data.tempo_count == 0 || data.tempo_tick.is_null() {
         return default_ns(tick);
     }
@@ -554,9 +552,8 @@ pub fn ns_to_tick(data: &KazuMIDIParserData, ns: u64) -> u32 {
         let tempo = *data.tempo_val.add(i);
         let delta_ns = ns.saturating_sub(base_ns);
         // Use u128 to avoid overflow and truncation.
-        let delta_tick = (delta_ns as u128 * division
-            / (tempo as u128).saturating_mul(1000).max(1))
-        .min(u32::MAX as u128) as u32;
+        let delta_tick = (delta_ns as u128 * division / (tempo as u128).saturating_mul(1000).max(1))
+            .min(u32::MAX as u128) as u32;
         base_tick.saturating_add(delta_tick)
     }
 }
@@ -571,10 +568,14 @@ mod tests {
     /// file in `KZMP_TEST_MIDIS` (a directory). Skipped when it is unset.
     #[test]
     fn cursor_matches_parser_counts() {
-        let Ok(dir) = std::env::var("KZMP_TEST_MIDIS") else { return };
+        let Ok(dir) = std::env::var("KZMP_TEST_MIDIS") else {
+            return;
+        };
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            let Ok(midi) = MIDIPlayerData::parse(&path, 0, None, None) else { continue };
+            let Ok(midi) = MIDIPlayerData::parse(&path, 0, None, None) else {
+                continue;
+            };
             let data = unsafe { &*midi.as_ptr() };
             let (mut channel, mut note_on) = (0u64, 0u64);
             for t in 0..data.header.tracks {
@@ -607,10 +608,19 @@ mod tests {
                         }
                     }
                     let expected = total - (kfs.len() as u64 - 1) * 4096;
-                    assert_eq!(from_kf, expected, "{} track {t} keyframe seek", path.display());
+                    assert_eq!(
+                        from_kf,
+                        expected,
+                        "{} track {t} keyframe seek",
+                        path.display()
+                    );
                 }
             }
-            println!("{}: {note_on} / {}", path.display(), midi.total_note_on_events());
+            println!(
+                "{}: {note_on} / {}",
+                path.display(),
+                midi.total_note_on_events()
+            );
             assert_eq!(channel, midi.total_channel_events(), "{}", path.display());
             assert_eq!(note_on, midi.total_note_on_events(), "{}", path.display());
         }

@@ -83,7 +83,10 @@ impl ShakeState {
         let derivative = -self.vel_y;
         let mut force_y = (kp * error + kd * derivative) * dt_scale;
 
-        if is_midi_loaded && !is_loading && player_state == PlayerState::Playing && !is_dragging_seek
+        if is_midi_loaded
+            && !is_loading
+            && player_state == PlayerState::Playing
+            && !is_dragging_seek
         {
             let active_notes = engine.get_active_notes();
             let mut left_count = 0;

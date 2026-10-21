@@ -343,9 +343,7 @@ fn main() {
         let pitch_bend_range = engine.get_pitch_bend_range();
         if !rl.is_window_maximized() && !rl.is_window_minimized() && !rl.is_window_fullscreen() {
             let target_x = if app_state.pitch_bend_move_window_enabled {
-                pitch_bend_normalized.clamp(-1.0, 1.0)
-                    * (pitch_bend_range.max(0.0) / 12.0)
-                    * 40.0
+                pitch_bend_normalized.clamp(-1.0, 1.0) * (pitch_bend_range.max(0.0) / 12.0) * 40.0
             } else {
                 0.0
             };

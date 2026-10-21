@@ -171,8 +171,7 @@ impl Window {
         }
     }
 
-    pub fn handle_input(&mut self, _event: InputEvent) {
-    }
+    pub fn handle_input(&mut self, _event: InputEvent) {}
 
     pub fn get_window_titlebar_height(&self) -> i32 {
         self.window_titlebar_height

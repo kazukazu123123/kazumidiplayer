@@ -1,7 +1,7 @@
 use kazumidiparser::MIDIPlayerData;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
 use std::thread;
 
 /// A parse-progress snapshot: tracks done and a live per-event count, which is
@@ -63,21 +63,21 @@ impl MIDIParserWorker {
                             );
                             match parse_result {
                                 Ok(data) => {
-                                    let _ = tx_feedback.send(
-                                        ParserFeedbackCommand::ParseComplete(
-                                            Arc::new(data),
-                                            path,
-                                            token_clone,
-                                        ),
-                                    );
+                                    let _ = tx_feedback.send(ParserFeedbackCommand::ParseComplete(
+                                        Arc::new(data),
+                                        path,
+                                        token_clone,
+                                    ));
                                 }
                                 Err(kazumidiparser::Error::Cancelled) => {
                                     let _ = tx_feedback
                                         .send(ParserFeedbackCommand::ParseCancelled(token_clone));
                                 }
                                 Err(_) => {
-                                    let _ = tx_feedback
-                                        .send(ParserFeedbackCommand::ParseFailed(path, token_clone));
+                                    let _ = tx_feedback.send(ParserFeedbackCommand::ParseFailed(
+                                        path,
+                                        token_clone,
+                                    ));
                                 }
                             }
                         });

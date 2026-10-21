@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::kazumidiparser_cursor::{
-    cursor_next, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held, TrackCursor,
+    TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held,
 };
 use crate::ui_components::piano_keyboard::{get_keyboard_note_regions, is_black_key};
 use crate::utils::get_note_color_by_index;
@@ -243,7 +243,8 @@ pub fn future_tick(
     let height_scale = (height / REFERENCE_HEIGHT).max(0.01);
     if is_tick_based {
         let division = (data.header.division as u32).max(1);
-        let span = (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
+        let span =
+            (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
         let current = ns_to_tick(data, playback_position_ns);
         current.saturating_add(span)
     } else {
@@ -675,26 +676,29 @@ fn run_scan(
         for w in 0..worker_count {
             let data = data.clone();
             let tx = seed_tx.clone();
-            handles.push((w, scope.spawn(move || {
-                // Safety: the Arc keeps the C MIDI struct alive for this call.
-                let parser = unsafe { &*data.as_ptr() };
-                let mut ti = w;
-                while ti < num_tracks {
-                    // Safety: ti < num_tracks; parser valid for this call.
-                    let (cur, held) = unsafe {
-                        seek_track_cursor_with_held(
-                            parser,
-                            ti as u16,
-                            start_tick,
-                            MAX_SOUNDING_PER_KEY,
-                        )
-                    };
-                    if tx.send((ti, cur, held)).is_err() {
-                        break;
+            handles.push((
+                w,
+                scope.spawn(move || {
+                    // Safety: the Arc keeps the C MIDI struct alive for this call.
+                    let parser = unsafe { &*data.as_ptr() };
+                    let mut ti = w;
+                    while ti < num_tracks {
+                        // Safety: ti < num_tracks; parser valid for this call.
+                        let (cur, held) = unsafe {
+                            seek_track_cursor_with_held(
+                                parser,
+                                ti as u16,
+                                start_tick,
+                                MAX_SOUNDING_PER_KEY,
+                            )
+                        };
+                        if tx.send((ti, cur, held)).is_err() {
+                            break;
+                        }
+                        ti += worker_count;
                     }
-                    ti += worker_count;
-                }
-            })));
+                }),
+            ));
         }
         // The receiver exits only after every worker drops its sender. This lets the
         // main scan thread consume results while workers are still seeking, keeping
@@ -755,7 +759,9 @@ fn run_scan(
                 color: crate::utils::note_color_index(ti, channel),
             });
             staged += 1;
-            open.entry((ti, channel, key as u8)).or_default().push_back(idx);
+            open.entry((ti, channel, key as u8))
+                .or_default()
+                .push_back(idx);
         }
     }
 
@@ -851,7 +857,13 @@ fn run_scan(
         while tick > target.load(Ordering::Relaxed) {
             let frontier = target.load(Ordering::Relaxed);
             events_since_publish = 0;
-            if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, frontier) {
+            if !publish(
+                &mut batch,
+                &mut staged,
+                &mut patches,
+                &mut patch_count,
+                frontier,
+            ) {
                 return;
             }
             priority_done = true;
@@ -870,7 +882,13 @@ fn run_scan(
                 // case let it fill in bottom-to-top as it is found.
                 if last_tick >= priority_tick {
                     events_since_publish = 0;
-                    if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
+                    if !publish(
+                        &mut batch,
+                        &mut staged,
+                        &mut patches,
+                        &mut patch_count,
+                        last_tick,
+                    ) {
                         return;
                     }
                     if latest.load(Ordering::SeqCst) != generation
@@ -882,7 +900,13 @@ fn run_scan(
                     commit(&mut committed);
                 } else if reveal_progressively && events_since_publish >= 2048 {
                     events_since_publish = 0;
-                    if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
+                    if !publish(
+                        &mut batch,
+                        &mut staged,
+                        &mut patches,
+                        &mut patch_count,
+                        last_tick,
+                    ) {
                         return;
                     }
                     // Swap this half-built window in: it is replacing an empty one, so
@@ -903,7 +927,13 @@ fn run_scan(
                     let sleep = Duration::from_millis(delay as u64);
                     while last_tick < tick {
                         last_tick += 1;
-                        if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
+                        if !publish(
+                            &mut batch,
+                            &mut staged,
+                            &mut patches,
+                            &mut patch_count,
+                            last_tick,
+                        ) {
                             return;
                         }
                         if latest.load(Ordering::SeqCst) != generation
@@ -918,7 +948,13 @@ fn run_scan(
                     // events.
                     if events_since_publish >= 2048 {
                         events_since_publish = 0;
-                        if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, last_tick) {
+                        if !publish(
+                            &mut batch,
+                            &mut staged,
+                            &mut patches,
+                            &mut patch_count,
+                            last_tick,
+                        ) {
                             return;
                         }
                         if latest.load(Ordering::SeqCst) != generation
@@ -1017,7 +1053,13 @@ fn run_scan(
                 start_tick
             };
             events_since_publish = 0;
-            if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, frontier) {
+            if !publish(
+                &mut batch,
+                &mut staged,
+                &mut patches,
+                &mut patch_count,
+                frontier,
+            ) {
                 return;
             }
             if latest.load(Ordering::SeqCst) != generation || shutdown.load(Ordering::Relaxed) {
@@ -1037,7 +1079,13 @@ fn run_scan(
     // Final publish: flush the rest and mark done. The scan can reach the end of the
     // MIDI without ever passing the priority tick (a short tail, or a seek near the
     // end), so this is also the last chance to show what was built.
-    if !publish(&mut batch, &mut staged, &mut patches, &mut patch_count, end_tick) {
+    if !publish(
+        &mut batch,
+        &mut staged,
+        &mut patches,
+        &mut patch_count,
+        end_tick,
+    ) {
         return;
     }
     if chunk.generation.load(Ordering::SeqCst) != generation {
@@ -1300,7 +1348,11 @@ pub fn draw_piano_roll_chunk(
         scratch.row_tick.resize(height_px + 1, 0);
         scratch.cols.resize(pixel_count, 0);
         scratch.owners.resize(pixel_count, u32::MAX);
-        let DrawScratch { row_tick, cols, owners } = &mut *scratch;
+        let DrawScratch {
+            row_tick,
+            cols,
+            owners,
+        } = &mut *scratch;
         row_tick.fill(0);
         let top_tick = if is_tick_based {
             let division = (data.header.division as u32).max(1);

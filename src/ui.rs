@@ -1,8 +1,6 @@
 use crate::player::{PlayerCommand, PlayerState};
 use crate::ui_components::button::draw_button;
-use crate::ui_components::combo_box::{
-    ComboBoxState, draw_combo_box, draw_combo_box_popup,
-};
+use crate::ui_components::combo_box::{ComboBoxState, draw_combo_box, draw_combo_box_popup};
 use crate::ui_components::numeric_slider::{
     NumericSliderInput, NumericSliderState, draw_u32_numeric_slider,
 };
@@ -491,15 +489,7 @@ pub fn draw_parse_toast(
         zoom: 1.0,
     };
 
-    draw_loading_panel(
-        d,
-        camera,
-        alpha,
-        "Loaded!",
-        progress,
-        parse_bps,
-        parse_eps,
-    );
+    draw_loading_panel(d, camera, alpha, "Loaded!", progress, parse_bps, parse_eps);
 }
 
 pub fn draw_settings_overlay(
@@ -944,12 +934,8 @@ pub fn draw_settings_overlay(
 
                 // Same click shielding as the EV buffer mode popup below.
                 if let Some(click) = click_pos {
-                    let header = Rectangle::new(
-                        combo_rect.x,
-                        combo_rect.y + 20.0,
-                        combo_rect.width,
-                        28.0,
-                    );
+                    let header =
+                        Rectangle::new(combo_rect.x, combo_rect.y + 20.0, combo_rect.width, 28.0);
                     let popup = Rectangle::new(
                         header.x,
                         header.y + header.height,
@@ -1040,7 +1026,11 @@ pub fn draw_settings_overlay(
                     &mut d_scissor,
                     combo_rect,
                     "EV Buffer Mode",
-                    &["Legacy (No Buffer)", "Buffered: Slowdown", "Buffered: Catch Up"],
+                    &[
+                        "Legacy (No Buffer)",
+                        "Buffered: Slowdown",
+                        "Buffered: Catch Up",
+                    ],
                     midi_ev_mode,
                     midi_ev_mode_combo,
                     click_pos,
@@ -1052,12 +1042,8 @@ pub fn draw_settings_overlay(
                 // The popup overlays later settings, so clicks handled by its header
                 // or option list must not continue into controls underneath it.
                 if let Some(click) = click_pos {
-                    let header = Rectangle::new(
-                        combo_rect.x,
-                        combo_rect.y + 20.0,
-                        combo_rect.width,
-                        28.0,
-                    );
+                    let header =
+                        Rectangle::new(combo_rect.x, combo_rect.y + 20.0, combo_rect.width, 28.0);
                     let popup = Rectangle::new(
                         header.x,
                         header.y + header.height,
@@ -1113,7 +1099,10 @@ pub fn draw_settings_overlay(
                     ("Spring Mass", 1, 20),
                     ("Spring Stiffness", 1, 1000),
                     ("Spring Damping", 0, 200),
-                ].into_iter().enumerate() {
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     let y = layout.next(52.0);
                     if is_visible(sy(y), 52.0) {
                         let input = NumericSliderInput {
@@ -1375,7 +1364,11 @@ pub fn draw_settings_overlay(
                 draw_combo_box_popup(
                     &mut d_scissor,
                     combo_rect,
-                    &["Legacy (No Buffer)", "Buffered: Slowdown", "Buffered: Catch Up"],
+                    &[
+                        "Legacy (No Buffer)",
+                        "Buffered: Slowdown",
+                        "Buffered: Catch Up",
+                    ],
                     midi_ev_mode_combo,
                     mouse_world_pos,
                     eased_t,

@@ -285,10 +285,8 @@ impl AppState {
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_midi_ev_buffer_size_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
-            settings_midi_ev_mode_combo:
-                crate::ui_components::combo_box::ComboBoxState::default(),
-            settings_audio_engine_combo:
-                crate::ui_components::combo_box::ComboBoxState::default(),
+            settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState::default(),
+            settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_scan_delay_slider_dragging: false,
             settings_parse_threads_slider_dragging: false,
             speed_slider_dragging: false,

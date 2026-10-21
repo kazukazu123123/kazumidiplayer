@@ -120,6 +120,12 @@ pub fn draw_combo_box_popup(
             },
         );
         d.draw_rectangle_lines_ex(option_rect, 1.0, border);
-        d.draw_text(option, option_rect.x as i32 + 7, option_rect.y as i32 + 6, 16, text);
+        d.draw_text(
+            option,
+            option_rect.x as i32 + 7,
+            option_rect.y as i32 + 6,
+            16,
+            text,
+        );
     }
 }
