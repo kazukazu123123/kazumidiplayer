@@ -545,6 +545,8 @@ pub fn draw_settings_overlay(
     scrollbar_drag_start_scroll: &mut f32,
     pb_multiplier_slider: &mut NumericSliderState,
     midi_ev_buffer_size_slider: &mut NumericSliderState,
+    audio_engine: &mut usize,
+    audio_engine_combo: &mut ComboBoxState,
     midi_ev_mode: &mut usize,
     midi_ev_mode_combo: &mut ComboBoxState,
     parse_threads: &mut u32,
@@ -731,6 +733,7 @@ pub fn draw_settings_overlay(
         // Scissor: clip scrollable content to the content area
         {
             let mut midi_ev_mode_combo_rect = None;
+            let mut audio_engine_combo_rect = None;
             let clip_tl = d2d.get_world_to_screen2D(Vector2::new(0.0, content_top), camera);
             let clip_br =
                 d2d.get_world_to_screen2D(Vector2::new(panel_rect.width, content_bottom), camera);
@@ -917,6 +920,47 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *autoplay_on_load = !*autoplay_on_load;
+                }
+            }
+
+            // Audio engine selector
+            let y = layout.next(52.0);
+            if is_visible(sy(y), 52.0) {
+                let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
+                audio_engine_combo_rect = Some(combo_rect);
+                let was_open = audio_engine_combo.open;
+                draw_combo_box(
+                    &mut d_scissor,
+                    combo_rect,
+                    "Audio Engine",
+                    &crate::audio_engine::AudioEngine::LABELS,
+                    audio_engine,
+                    audio_engine_combo,
+                    click_pos,
+                    eased_t,
+                    true,
+                    None,
+                );
+
+                // Same click shielding as the EV buffer mode popup below.
+                if let Some(click) = click_pos {
+                    let header = Rectangle::new(
+                        combo_rect.x,
+                        combo_rect.y + 20.0,
+                        combo_rect.width,
+                        28.0,
+                    );
+                    let popup = Rectangle::new(
+                        header.x,
+                        header.y + header.height,
+                        header.width,
+                        28.0 * crate::audio_engine::AudioEngine::LABELS.len() as f32,
+                    );
+                    if header.check_collision_point_rec(click)
+                        || (was_open && popup.check_collision_point_rec(click))
+                    {
+                        click_pos = None;
+                    }
                 }
             }
 
@@ -1316,7 +1360,17 @@ pub fn draw_settings_overlay(
                 }
             }
 
-            // Popup is deliberately drawn last so it floats above the controls below it.
+            // Popups are deliberately drawn last so they float above the controls below.
+            if let Some(combo_rect) = audio_engine_combo_rect {
+                draw_combo_box_popup(
+                    &mut d_scissor,
+                    combo_rect,
+                    &crate::audio_engine::AudioEngine::LABELS,
+                    audio_engine_combo,
+                    mouse_world_pos,
+                    eased_t,
+                );
+            }
             if let Some(combo_rect) = midi_ev_mode_combo_rect {
                 draw_combo_box_popup(
                     &mut d_scissor,

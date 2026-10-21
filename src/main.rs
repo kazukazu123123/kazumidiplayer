@@ -1,4 +1,5 @@
 mod app_state;
+mod audio_engine;
 mod blur_requester;
 mod flip_3d;
 mod kazumidiparser_cursor;
@@ -19,7 +20,6 @@ use player::{PlayerCommand, PlayerFeedback, PlayerHandle, PlayerState};
 use raylib::prelude::*;
 use std::sync::mpsc;
 
-use crate::kdmapi::get_kdmapi;
 use crate::window_manager::WindowManager;
 
 fn insert_char_at(text: &mut String, char_pos: usize, c: char) {
@@ -192,17 +192,13 @@ fn main() {
     let (tx_commands_to_player, rx_commands_from_main) = mpsc::channel::<PlayerCommand>();
     let (tx_feedback_to_main, rx_feedback_from_player) = mpsc::channel::<PlayerFeedback>();
 
-    let engine = match get_kdmapi().filter(|k| k.is_kdmapi_available()) {
-        Some(kdmapi) => {
-            let stream = kdmapi.open_stream();
-            PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, Some(stream))
-        }
-        None => {
-            eprintln!("[WARN] KDMAPI (OmniMIDI) is not available. Running without audio output.");
-            app_state.kdmapi_missing = true;
-            PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, None)
-        }
-    };
+    let audio_engine = audio_engine::AudioEngine::from_index(app_state.audio_engine);
+    let stream = audio_engine.open();
+    if stream.is_none() {
+        eprintln!("[WARN] {audio_engine:?} is not available. Running without audio output.");
+        app_state.kdmapi_missing = true;
+    }
+    let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, stream);
 
     let mut render_texture = rl
         .load_render_texture(
@@ -1630,6 +1626,8 @@ fn main() {
                             &mut app_state.settings_scrollbar_drag_start_scroll,
                             &mut app_state.settings_pb_multiplier_slider,
                             &mut app_state.settings_midi_ev_buffer_size_slider,
+                            &mut app_state.audio_engine,
+                            &mut app_state.settings_audio_engine_combo,
                             &mut app_state.midi_ev_mode,
                             &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,

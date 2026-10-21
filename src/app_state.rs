@@ -140,6 +140,8 @@ pub struct AppState {
     pub midi_ev_buffer_size: u32,
     /// 0 = legacy/no buffer, 1 = buffered slowdown, 2 = buffered catch-up.
     pub midi_ev_mode: usize,
+    /// Index into `AudioEngine::ALL`.
+    pub audio_engine: usize,
 
     // UI (non-editor)
     pub last_input_event: Option<InputEvent>,
@@ -155,6 +157,7 @@ pub struct AppState {
     pub settings_midi_ev_buffer_size_slider:
         crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
+    pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_scan_delay_slider_dragging: bool,
     pub settings_parse_threads_slider_dragging: bool,
     pub speed_slider_dragging: bool,
@@ -267,6 +270,7 @@ impl AppState {
             unlimited_output_animation: 0.0,
             midi_ev_buffer_size: crate::player::DEFAULT_MIDI_EV_BUFFER_SIZE,
             midi_ev_mode: 0,
+            audio_engine: 0,
 
             // UI (non-editor)
             last_input_event: None,
@@ -282,6 +286,8 @@ impl AppState {
             settings_midi_ev_buffer_size_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_midi_ev_mode_combo:
+                crate::ui_components::combo_box::ComboBoxState::default(),
+            settings_audio_engine_combo:
                 crate::ui_components::combo_box::ComboBoxState::default(),
             settings_scan_delay_slider_dragging: false,
             settings_parse_threads_slider_dragging: false,
