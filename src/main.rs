@@ -707,7 +707,7 @@ fn main() {
                         // Later notes paint over earlier ones. This lookup is bounded:
                         // the old forward scan visited every past note on every frame
                         // and became a major stutter on dense files with sustained notes.
-                        let chosen = piano_roll::sounding_color_at(&bucket.notes, current_tick);
+                        let chosen = bucket.sounding_color_at(current_tick);
                         drop(bucket);
                         if let Some(color) = chosen {
                             let (r, g, b) = utils::get_note_color_by_index(color);

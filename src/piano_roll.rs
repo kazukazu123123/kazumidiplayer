@@ -1,6 +1,7 @@
 use kazumidiparser::{KazuMIDIParserData, MIDIPlayerData};
 use raylib::prelude::*;
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -47,6 +48,20 @@ const OPEN_END: u32 = u32::MAX;
 /// black ones add up to a black roll.
 pub(crate) const BORDER_SHADE: u32 = 45;
 
+/// Reuse raster buffers across frames instead of allocating and freeing three
+/// large vectors on every draw. The renderer calls this on one thread, so TLS
+/// avoids cross-thread locking and keeps capacity stable across frames.
+#[derive(Default)]
+struct DrawScratch {
+    row_tick: Vec<u32>,
+    cols: Vec<u32>,
+    owners: Vec<u32>,
+}
+
+thread_local! {
+    static DRAW_SCRATCH: RefCell<DrawScratch> = RefCell::new(DrawScratch::default());
+}
+
 /// Marks a packed column pixel as already outlined, so it is not darkened a second
 /// time. Sits above the 24 color bits and the occupancy bit.
 const EDGE_BIT: u32 = 1 << 25;
@@ -73,6 +88,21 @@ pub struct RollNote {
     pub color: u16,
 }
 
+/// A still-sounding note moved out of `KeyBucket::notes` so it cannot hold back
+/// retirement of the dead notes behind it. `idx` is the note's absolute append
+/// index, which is how a note-off that arrives after the move finds it.
+#[derive(Clone, Copy)]
+struct PinnedNote {
+    idx: u64,
+    note: RollNote,
+}
+
+/// How many still-sounding notes a key keeps after they leave the queue, at each
+/// end. The rasterizer's oldest-edge fallback looks at the oldest ones and its
+/// bounded reverse walk at the newest ones; the notes between are never reached,
+/// so they are not worth holding.
+const MAX_PINNED: usize = MAX_LOOKBACK;
+
 /// One key's notes, and the bookkeeping that has to stay in step with them.
 ///
 /// `generation` lives here rather than on the chunk so that a publish's "is this
@@ -87,10 +117,21 @@ pub struct KeyBucket {
     /// still held; its end is patched in on note-off. Notes that playback has passed
     /// are popped off the front by `retire`.
     pub notes: VecDeque<RollNote>,
-    /// Count of notes popped off the front so far. The scan addresses notes by an
+    /// Count of notes removed from the front so far. The scan addresses notes by an
     /// absolute index (total ever appended to this key), so subtracting this maps an
     /// absolute index to the current queue position.
     retired: u64,
+    /// Notes that started before the playhead but have not ended. They are what
+    /// would otherwise block `retire` at the front of the queue while millions of
+    /// already-ended notes pile up behind them. They are kept as a merged prefix by
+    /// the draw (every pinned note starts no later than the first queued one).
+    ///
+    /// Two sets, because both ends of that prefix are visible: `pinned_old` holds
+    /// the oldest notes (the rasterizer's oldest-edge fallback) and `pinned_new`
+    /// rolls the newest ones (the notes just below the playhead). Everything in
+    /// between is never reached by either bounded scan.
+    pinned_old: VecDeque<PinnedNote>,
+    pinned_new: VecDeque<PinnedNote>,
 }
 
 /// A sliding window of piano-roll draw data, filled in by the worker as playback
@@ -154,8 +195,12 @@ impl RollChunk {
             b.generation = generation;
             b.retired = 0;
             let old = std::mem::take(&mut b.notes);
+            let old_pinned_old = std::mem::take(&mut b.pinned_old);
+            let old_pinned_new = std::mem::take(&mut b.pinned_new);
             drop(b);
             drop(old);
+            drop(old_pinned_old);
+            drop(old_pinned_new);
         }
         self.scan_frontier_tick.store(start_tick, Ordering::SeqCst);
         self.window_start_tick.store(start_tick, Ordering::SeqCst);
@@ -341,25 +386,86 @@ impl PianoRollWorker {
     /// Notes currently resident in the window, and the bytes their queues occupy
     /// (allocated capacity, not just the used part). For the stats panel: this is
     /// the piano roll's share of the heap, to be compared against the total.
+    pub fn resident_stats(&self) -> (usize, usize) {
+        let guard = self.acquire_live();
+        let note_bytes = std::mem::size_of::<RollNote>();
+        let mut notes = 0usize;
+        let mut bytes = 0usize;
+        for slot in guard.chunk.notes_by_key.iter() {
+            let b = slot.lock().unwrap();
+            notes += b.notes.len() + b.pinned_old.len() + b.pinned_new.len();
+            bytes += b.notes.capacity() * note_bytes
+                + (b.pinned_old.capacity() + b.pinned_new.capacity())
+                    * std::mem::size_of::<PinnedNote>();
+        }
+        (notes, bytes)
+    }
+
+    /// Approximate resident note storage across both double-buffered chunks.
+    /// Unlike `resident_stats`, this includes the build chunk while a seek/scan is
+    /// in progress, which is important when comparing the roll's allocation with
+    /// process RSS on very dense MIDI files. It excludes scan staging, parser-owned
+    /// MIDI data, hash-map allocations, allocator metadata, and draw-thread scratch.
+    pub fn resident_stats_all_chunks(&self) -> (usize, usize) {
+        let note_bytes = std::mem::size_of::<RollNote>();
+        let pinned_bytes = std::mem::size_of::<PinnedNote>();
+        let mut notes = 0usize;
+        let mut bytes = 0usize;
+        for chunk in &self.chunks {
+            for slot in chunk.notes_by_key.iter() {
+                let b = slot.lock().unwrap();
+                notes += b.notes.len() + b.pinned_old.len() + b.pinned_new.len();
+                bytes += b.notes.capacity() * note_bytes
+                    + (b.pinned_old.capacity() + b.pinned_new.capacity()) * pinned_bytes;
+            }
+        }
+        (notes, bytes)
+    }
+
     /// Drop notes that playback has passed, freeing the memory behind the window.
-    /// Pops from the front of each key queue while the front note has fully ended;
-    /// the queues are start-sorted, so the first note still alive stops the pop and
-    /// a long note holds back everything behind it (exactly what the draw needs).
+    /// Notes that started in the past and are still sounding are moved to `pinned`
+    /// instead of being left in the queue where they would stop every later note
+    /// from ever being retired. A long note used to make a bucket grow for the whole
+    /// song, because the dead notes behind it could never reach the front.
     pub fn retire(&self, current_tick: u32) {
         let guard = self.acquire_live();
         for slot in guard.chunk.notes_by_key.iter() {
             let mut b = slot.lock().unwrap();
-            let mut popped = 0u64;
+
+            // A pinned note whose note-off has since been patched can go.
+            b.pinned_old.retain(|p| p.note.end_tick >= current_tick);
+            b.pinned_new.retain(|p| p.note.end_tick >= current_tick);
+
             while let Some(front) = b.notes.front() {
                 // Copy out of the packed struct before comparing.
                 let end = front.end_tick;
-                if end >= current_tick {
+                let start = front.start_tick;
+                if end < current_tick {
+                    b.notes.pop_front();
+                    b.retired += 1;
+                } else if start >= current_tick {
+                    // Nothing at or before the playhead can follow: every remaining
+                    // note starts now or later, so none can be dead yet.
                     break;
+                } else {
+                    // Started in the past and still ringing. It is exactly what used
+                    // to block retirement, so take it out of the queue. Keep the
+                    // oldest MAX_PINNED for the oldest-edge fallback and roll the
+                    // newest MAX_PINNED for the lookups just under the playhead; the
+                    // draw never reaches the rest, so they are dropped for good.
+                    let idx = b.retired;
+                    let note = b.notes.pop_front().unwrap();
+                    b.retired += 1;
+                    if b.pinned_new.is_empty() && b.pinned_old.len() < MAX_PINNED {
+                        b.pinned_old.push_back(PinnedNote { idx, note });
+                    } else {
+                        if b.pinned_new.len() == MAX_PINNED {
+                            b.pinned_new.pop_front();
+                        }
+                        b.pinned_new.push_back(PinnedNote { idx, note });
+                    }
                 }
-                b.notes.pop_front();
-                popped += 1;
             }
-            b.retired += popped;
 
             // A VecDeque keeps its high-water capacity forever, and it grows by
             // doubling. On a dense MIDI that slack ran to a hundred megabytes of
@@ -588,23 +694,32 @@ fn run_scan(
     // Stride rather than block: track lengths vary wildly, and interleaving keeps one
     // thread from drawing all the long ones.
     let worker_count = (crate::app_state::cpu_threads().max(1) as usize).min(num_tracks.max(1));
-    let seeded = thread::scope(|scope| {
+    // Stream seek results through a bounded channel instead of collecting every
+    // worker's Vec and then building a second per-track staging Vec. On dense files,
+    // each track can return many held notes; retaining all those result vectors until
+    // every worker finishes needlessly raises the seek-time memory peak.
+    // The bounded queue limits queued results to 2 * worker_count tracks (plus at
+    // most one in-flight result per worker), while preserving the exact same set of
+    // held notes and the track-indexed cursor order needed by the merge heap.
+    let mut cursor_slots: Vec<Option<TrackCursor>> = (0..num_tracks).map(|_| None).collect();
+    let queue_capacity = worker_count.saturating_mul(2).max(1);
+    let (seed_tx, seed_rx) = mpsc::sync_channel::<(
+        usize,
+        TrackCursor,
+        Vec<crate::kazumidiparser_cursor::HeldNote>,
+    )>(queue_capacity);
+
+    thread::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
         for w in 0..worker_count {
             let data = data.clone();
-            handles.push(scope.spawn(move || {
+            let tx = seed_tx.clone();
+            handles.push((w, scope.spawn(move || {
                 // Safety: the Arc keeps the C MIDI struct alive for this call.
                 let parser = unsafe { &*data.as_ptr() };
-                let mut out: Vec<(usize, TrackCursor, Vec<crate::kazumidiparser_cursor::HeldNote>)> =
-                    Vec::new();
                 let mut ti = w;
                 while ti < num_tracks {
-                    // Safety: ti < num_tracks; parser valid for this call. Each track
-                    // also reports notes already held at `start_tick`, so notes
-                    // spanning the seek point still render -- except those that began
-                    // before the keyframe the walk starts from, whose note-on it never
-                    // reads. Those are simply missing from the roll until playback
-                    // reaches a rebuild that starts before them.
+                    // Safety: ti < num_tracks; parser valid for this call.
                     let (cur, held) = unsafe {
                         seek_track_cursor_with_held(
                             parser,
@@ -613,45 +728,43 @@ fn run_scan(
                             MAX_SOUNDING_PER_KEY,
                         )
                     };
-                    out.push((ti, cur, held));
+                    if tx.send((ti, cur, held)).is_err() {
+                        break;
+                    }
                     ti += worker_count;
                 }
-                out
-            }));
+            })));
         }
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().ok())
-            .collect::<Vec<_>>()
-    });
-
-    // Fold the seeks back together in track order. `sounding` keeps the newest 128
-    // starts per key, which is the same set whatever order they arrive in, but the
-    // heap merge below wants `cursors` indexed by track, so put them back in order.
-    let mut per_track: Vec<Option<(TrackCursor, Vec<crate::kazumidiparser_cursor::HeldNote>)>> =
-        (0..num_tracks).map(|_| None).collect();
-    for chunk in seeded {
-        for (ti, cur, held) in chunk {
-            per_track[ti] = Some((cur, held));
-        }
-    }
-
-    for (ti, entry) in per_track.into_iter().enumerate() {
-        let Some((cur, held)) = entry else {
-            // A worker panicked; treat the track as empty rather than mis-indexing
-            // every track after it.
-            cursors.push(unsafe { seek_track_cursor(parser, ti as u16, start_tick) });
-            continue;
-        };
-        for note in held {
-            let newest = &mut sounding[note.key as usize];
-            newest.push(Reverse((note.start_tick, ti as u16, note.channel)));
-            if newest.len() > MAX_SOUNDING_PER_KEY {
-                if let Some(Reverse((_, old_ti, old_ch))) = newest.pop() {
-                    *evicted.entry((old_ti, old_ch, note.key)).or_default() += 1;
+        // The receiver exits only after every worker drops its sender. This lets the
+        // main scan thread consume results while workers are still seeking, keeping
+        // the number of live HeldNote vectors bounded instead of proportional to the
+        // total number of tracks.
+        drop(seed_tx);
+        while let Ok((ti, cur, held)) = seed_rx.recv() {
+            for note in held {
+                let newest = &mut sounding[note.key as usize];
+                newest.push(Reverse((note.start_tick, ti as u16, note.channel)));
+                if newest.len() > MAX_SOUNDING_PER_KEY {
+                    if let Some(Reverse((_, old_ti, old_ch))) = newest.pop() {
+                        *evicted.entry((old_ti, old_ch, note.key)).or_default() += 1;
+                    }
                 }
             }
+            cursor_slots[ti] = Some(cur);
         }
+        // Preserve the existing recovery behavior if a seek worker panicked: only
+        // that worker's stride is retried synchronously below.
+        for (w, handle) in handles {
+            let _ = handle.join();
+            let _ = w;
+        }
+    });
+
+    for (ti, slot) in cursor_slots.into_iter().enumerate() {
+        let cur = match slot {
+            Some(cur) => cur,
+            None => unsafe { seek_track_cursor(parser, ti as u16, start_tick) },
+        };
         if cur.has_event && !cur.is_tempo && cur.abs_tick <= end_tick {
             heap.push(Reverse((cur.abs_tick, ti)));
         }
@@ -733,6 +846,17 @@ fn run_scan(
             }
             b.notes.extend(run.drain(..));
             for (idx, end) in key_patches.drain(..) {
+                // A still-sounding note may have been moved out of the queue by
+                // `retire` while its note-off was in flight. Pinned notes keep their
+                // absolute index (ascending) so the patch still finds them.
+                if let Ok(pos) = b.pinned_old.binary_search_by_key(&idx, |p| p.idx) {
+                    b.pinned_old[pos].note.end_tick = end;
+                    continue;
+                }
+                if let Ok(pos) = b.pinned_new.binary_search_by_key(&idx, |p| p.idx) {
+                    b.pinned_new[pos].note.end_tick = end;
+                    continue;
+                }
                 // Absolute index -> current queue position. A note whose index is
                 // below the retired count has already scrolled out of the window; its
                 // end no longer exists to patch, so the patch is simply dropped.
@@ -872,7 +996,9 @@ fn run_scan(
                     // Close the oldest note still ringing on this voice. A note-off
                     // carries no way to say which of several stacked notes it ends,
                     // so oldest-first is the convention.
-                    if let Some(queue) = open.get_mut(&(ti as u16, channel, key as u8)) {
+                    let voice = (ti as u16, channel, key as u8);
+                    let mut emptied = false;
+                    if let Some(queue) = open.get_mut(&voice) {
                         // A tombstone consumes its note-off and patches nothing: the
                         // note it stands for was never put in the roll.
                         if let Some(idx) = queue.pop_front() {
@@ -881,6 +1007,14 @@ fn run_scan(
                                 patch_count += 1;
                             }
                         }
+                        emptied = queue.is_empty();
+                    }
+                    // A voice with nothing left ringing must not keep its queue
+                    // buffer alive for the rest of the scan. On a many-track MIDI
+                    // this map is where most of the scan's memory goes: one entry
+                    // per voice ever struck, each holding its peak stack size.
+                    if emptied {
+                        open.remove(&voice);
                     }
                 }
             }
@@ -969,9 +1103,8 @@ fn darken(packed: u32) -> u32 {
     (1u32 << 24) | EDGE_BIT | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Index of the first note starting above `limit`, in the deque's logical order.
-/// The bucket is start-sorted, so every note from here on is off the top of the view.
-fn first_note_above(notes: &VecDeque<RollNote>, limit: u32) -> usize {
+/// Index of the first note starting above `limit` within the queue alone.
+fn first_note_above_queue(notes: &VecDeque<RollNote>, limit: u32) -> usize {
     // A VecDeque is a ring, so its contents are up to two slices; each is sorted and
     // the head's notes all precede the tail's.
     let (head, tail) = notes.as_slices();
@@ -980,6 +1113,45 @@ fn first_note_above(notes: &VecDeque<RollNote>, limit: u32) -> usize {
         in_head
     } else {
         head.len() + tail.partition_point(|n| n.start_tick <= limit)
+    }
+}
+
+/// Index of the first note starting above `limit`, in the draw's logical order:
+/// pinned notes first, then the queue. Every pinned note starts no later than the
+/// first queued one, so the merged sequence is still start-sorted. The bucket is
+/// start-sorted, so every note from here on is off the top of the view.
+fn first_note_above(
+    pinned_old: &VecDeque<PinnedNote>,
+    pinned_new: &VecDeque<PinnedNote>,
+    notes: &VecDeque<RollNote>,
+    limit: u32,
+) -> usize {
+    let in_old = pinned_old.partition_point(|p| p.note.start_tick <= limit);
+    if in_old < pinned_old.len() {
+        return in_old;
+    }
+    let in_new = pinned_new.partition_point(|p| p.note.start_tick <= limit);
+    if in_new < pinned_new.len() {
+        return pinned_old.len() + in_new;
+    }
+    pinned_old.len() + pinned_new.len() + first_note_above_queue(notes, limit)
+}
+
+/// The merged sequence's note at `i`.
+#[inline]
+fn note_at(
+    pinned_old: &VecDeque<PinnedNote>,
+    pinned_new: &VecDeque<PinnedNote>,
+    notes: &VecDeque<RollNote>,
+    i: usize,
+) -> RollNote {
+    let old_len = pinned_old.len();
+    if i < old_len {
+        pinned_old[i].note
+    } else if i < old_len + pinned_new.len() {
+        pinned_new[i - old_len].note
+    } else {
+        notes[i - old_len - pinned_new.len()]
     }
 }
 
@@ -993,22 +1165,31 @@ const MAX_LOOKBACK: usize = 64;
 /// Color of the topmost note sounding at `tick`, using the same bounded lookup as
 /// the roll rasterizer. A sustained note can keep millions of already-ended notes
 /// behind it in the queue, so an unbounded scan here would stall the render loop.
-pub(crate) fn sounding_color_at(notes: &VecDeque<RollNote>, tick: u32) -> Option<u16> {
-    let prefix = first_note_above(notes, tick);
-    for n in notes.range(..prefix).rev().take(MAX_LOOKBACK) {
+fn sounding_color_at_bucket(b: &KeyBucket, tick: u32) -> Option<u16> {
+    let prefix = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, tick);
+    for k in 0..MAX_LOOKBACK.min(prefix) {
+        let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, prefix - 1 - k);
         if n.end_tick > tick {
             return Some(n.color);
         }
     }
 
     if prefix > MAX_LOOKBACK {
-        for n in notes.range(..prefix.min(MAX_LOOKBACK)).rev() {
+        for i in (0..MAX_LOOKBACK).rev() {
+            let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, i);
             if n.end_tick > tick {
                 return Some(n.color);
             }
         }
     }
     None
+}
+
+impl KeyBucket {
+    /// Color of the topmost note sounding at `tick`, for the keyboard highlight.
+    pub fn sounding_color_at(&self, tick: u32) -> Option<u16> {
+        sounding_color_at_bucket(self, tick)
+    }
 }
 
 /// Fill one key's column by asking each pixel which note it shows, rather than by
@@ -1040,15 +1221,18 @@ fn rasterize_column(
     current_tick: u32,
     effective_top: u32,
 ) {
-    let b = bucket.lock().unwrap();
-    if b.notes.is_empty() {
-        return;
-    }
+    // Clear the column before the empty-bucket fast path so a key that was active
+    // in the previous frame cannot leave stale pixels behind. Doing this here also
+    // avoids clearing every pixel globally and then clearing active columns again.
     for slot in col.iter_mut() {
         *slot = 0;
     }
     for slot in owner.iter_mut() {
         *slot = u32::MAX;
+    }
+    let b = bucket.lock().unwrap();
+    if b.notes.is_empty() && b.pinned_old.is_empty() && b.pinned_new.is_empty() {
+        return;
     }
 
     for r in 0..col.len() {
@@ -1060,7 +1244,7 @@ fn rasterize_column(
             continue;
         }
 
-        let prefix = first_note_above(&b.notes, t_hi);
+        let prefix = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, t_hi);
         if prefix == 0 {
             continue;
         }
@@ -1068,13 +1252,12 @@ fn rasterize_column(
         // Walk back from the newest note that could reach this row. Each one passed
         // over is a note that ended before the row starts, i.e. one that is genuinely
         // not here -- not one being covered up.
-        for (k, n) in b.notes.range(..prefix).rev().enumerate() {
-            if k >= MAX_LOOKBACK {
-                break;
-            }
+        for k in 0..MAX_LOOKBACK.min(prefix) {
+            let index = prefix - 1 - k;
+            let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, index);
             if n.end_tick >= t_lo {
                 col[r] = pack(get_note_color_by_index(n.color));
-                owner[r] = (prefix - 1 - k) as u32;
+                owner[r] = index as u32;
                 break;
             }
         }
@@ -1088,7 +1271,8 @@ fn rasterize_column(
         // turning a dense rest into an unbounded scan on every pixel.
         if owner[r] == u32::MAX && prefix > MAX_LOOKBACK {
             let oldest_end = prefix.min(MAX_LOOKBACK);
-            for (index, n) in b.notes.range(..oldest_end).enumerate().rev() {
+            for index in (0..oldest_end).rev() {
+                let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, index);
                 if n.end_tick >= t_lo {
                     col[r] = pack(get_note_color_by_index(n.color));
                     owner[r] = index as u32;
@@ -1149,101 +1333,107 @@ pub fn draw_piano_roll_chunk(
     // the rasterizer needs now that pixels look their note up instead of notes
     // painting themselves onto pixels. Both axis modes build it, so there is one path
     // rather than a closure per mode.
-    let mut row_tick = vec![0u32; height_px + 1];
-    let top_tick = if is_tick_based {
-        let division = (data.header.division as u32).max(1);
-        let span =
-            (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
-        for (r, slot) in row_tick.iter_mut().enumerate() {
-            let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
-            *slot = if r == height_px {
-                current_tick
-            } else {
-                current_tick.saturating_add((progress * span as f32) as u32)
-            };
-        }
-        current_tick.saturating_add(span)
-    } else {
-        let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
-        for (r, slot) in row_tick.iter_mut().enumerate() {
-            let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
-            let ns = if r == height_px {
-                playback_position_ns
-            } else {
-                playback_position_ns.saturating_add((progress * span_ns as f32) as u64)
-            };
-            *slot = ns_to_tick(data, ns);
-        }
-        ns_to_tick(data, playback_position_ns.saturating_add(span_ns))
-    };
-
-    // Reveal only up to the scan frontier; notes above it are not generated yet.
-    let effective_top = top_tick
-        .min(chunk.scan_frontier_tick.load(Ordering::SeqCst))
-        .max(current_tick);
-
-    let regions = get_keyboard_note_regions(area.width);
-
-    // All 128 columns, back to back. Packed color per pixel: 0 = empty, else
-    // (1<<24) | rgb. `owners` runs alongside so the emit pass can separate two
-    // touching notes that happen to share a colour.
-    let mut cols: Vec<u32> = vec![0u32; 128 * height_px];
-    let mut owners: Vec<u32> = vec![u32::MAX; 128 * height_px];
-
-    // This is only 128 * window-height pixels. Spawning a full set of scoped OS
-    // threads every frame cost more than the rasterization itself, caused scheduler
-    // spikes, and made every thread reserve a stack. Keep the hot path on the render
-    // thread; the expensive MIDI scan remains on its persistent worker.
-    for (key, (col, own)) in cols
-        .chunks_mut(height_px)
-        .zip(owners.chunks_mut(height_px))
-        .enumerate()
-    {
-        rasterize_column(
-            &chunk.notes_by_key[key],
-            col,
-            own,
-            &row_tick,
-            current_tick,
-            effective_top,
-        );
-    }
-
-    // Emit one rectangle per contiguous same-color run.
-    //
-    // The left and right edges are drawn per run rather than per note: every note on
-    // a key spans the key's full width, so those two edges are the same two columns
-    // of pixels for all of them.
-    // White-key regions overlap the neighbouring black-key regions. MIDI note order
-    // alternates between them, so a single ascending pass lets the next white key
-    // paint over the preceding black key. Match a physical keyboard's z-order:
-    // render every white-key column first, then all black-key columns on top.
-    for black_pass in [false, true] {
-        for (note, col) in cols.chunks(height_px).enumerate() {
-            if is_black_key(note as u8) != black_pass {
-                continue;
+    DRAW_SCRATCH.with(|scratch_cell| {
+        let mut scratch = scratch_cell.borrow_mut();
+        let pixel_count = 128 * height_px;
+        scratch.row_tick.resize(height_px + 1, 0);
+        scratch.cols.resize(pixel_count, 0);
+        scratch.owners.resize(pixel_count, u32::MAX);
+        let DrawScratch { row_tick, cols, owners } = &mut *scratch;
+        row_tick.fill(0);
+        let top_tick = if is_tick_based {
+            let division = (data.header.division as u32).max(1);
+            let span =
+                (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
+            for (r, slot) in row_tick.iter_mut().enumerate() {
+                let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
+                *slot = if r == height_px {
+                    current_tick
+                } else {
+                    current_tick.saturating_add((progress * span as f32) as u32)
+                };
             }
-            let (rx, rw) = regions[note];
-            let x = area.x + rx;
-            let mut yy = 0usize;
-            while yy < height_px {
-                let p = col[yy];
-                if p == 0 {
-                    yy += 1;
+            current_tick.saturating_add(span)
+        } else {
+            let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
+            for (r, slot) in row_tick.iter_mut().enumerate() {
+                let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
+                let ns = if r == height_px {
+                    playback_position_ns
+                } else {
+                    playback_position_ns.saturating_add((progress * span_ns as f32) as u64)
+                };
+                *slot = ns_to_tick(data, ns);
+            }
+            ns_to_tick(data, playback_position_ns.saturating_add(span_ns))
+        };
+
+        // Reveal only up to the scan frontier; notes above it are not generated yet.
+        let effective_top = top_tick
+            .min(chunk.scan_frontier_tick.load(Ordering::SeqCst))
+            .max(current_tick);
+
+        let regions = get_keyboard_note_regions(area.width);
+
+        // All 128 columns, back to back. Packed color per pixel: 0 = empty, else
+        // (1<<24) | rgb. `owners` runs alongside so the emit pass can separate two
+        // touching notes that happen to share a colour.
+
+        // This is only 128 * window-height pixels. Spawning a full set of scoped OS
+        // threads every frame cost more than the rasterization itself, caused scheduler
+        // spikes, and made every thread reserve a stack. Keep the hot path on the render
+        // thread; the expensive MIDI scan remains on its persistent worker.
+        for (key, (col, own)) in cols
+            .chunks_mut(height_px)
+            .zip(owners.chunks_mut(height_px))
+            .enumerate()
+        {
+            rasterize_column(
+                &chunk.notes_by_key[key],
+                col,
+                own,
+                &row_tick,
+                current_tick,
+                effective_top,
+            );
+        }
+
+        // Emit one rectangle per contiguous same-color run.
+        //
+        // The left and right edges are drawn per run rather than per note: every note on
+        // a key spans the key's full width, so those two edges are the same two columns
+        // of pixels for all of them.
+        // White-key regions overlap the neighbouring black-key regions. MIDI note order
+        // alternates between them, so a single ascending pass lets the next white key
+        // paint over the preceding black key. Match a physical keyboard's z-order:
+        // render every white-key column first, then all black-key columns on top.
+        for black_pass in [false, true] {
+            for (note, col) in cols.chunks(height_px).enumerate() {
+                if is_black_key(note as u8) != black_pass {
                     continue;
                 }
-                let run_start = yy;
-                while yy < height_px && col[yy] == p {
-                    yy += 1;
+                let (rx, rw) = regions[note];
+                let x = area.x + rx;
+                let mut yy = 0usize;
+                while yy < height_px {
+                    let p = col[yy];
+                    if p == 0 {
+                        yy += 1;
+                        continue;
+                    }
+                    let run_start = yy;
+                    while yy < height_px && col[yy] == p {
+                        yy += 1;
+                    }
+                    let unpack = |v: u32| Color::new((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
+                    let y = top_y + run_start as f32;
+                    let h = (yy - run_start) as f32;
+                    d.draw_rectangle_rec(Rectangle::new(x, y, rw, h), unpack(p));
+                    let edge = unpack(darken(p));
+                    d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
+                    d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
                 }
-                let unpack = |v: u32| Color::new((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
-                let y = top_y + run_start as f32;
-                let h = (yy - run_start) as f32;
-                d.draw_rectangle_rec(Rectangle::new(x, y, rw, h), unpack(p));
-                let edge = unpack(darken(p));
-                d.draw_rectangle_rec(Rectangle::new(x, y, 1.0, h), edge);
-                d.draw_rectangle_rec(Rectangle::new(x + rw - 1.0, y, 1.0, h), edge);
             }
         }
-    }
+    });
 }
