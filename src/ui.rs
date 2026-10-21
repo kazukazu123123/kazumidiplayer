@@ -1354,6 +1354,8 @@ pub fn draw_text_editor_overlay(
     let mut close_clicked = false;
     let mut apply_clicked = false;
 
+    let shift =
+        d.is_key_down(KeyboardKey::KEY_LEFT_SHIFT) || d.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
     let mut d2d = d.begin_mode2D(camera);
 
     let bg_color = Color::new(45, 45, 48, (255.0 * eased_t) as u8);
@@ -1395,6 +1397,7 @@ pub fn draw_text_editor_overlay(
             click: editor_click,
             down: is_mouse_down,
             wheel: mouse_wheel,
+            shift,
         },
         eased_t,
         Some(&DEMO_HIGHLIGHTER),

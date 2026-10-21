@@ -763,10 +763,9 @@ fn main() {
         }
 
         if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
-            let keys = ui_components::text_editor::TextEditorKeys::poll(&mut rl);
             // First Escape drops the editor's focus, the next one closes the overlay.
-            let focus_dropped = app_state.text_editor.handle_keys(&keys, dt);
-            if keys.escape && !focus_dropped {
+            let focus_dropped = app_state.text_editor.update(&mut rl, dt);
+            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) && !focus_dropped {
                 app_state.overlay_manager.close();
             }
         }
