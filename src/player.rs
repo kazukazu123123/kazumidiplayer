@@ -5,10 +5,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::audio_engine::OutputStream;
 use crate::kazumidiparser_cursor::{
     TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, tick_to_ns,
 };
-use crate::kdmapi::KDMAPIStream;
 use crate::midi_parser_worker::{MIDIParserWorker, ParserCommand, ParserFeedbackCommand};
 use crate::utils::lock_mutex;
 
@@ -40,6 +40,8 @@ pub enum PlayerCommand {
     SetLegacyMidiOutput(bool),
     SetSpeed(f32),
     SetParseThreads(u32),
+    /// Replace the output (audio engine switch).
+    SetOutput(Option<OutputStream>),
 }
 
 pub enum PlayerFeedback {
@@ -72,7 +74,7 @@ struct BufferedMidiEvent {
 #[allow(clippy::too_many_arguments)]
 fn dispatch_midi_event(
     event: BufferedMidiEvent,
-    stream: Option<&mut KDMAPIStream>,
+    stream: Option<&mut OutputStream>,
     channel_rpn_msb: &mut [u8; 16],
     channel_rpn_lsb: &mut [u8; 16],
     channel_pitch_bend_range: &mut [f32; 16],
@@ -182,7 +184,7 @@ impl PlayerHandle {
     pub fn spawn(
         rx_main: Receiver<PlayerCommand>,
         tx_main_feedback: Sender<PlayerFeedback>,
-        kdmapi: Option<KDMAPIStream>,
+        kdmapi: Option<OutputStream>,
     ) -> Self {
         let state = Arc::new(AtomicU32::new(PlayerState::Stopped as u32));
         let position_ns = Arc::new(AtomicU64::new(0));
@@ -421,6 +423,14 @@ impl PlayerHandle {
                         }
                         PlayerCommand::SetParseThreads(threads) => {
                             parser_worker_for_thread.set_threads(threads);
+                        }
+                        PlayerCommand::SetOutput(stream) => {
+                            // Silence the old output, then bring the new one to the
+                            // same neutral state a seek would leave behind.
+                            midi_ev_fifo.clear();
+                            player.send_all_notes_off();
+                            player.stream = stream;
+                            player.reset_playback_state();
                         }
                     }
                 }
@@ -870,6 +880,10 @@ impl PlayerHandle {
         let _ = self.tx_command.send(PlayerCommand::SetSpeed(speed));
     }
 
+    pub fn set_output(&self, stream: Option<OutputStream>) {
+        let _ = self.tx_command.send(PlayerCommand::SetOutput(stream));
+    }
+
     /// Takes effect on the next load; a parse already in flight keeps its count.
     pub fn set_parse_threads(&self, threads: u32) {
         let _ = self
@@ -928,7 +942,7 @@ impl PlayerHandle {
 }
 
 pub struct MIDIPlayer {
-    pub stream: Option<KDMAPIStream>,
+    pub stream: Option<OutputStream>,
     pub data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
     pub state: PlayerState,
     pub seek_position_ns: u64,
@@ -1014,7 +1028,7 @@ impl MIDIPlayer {
     }
 
     pub fn new(
-        kdmapi: Option<KDMAPIStream>,
+        kdmapi: Option<OutputStream>,
         pitch_bend_override: Arc<AtomicBool>,
         pitch_bend_multiplier: Arc<AtomicU8>,
         unlimited_output: Arc<AtomicBool>,
@@ -1108,7 +1122,7 @@ impl MIDIPlayer {
 }
 
 fn send_midi_event_with_override(
-    stream: Option<&mut KDMAPIStream>,
+    stream: Option<&mut OutputStream>,
     status: u8,
     p1: u8,
     p2: u8,

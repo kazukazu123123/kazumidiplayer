@@ -1,8 +1,6 @@
 use libloading::Library;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender, SyncSender};
-use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "windows")]
 const LIB_NAME: &str = "OmniMIDI.dll";
@@ -27,54 +25,25 @@ impl KDMAPIBinds {
         unsafe { (self.is_kdmapi_available)() }
     }
 
-    pub fn open_stream(&'static self) -> KDMAPIStream {
+    /// `None` if a previous stream is still open or initialization fails.
+    pub fn open_stream(&'static self) -> Option<KDMAPIStream> {
         if self
             .is_stream_open
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            panic!("KDMAPI stream is already open");
+            return None;
         }
-        // Safety: FFI call to OmniMIDI; panics if stream initialization fails.
+        // Safety: FFI call to OmniMIDI.
         let result = unsafe { (self.initialize_kdmapi_stream)() };
         if result == 0 {
             self.is_stream_open.store(false, Ordering::SeqCst);
-            panic!("Failed to initialize KDMAPI stream");
+            return None;
         }
-
-        let (tx, rx) = mpsc::channel();
-        let generation = Arc::new(AtomicU64::new(0));
-        let worker_generation = generation.clone();
-        thread::spawn(move || {
-            while let Ok(command) = rx.recv() {
-                match command {
-                    KDMAPICommand::Data(data, event_generation) => {
-                        // A file load advances the generation. Once a blocked FFI call
-                        // returns, discard all output still queued for the old file.
-                        if event_generation == worker_generation.load(Ordering::Acquire) {
-                            // Safety: direct sends wait for a Flush before using the
-                            // stream, so they cannot overlap this worker's FFI calls.
-                            unsafe { (self.send_direct_data)(data) };
-                        }
-                    }
-                    KDMAPICommand::Flush(completion) => {
-                        let _ = completion.send(());
-                    }
-                    KDMAPICommand::Shutdown => break,
-                }
-            }
-            // Safety: dropping the stream excludes direct callers, and this
-            // worker has finished all queued FFI calls before terminating it.
-            unsafe { (self.terminate_kdmapi_stream)() };
-            self.is_stream_open.store(false, Ordering::SeqCst);
-        });
-
-        KDMAPIStream {
-            tx,
-            generation,
+        Some(KDMAPIStream {
             binds: self,
-            queued_output: AtomicBool::new(false),
-        }
+            closed: false,
+        })
     }
 }
 
@@ -107,55 +76,31 @@ fn load_kdmapi_binds(lib: &Library) -> Option<KDMAPIBinds> {
     })
 }
 
-enum KDMAPICommand {
-    Data(u32, u64),
-    Flush(SyncSender<()>),
-    Shutdown,
-}
-
+/// An open OmniMIDI stream. Only one exists at a time.
 pub struct KDMAPIStream {
-    tx: Sender<KDMAPICommand>,
-    generation: Arc<AtomicU64>,
     binds: &'static KDMAPIBinds,
-    queued_output: AtomicBool,
+    closed: bool,
 }
 
 impl KDMAPIStream {
-    /// Queue output without letting a blocked OmniMIDI call stall playback or loading.
-    pub fn send_direct_data(&self, data: u32) -> u32 {
-        let generation = self.generation.load(Ordering::Acquire);
-        self.queued_output.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(KDMAPICommand::Data(data, generation));
-        0
-    }
-
-    /// Call OmniMIDI on the caller's thread, draining earlier queued sends first.
-    /// Exclusive access prevents new queued sends until this FFI call returns.
-    pub fn send_direct_data_blocking(&mut self, data: u32) -> u32 {
-        if *self.queued_output.get_mut() {
-            let (tx_completion, rx_completion) = mpsc::sync_channel(0);
-            if self.tx.send(KDMAPICommand::Flush(tx_completion)).is_err()
-                || rx_completion.recv().is_err()
-            {
-                return 0;
-            }
-            *self.queued_output.get_mut() = false;
-        }
-        // Safety: Flush acknowledges completion of all earlier worker FFI calls.
-        // The exclusive borrow prevents further submissions or stream shutdown.
+    pub fn send(&mut self, data: u32) -> u32 {
+        // Safety: FFI call to an initialized stream; `&mut` excludes overlap.
         unsafe { (self.binds.send_direct_data)(data) }
     }
 
-    /// Make output already queued for the previous file obsolete.
-    pub fn invalidate_pending(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+    pub fn close(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        // Safety: `&mut` guarantees no send is in progress.
+        unsafe { (self.binds.terminate_kdmapi_stream)() };
+        self.binds.is_stream_open.store(false, Ordering::SeqCst);
     }
 }
 
 impl Drop for KDMAPIStream {
     fn drop(&mut self) {
-        // Never wait here: OmniMIDI may currently be stuck inside SendDirectData.
-        let _ = self.tx.send(KDMAPICommand::Shutdown);
+        self.close();
     }
 }
 
@@ -178,8 +123,10 @@ pub fn get_kdmapi() -> Option<&'static KDMAPIBinds> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_engine::{AudioEngine, OutputStream};
+    use std::sync::mpsc::{self, Sender};
     use std::sync::{Mutex, MutexGuard};
-    use std::thread::ThreadId;
+    use std::thread::{self, ThreadId};
     use std::time::{Duration, Instant};
 
     const BLOCKED_MESSAGE: u32 = 0xFFFF_FFFF;
@@ -238,8 +185,26 @@ mod tests {
         data ^ RESULT_MASK
     }
 
+    struct MockEngine(KDMAPIStream);
+
+    impl AudioEngine for MockEngine {
+        const LABEL: &'static str = "mock";
+
+        fn open() -> Result<Self, String> {
+            MOCK_BINDS.open_stream().map(Self).ok_or_else(|| "busy".into())
+        }
+
+        fn send_midi_event(&mut self, data: u32) -> u32 {
+            self.0.send(data)
+        }
+
+        fn close(&mut self) {
+            self.0.close();
+        }
+    }
+
     struct TestStream {
-        stream: Option<KDMAPIStream>,
+        stream: Option<OutputStream>,
         calls: mpsc::Receiver<Call>,
         release: Option<Sender<()>>,
         _guard: MutexGuard<'static, ()>,
@@ -255,7 +220,12 @@ mod tests {
                 release: Some(rx_release),
             });
             Self {
-                stream: Some(MOCK_BINDS.open_stream()),
+                stream: Some(
+                    OutputStream::open_engine::<MockEngine>()
+                        .recv_timeout(TIMEOUT)
+                        .unwrap()
+                        .unwrap(),
+                ),
                 calls,
                 release: Some(release),
                 _guard: guard,

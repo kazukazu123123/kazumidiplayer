@@ -192,13 +192,11 @@ fn main() {
     let (tx_commands_to_player, rx_commands_from_main) = mpsc::channel::<PlayerCommand>();
     let (tx_feedback_to_main, rx_feedback_from_player) = mpsc::channel::<PlayerFeedback>();
 
-    let audio_engine = audio_engine::AudioEngine::from_index(app_state.audio_engine);
-    let stream = audio_engine.open();
-    if stream.is_none() {
-        eprintln!("[WARN] {audio_engine:?} is not available. Running without audio output.");
-        app_state.kdmapi_missing = true;
-    }
-    let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, stream);
+    // The output arrives asynchronously (an engine may take a while to open);
+    // until then the player runs silent.
+    let startup_audio_engine = audio_engine::EngineSelection::from_index(app_state.audio_engine);
+    let mut pending_audio_engine = Some((startup_audio_engine, startup_audio_engine.start()));
+    let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, None);
 
     let mut render_texture = rl
         .load_render_texture(
@@ -332,6 +330,36 @@ fn main() {
             let dropped_files = rl.load_dropped_files();
             if let Some(path) = dropped_files.paths().first() {
                 app_state.handle_file_drop(path, &tx_commands_to_player);
+            }
+        }
+
+        if let Some((audio_engine, rx)) = &pending_audio_engine {
+            match rx.try_recv() {
+                Ok(Ok(stream)) => {
+                    engine.set_output(Some(stream));
+                    if app_state.audio_banner.is_some() {
+                        app_state.audio_banner =
+                            Some((format!("{} ready", audio_engine.label()), false));
+                        app_state.audio_banner_timer = 0.0;
+                    }
+                    pending_audio_engine = None;
+                }
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "[WARN] {}: {e}. Audio output unchanged.",
+                        audio_engine.label()
+                    );
+                    app_state.audio_banner = Some((format!("{}: {e}", audio_engine.label()), true));
+                    app_state.audio_banner_timer = 0.0;
+                    pending_audio_engine = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Keep a loading banner up until the result arrives.
+                    if matches!(app_state.audio_banner, Some((_, false))) {
+                        app_state.audio_banner_timer = 0.0;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => pending_audio_engine = None,
             }
         }
 
@@ -1581,6 +1609,7 @@ fn main() {
                         let prev_midi_ev_buffer_size = app_state.midi_ev_buffer_size;
                         let prev_midi_ev_mode = app_state.midi_ev_mode;
                         let prev_parse_threads = app_state.parse_threads;
+                        let prev_audio_engine = app_state.audio_engine;
                         if ui::draw_settings_overlay(
                             d,
                             screen_width,
@@ -1656,6 +1685,16 @@ fn main() {
                         if app_state.parse_threads != prev_parse_threads {
                             engine.set_parse_threads(app_state.parse_threads);
                         }
+                        if app_state.audio_engine != prev_audio_engine {
+                            let selected =
+                                audio_engine::EngineSelection::from_index(app_state.audio_engine);
+                            // Replacing a pending load drops it; the current output keeps
+                            // playing until the new one is ready.
+                            pending_audio_engine = Some((selected, selected.start()));
+                            app_state.audio_banner =
+                                Some((format!("Loading {}...", selected.label()), false));
+                            app_state.audio_banner_timer = 0.0;
+                        }
 
                         window_manager.set_window_visible(
                             piano_keyboard_window_handle,
@@ -1727,13 +1766,15 @@ fn main() {
             );
         }
 
-        if app_state.kdmapi_missing {
-            app_state.kdmapi_missing_timer += dt;
-            ui::draw_kdmapi_missing_banner(
+        if let Some((message, is_error)) = &app_state.audio_banner {
+            app_state.audio_banner_timer += dt;
+            ui::draw_audio_banner(
                 &mut d,
                 screen_width,
                 screen_height,
-                app_state.kdmapi_missing_timer,
+                app_state.audio_banner_timer,
+                message,
+                *is_error,
             );
         }
 

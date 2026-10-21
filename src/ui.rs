@@ -283,14 +283,16 @@ pub fn draw_player_crashed_overlay(
     );
 }
 
-/// Non-blocking banner drawn when OmniMIDI / KDMAPI was not found.
-/// Fades out after 5 seconds. Unlike the PlayerCrashed overlay the UI stays
-/// fully interactive.
-pub fn draw_kdmapi_missing_banner(
+/// Non-blocking audio engine status banner (loading, ready, or failure such as
+/// OmniMIDI / KDMAPI not found). Fades out after 5 seconds. Unlike the
+/// PlayerCrashed overlay the UI stays fully interactive.
+pub fn draw_audio_banner(
     d: &mut RaylibDrawHandle,
     screen_width: i32,
     _screen_height: i32,
     timer: f32,
+    message: &str,
+    is_error: bool,
 ) {
     const DURATION: f32 = 5.0;
     const FADE: f32 = 0.8;
@@ -303,14 +305,19 @@ pub fn draw_kdmapi_missing_banner(
     if alpha == 0 {
         return;
     }
-    d.draw_rectangle(0, 0, screen_width, 28, Color::new(60, 30, 30, alpha));
-    d.draw_text(
-        "KDMAPI (OmniMIDI) not found, audio output disabled",
-        16,
-        6,
-        16,
-        Color::new(255, 180, 180, alpha),
-    );
+    let (bg, fg) = if is_error {
+        (
+            Color::new(60, 30, 30, alpha),
+            Color::new(255, 180, 180, alpha),
+        )
+    } else {
+        (
+            Color::new(30, 45, 60, alpha),
+            Color::new(180, 215, 255, alpha),
+        )
+    };
+    d.draw_rectangle(0, 0, screen_width, 28, bg);
+    d.draw_text(message, 16, 6, 16, fg);
 }
 
 /// `camera` decides where and at what scale it lands.
@@ -923,7 +930,7 @@ pub fn draw_settings_overlay(
                     &mut d_scissor,
                     combo_rect,
                     "Audio Engine",
-                    &crate::audio_engine::AudioEngine::LABELS,
+                    &crate::audio_engine::EngineSelection::LABELS,
                     audio_engine,
                     audio_engine_combo,
                     click_pos,
@@ -940,7 +947,7 @@ pub fn draw_settings_overlay(
                         header.x,
                         header.y + header.height,
                         header.width,
-                        28.0 * crate::audio_engine::AudioEngine::LABELS.len() as f32,
+                        28.0 * crate::audio_engine::EngineSelection::LABELS.len() as f32,
                     );
                     if header.check_collision_point_rec(click)
                         || (was_open && popup.check_collision_point_rec(click))
@@ -1354,7 +1361,7 @@ pub fn draw_settings_overlay(
                 draw_combo_box_popup(
                     &mut d_scissor,
                     combo_rect,
-                    &crate::audio_engine::AudioEngine::LABELS,
+                    &crate::audio_engine::EngineSelection::LABELS,
                     audio_engine_combo,
                     mouse_world_pos,
                     eased_t,
