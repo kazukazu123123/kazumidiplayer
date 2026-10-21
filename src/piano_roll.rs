@@ -383,45 +383,6 @@ impl PianoRollWorker {
         self.target_tick.store(tick, Ordering::Relaxed);
     }
 
-    /// Notes currently resident in the window, and the bytes their queues occupy
-    /// (allocated capacity, not just the used part). For the stats panel: this is
-    /// the piano roll's share of the heap, to be compared against the total.
-    pub fn resident_stats(&self) -> (usize, usize) {
-        let guard = self.acquire_live();
-        let note_bytes = std::mem::size_of::<RollNote>();
-        let mut notes = 0usize;
-        let mut bytes = 0usize;
-        for slot in guard.chunk.notes_by_key.iter() {
-            let b = slot.lock().unwrap();
-            notes += b.notes.len() + b.pinned_old.len() + b.pinned_new.len();
-            bytes += b.notes.capacity() * note_bytes
-                + (b.pinned_old.capacity() + b.pinned_new.capacity())
-                    * std::mem::size_of::<PinnedNote>();
-        }
-        (notes, bytes)
-    }
-
-    /// Approximate resident note storage across both double-buffered chunks.
-    /// Unlike `resident_stats`, this includes the build chunk while a seek/scan is
-    /// in progress, which is important when comparing the roll's allocation with
-    /// process RSS on very dense MIDI files. It excludes scan staging, parser-owned
-    /// MIDI data, hash-map allocations, allocator metadata, and draw-thread scratch.
-    pub fn resident_stats_all_chunks(&self) -> (usize, usize) {
-        let note_bytes = std::mem::size_of::<RollNote>();
-        let pinned_bytes = std::mem::size_of::<PinnedNote>();
-        let mut notes = 0usize;
-        let mut bytes = 0usize;
-        for chunk in &self.chunks {
-            for slot in chunk.notes_by_key.iter() {
-                let b = slot.lock().unwrap();
-                notes += b.notes.len() + b.pinned_old.len() + b.pinned_new.len();
-                bytes += b.notes.capacity() * note_bytes
-                    + (b.pinned_old.capacity() + b.pinned_new.capacity()) * pinned_bytes;
-            }
-        }
-        (notes, bytes)
-    }
-
     /// Drop notes that playback has passed, freeing the memory behind the window.
     /// Notes that started in the past and are still sounding are moved to `pinned`
     /// instead of being left in the queue where they would stop every later note
