@@ -191,7 +191,10 @@ mod tests {
         const LABEL: &'static str = "mock";
 
         fn open() -> Result<Self, String> {
-            MOCK_BINDS.open_stream().map(Self).ok_or_else(|| "busy".into())
+            MOCK_BINDS
+                .open_stream()
+                .map(Self)
+                .ok_or_else(|| "busy".into())
         }
 
         fn send_midi_event(&mut self, data: u32) -> u32 {

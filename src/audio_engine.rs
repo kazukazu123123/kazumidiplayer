@@ -89,7 +89,11 @@ impl EngineSelection {
     };
 
     pub fn from_index(index: usize) -> Self {
-        if index < ENGINE_COUNT { Self(index) } else { Self::default() }
+        if index < ENGINE_COUNT {
+            Self(index)
+        } else {
+            Self::default()
+        }
     }
 
     pub fn label(self) -> &'static str {

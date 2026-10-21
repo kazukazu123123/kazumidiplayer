@@ -89,7 +89,9 @@ pub(super) fn channel() -> (MidiSender, MidiReceiver) {
 
 impl MidiSender {
     pub fn send(&self, data: u32) {
-        let _ = self.tx.send((Message::Data(data), self.generation.current()));
+        let _ = self
+            .tx
+            .send((Message::Data(data), self.generation.current()));
     }
 
     /// Wait until the engine has taken everything queued so far.
