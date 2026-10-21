@@ -547,9 +547,9 @@ pub fn draw_settings_overlay(
     midi_ev_mode: &mut usize,
     midi_ev_mode_combo: &mut ComboBoxState,
     parse_threads: &mut u32,
-    parse_threads_slider_dragging: &mut bool,
+    parse_threads_slider: &mut NumericSliderState,
     scan_delay_ms: &mut u32,
-    scan_delay_slider_dragging: &mut bool,
+    scan_delay_slider: &mut NumericSliderState,
     show_stats: &mut bool,
     show_stats_animation: f32,
 ) -> bool {
@@ -612,41 +612,6 @@ pub fn draw_settings_overlay(
             self.max_bottom + bottom_padding
         }
     }
-    // Pre-calculate content height for scrollbar
-    let mut measure_layout = VerticalLayout::new(content_top, 5.0);
-    measure_layout.next(18.0);
-    measure_layout.next(30.0); // Tick Based Mode
-    measure_layout.next(30.0); // Beat Bounce
-    if *beat_bounce_enabled {
-        measure_layout.next(52.0); // Beat Bounce Amount
-        measure_layout.next(52.0); // Beat Bounce Note Value
-        measure_layout.next(30.0); // Beat Bounce Offbeat
-    }
-    measure_layout.next(30.0); // Shaking Window
-    measure_layout.next(30.0);
-    measure_layout.next(30.0);
-    measure_layout.next(30.0);
-    measure_layout.next(30.0);
-    measure_layout.next(30.0);
-    measure_layout.next(52.0); // MIDI EV Buffer Size slider
-    measure_layout.next(52.0); // EV buffer mode combo box
-    measure_layout.next(30.0); // Pitch Bend OS Window Movement
-    if *pitch_bend_move_window_enabled {
-        for _ in 0..3 {
-            measure_layout.next(52.0);
-        }
-    }
-    if *pitch_bend_override {
-        measure_layout.next(52.0);
-    }
-    measure_layout.next(18.0); // "Parsing:" label
-    measure_layout.next(38.0); // Parse Threads slider
-    measure_layout.next(18.0); // "Statistics:" label
-    measure_layout.next(30.0); // Show Statistics toggle
-    measure_layout.next(38.0); // Scan Delay slider (debug)
-    let content_height = measure_layout.content_height(20.0);
-    let max_scroll = f32::max(content_height - viewport_height, 0.0);
-
     let mut layout = VerticalLayout::new(content_top, 5.0);
 
     {
@@ -682,42 +647,10 @@ pub fn draw_settings_overlay(
             None
         };
 
-        // Scroll with mouse wheel when hovering the panel content area. The numeric
-        // EV control owns the wheel while hovered for exact stepping.
+        // Wheel scrolling is applied after the controls are drawn, unless one of
+        // them (a numeric slider's value box) used the wheel itself.
         let scroll_area_rect = Rectangle::new(0.0, content_top, panel_rect.width, viewport_height);
-        let conditional_beat_height = if *beat_bounce_enabled { 149.0 } else { 0.0 };
-        let beat_amount_rect = Rectangle::new(20.0, 143.0 - *scroll_y, 275.0, 144.0);
-        let midi_ev_rect = Rectangle::new(
-            20.0,
-            283.0 + conditional_beat_height - *scroll_y,
-            275.0,
-            52.0,
-        );
-        if scroll_area_rect.check_collision_point_rec(mouse_world_pos)
-            && !midi_ev_rect.check_collision_point_rec(mouse_world_pos)
-            && !(*beat_bounce_enabled
-                && beat_amount_rect.check_collision_point_rec(mouse_world_pos))
-            && mouse_wheel != 0.0
-        {
-            let scroll_speed = 30.0;
-            *scroll_y = (*scroll_y - mouse_wheel * scroll_speed).clamp(0.0, max_scroll);
-        }
-
-        let track_rect = Rectangle::new(panel_rect.width - 14.0, content_top, 8.0, viewport_height);
-        draw_scrollbar(
-            &mut d2d,
-            track_rect,
-            content_height - content_top,
-            viewport_height,
-            scroll_y,
-            scrollbar_dragging,
-            scrollbar_drag_start_y,
-            scrollbar_drag_start_scroll,
-            mouse_world_pos,
-            click_pos,
-            is_mouse_down,
-            eased_t,
-        );
+        let mut wheel_consumed = false;
 
         let sy = |y: f32| y - *scroll_y;
 
@@ -804,7 +737,7 @@ pub fn draw_settings_overlay(
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
-                    draw_u32_numeric_slider(
+                    wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
                         Rectangle::new(20.0, sy(y), 275.0, 52.0),
                         "Beat Bounce Amount (%)",
@@ -833,7 +766,7 @@ pub fn draw_settings_overlay(
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
-                    draw_u32_numeric_slider(
+                    wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
                         Rectangle::new(20.0, sy(y), 275.0, 52.0),
                         "Beat Interval (1/N Note)",
@@ -1008,7 +941,7 @@ pub fn draw_settings_overlay(
                     } else {
                         "8192 (Fixed)"
                     };
-                    draw_u32_numeric_slider(
+                    wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
                         Rectangle::new(20.0, sy(y), 275.0, 52.0),
                         label,
@@ -1124,7 +1057,7 @@ pub fn draw_settings_overlay(
                             enter: numeric_enter,
                             escape: numeric_escape,
                         };
-                        draw_u32_numeric_slider(
+                        wheel_consumed |= draw_u32_numeric_slider(
                             &mut d_scissor,
                             Rectangle::new(20.0, sy(y), 275.0, 52.0),
                             label,
@@ -1182,7 +1115,7 @@ pub fn draw_settings_overlay(
                         escape: numeric_escape,
                     };
                     let mut multiplier = *pitch_bend_multiplier as u32;
-                    draw_u32_numeric_slider(
+                    wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
                         Rectangle::new(20.0, sy(y), 275.0, 52.0),
                         "PB Multiplier",
@@ -1214,62 +1147,33 @@ pub fn draw_settings_overlay(
 
             // Parse Threads slider: 1..=hardware threads. Applies to the next load.
             {
-                let max_threads = crate::app_state::cpu_threads();
-                let y = layout.next(38.0);
-                if is_visible(sy(y), 38.0) {
-                    *parse_threads = (*parse_threads).clamp(1, max_threads);
-                    let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
-                    let label = format!("Parse Threads: {} / {}", *parse_threads, max_threads);
-                    d_scissor.draw_text_ex(
-                        &font,
-                        &label,
-                        Vector2::new(slider_rect.x, sy(y)),
-                        16.0,
-                        1.0,
-                        text_color,
-                    );
-                    d_scissor.draw_rectangle(
-                        slider_rect.x as i32,
-                        (slider_rect.y + 8.0) as i32,
-                        slider_rect.width as i32,
-                        4,
-                        Color::new(80, 80, 80, (255.0 * eased_t) as u8),
-                    );
-                    // A single-core machine has no range to drag: pin the thumb at the end.
-                    let span = (max_threads - 1) as f32;
-                    let t = if span > 0.0 {
-                        ((*parse_threads - 1) as f32 / span).clamp(0.0, 1.0)
-                    } else {
-                        1.0
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
                     };
-                    let thumb_x = slider_rect.x + t * slider_rect.width;
-                    let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                    d_scissor.draw_rectangle_rec(
-                        thumb_rect,
-                        Color::new(0, 120, 215, (255.0 * eased_t) as u8),
+                    wheel_consumed |= draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "Parse Threads",
+                        parse_threads,
+                        1,
+                        crate::app_state::cpu_threads(),
+                        parse_threads_slider,
+                        &input,
+                        eased_t,
+                        true,
+                        None,
                     );
-
-                    if let Some(cp) = click_pos {
-                        if thumb_rect.check_collision_point_rec(cp)
-                            || slider_rect.check_collision_point_rec(cp)
-                        {
-                            *parse_threads_slider_dragging = true;
-                        }
-                    }
-
-                    if *parse_threads_slider_dragging {
-                        if is_mouse_down {
-                            if span > 0.0 {
-                                let clamped_x = mouse_world_pos
-                                    .x
-                                    .clamp(slider_rect.x, slider_rect.x + slider_rect.width);
-                                let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
-                                *parse_threads = (new_t * span).round() as u32 + 1;
-                            }
-                        } else {
-                            *parse_threads_slider_dragging = false;
-                        }
-                    }
                 }
             }
 
@@ -1305,54 +1209,34 @@ pub fn draw_settings_overlay(
             }
 
             // Scan Delay slider (debug): artificially slow the piano-roll scan.
-            const SCAN_DELAY_MAX: f32 = 1000.0; // milliseconds
             {
-                let y = layout.next(38.0);
-                if is_visible(sy(y), 38.0) {
-                    let slider_rect = Rectangle::new(20.0, sy(y) + 18.0, 200.0, 20.0);
-                    let label = format!("Scan Delay: {} ms", *scan_delay_ms);
-                    d_scissor.draw_text_ex(
-                        &font,
-                        &label,
-                        Vector2::new(slider_rect.x, sy(y)),
-                        16.0,
-                        1.0,
-                        text_color,
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    wheel_consumed |= draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "Scan Delay (ms)",
+                        scan_delay_ms,
+                        0,
+                        1000,
+                        scan_delay_slider,
+                        &input,
+                        eased_t,
+                        true,
+                        None,
                     );
-                    d_scissor.draw_rectangle(
-                        slider_rect.x as i32,
-                        (slider_rect.y + 8.0) as i32,
-                        slider_rect.width as i32,
-                        4,
-                        Color::new(80, 80, 80, (255.0 * eased_t) as u8),
-                    );
-                    let t = (*scan_delay_ms as f32 / SCAN_DELAY_MAX).clamp(0.0, 1.0);
-                    let thumb_x = slider_rect.x + t * slider_rect.width;
-                    let thumb_rect = Rectangle::new(thumb_x - 6.0, slider_rect.y + 2.0, 12.0, 16.0);
-                    d_scissor.draw_rectangle_rec(
-                        thumb_rect,
-                        Color::new(0, 120, 215, (255.0 * eased_t) as u8),
-                    );
-
-                    if let Some(cp) = click_pos {
-                        if thumb_rect.check_collision_point_rec(cp)
-                            || slider_rect.check_collision_point_rec(cp)
-                        {
-                            *scan_delay_slider_dragging = true;
-                        }
-                    }
-
-                    if *scan_delay_slider_dragging {
-                        if is_mouse_down {
-                            let clamped_x = mouse_world_pos
-                                .x
-                                .clamp(slider_rect.x, slider_rect.x + slider_rect.width);
-                            let new_t = (clamped_x - slider_rect.x) / slider_rect.width;
-                            *scan_delay_ms = (new_t * SCAN_DELAY_MAX).round() as u32;
-                        } else {
-                            *scan_delay_slider_dragging = false;
-                        }
-                    }
                 }
             }
 
@@ -1381,6 +1265,37 @@ pub fn draw_settings_overlay(
                     eased_t,
                 );
             }
+        }
+
+        // Measured from what was just laid out, so the scroll range always
+        // matches the controls actually drawn.
+        // `layout` starts at `content_top`, so its bottom includes that offset.
+        let content_height = layout.content_height(20.0) - content_top;
+        let max_scroll = f32::max(content_height - viewport_height, 0.0);
+        *scroll_y = (*scroll_y).clamp(0.0, max_scroll);
+
+        let track_rect = Rectangle::new(panel_rect.width - 14.0, content_top, 8.0, viewport_height);
+        draw_scrollbar(
+            &mut d2d,
+            track_rect,
+            content_height,
+            viewport_height,
+            scroll_y,
+            scrollbar_dragging,
+            scrollbar_drag_start_y,
+            scrollbar_drag_start_scroll,
+            mouse_world_pos,
+            click_pos,
+            is_mouse_down,
+            eased_t,
+        );
+
+        if !wheel_consumed
+            && mouse_wheel != 0.0
+            && scroll_area_rect.check_collision_point_rec(mouse_world_pos)
+        {
+            let scroll_speed = 30.0;
+            *scroll_y = (*scroll_y - mouse_wheel * scroll_speed).clamp(0.0, max_scroll);
         }
 
         // Close button (fixed coordinates, outside scroll area)

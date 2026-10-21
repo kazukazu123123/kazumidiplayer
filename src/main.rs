@@ -1658,9 +1658,9 @@ fn main() {
                             &mut app_state.midi_ev_mode,
                             &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,
-                            &mut app_state.settings_parse_threads_slider_dragging,
+                            &mut app_state.settings_parse_threads_slider,
                             &mut app_state.scan_delay_ms,
-                            &mut app_state.settings_scan_delay_slider_dragging,
+                            &mut app_state.settings_scan_delay_slider,
                             &mut app_state.show_stats,
                             app_state.show_stats_animation,
                         ) {

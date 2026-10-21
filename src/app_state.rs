@@ -158,8 +158,8 @@ pub struct AppState {
         crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
-    pub settings_scan_delay_slider_dragging: bool,
-    pub settings_parse_threads_slider_dragging: bool,
+    pub settings_scan_delay_slider: crate::ui_components::numeric_slider::NumericSliderState,
+    pub settings_parse_threads_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub speed_slider_dragging: bool,
 
     // Editor
@@ -288,8 +288,8 @@ impl AppState {
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
-            settings_scan_delay_slider_dragging: false,
-            settings_parse_threads_slider_dragging: false,
+            settings_scan_delay_slider: Default::default(),
+            settings_parse_threads_slider: Default::default(),
             speed_slider_dragging: false,
 
             // Editor
