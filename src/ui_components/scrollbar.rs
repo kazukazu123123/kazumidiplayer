@@ -72,22 +72,12 @@ pub fn draw_scrollbar(
     }
 
     // Track
-    d.draw_rectangle(
-        track_rect.x as i32,
-        track_rect.y as i32,
-        track_rect.width as i32,
-        track_rect.height as i32,
-        Color::new(60, 60, 60, (200.0 * alpha) as u8),
-    );
+    // Float rects: truncating y and height separately left the thumb up to
+    // 1px short of the track's bottom when scrolled to the end.
+    d.draw_rectangle_rec(track_rect, Color::new(60, 60, 60, (200.0 * alpha) as u8));
 
     // Thumb
-    d.draw_rectangle(
-        thumb_rect.x as i32,
-        thumb_rect.y as i32,
-        thumb_rect.width as i32,
-        thumb_rect.height as i32,
-        Color::new(120, 120, 120, (230.0 * alpha) as u8),
-    );
+    d.draw_rectangle_rec(thumb_rect, Color::new(120, 120, 120, (230.0 * alpha) as u8));
 
     interacted
 }
