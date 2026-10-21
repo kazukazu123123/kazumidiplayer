@@ -22,74 +22,6 @@ use std::sync::mpsc;
 
 use crate::window_manager::WindowManager;
 
-fn insert_char_at(text: &mut String, char_pos: usize, c: char) {
-    let byte_pos = text
-        .char_indices()
-        .nth(char_pos)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    text.insert(byte_pos, c);
-}
-
-fn remove_char_at(text: &mut String, char_pos: usize) {
-    if let Some((byte_pos, c)) = text.char_indices().nth(char_pos) {
-        let char_len = c.len_utf8();
-        text.drain(byte_pos..byte_pos + char_len);
-    }
-}
-
-fn move_cursor_up(text: &str, cursor_pos: usize) -> usize {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut char_count = 0;
-    let mut current_row = 0;
-    let mut current_col = 0;
-    for (row_idx, line) in lines.iter().enumerate() {
-        let line_len = line.chars().count();
-        if cursor_pos >= char_count && cursor_pos <= char_count + line_len {
-            current_row = row_idx;
-            current_col = cursor_pos - char_count;
-            break;
-        }
-        char_count += line_len + 1;
-    }
-    if current_row == 0 {
-        return 0;
-    }
-    let mut new_pos = 0;
-    for i in 0..current_row - 1 {
-        new_pos += lines[i].chars().count() + 1;
-    }
-    let prev_line_len = lines[current_row - 1].chars().count();
-    new_pos += current_col.min(prev_line_len);
-    new_pos
-}
-
-fn move_cursor_down(text: &str, cursor_pos: usize) -> usize {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut char_count = 0;
-    let mut current_row = 0;
-    let mut current_col = 0;
-    for (row_idx, line) in lines.iter().enumerate() {
-        let line_len = line.chars().count();
-        if cursor_pos >= char_count && cursor_pos <= char_count + line_len {
-            current_row = row_idx;
-            current_col = cursor_pos - char_count;
-            break;
-        }
-        char_count += line_len + 1;
-    }
-    if current_row + 1 >= lines.len() {
-        return text.chars().count();
-    }
-    let mut new_pos = 0;
-    for i in 0..current_row + 1 {
-        new_pos += lines[i].chars().count() + 1;
-    }
-    let next_line_len = lines[current_row + 1].chars().count();
-    new_pos += current_col.min(next_line_len);
-    new_pos
-}
-
 // Format an integer with comma thousands separators (e.g. 1204880 -> "1,204,880").
 fn group_thousands(n: u64) -> String {
     let s = n.to_string();
@@ -804,7 +736,7 @@ fn main() {
             } else if !app_state.overlay_manager.blocks_input() {
                 let text_editor_focused = app_state.overlay_manager.current_kind()
                     == Some(app_state::AppOverlay::TextEditor)
-                    && app_state.editor_focused;
+                    && app_state.text_editor.focused;
                 if !text_editor_focused {
                     app_state.settings_scroll_y = 0.0;
                     app_state.settings_scrollbar_dragging = false;
@@ -818,73 +750,25 @@ fn main() {
 
         if rl.is_key_pressed(KeyboardKey::KEY_P) && !flip_3d.is_active() {
             if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
-                if !app_state.editor_focused {
+                if !app_state.text_editor.focused {
                     app_state.overlay_manager.close();
                 }
             } else if !app_state.overlay_manager.blocks_input() {
                 app_state
                     .overlay_manager
                     .open(app_state::AppOverlay::TextEditor);
-                app_state.editor_focused = false;
-                app_state.editor_cursor_pos = app_state.editor_text.chars().count();
-                app_state.editor_cursor_visible = true;
-                app_state.editor_cursor_blink_timer = 0.0;
+                app_state.text_editor.reset_interaction();
                 window_manager.mouse_up(mouse_point);
             }
         }
 
-        if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-            if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
+        if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
+            let keys = ui_components::text_editor::TextEditorKeys::poll(&mut rl);
+            // First Escape drops the editor's focus, the next one closes the overlay.
+            let focus_dropped = app_state.text_editor.handle_keys(&keys, dt);
+            if keys.escape && !focus_dropped {
                 app_state.overlay_manager.close();
             }
-        }
-
-        // Text input for text editor overlay
-        if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor)
-            && app_state.editor_focused
-        {
-            while let Some(key) = rl.get_char_pressed() {
-                insert_char_at(&mut app_state.editor_text, app_state.editor_cursor_pos, key);
-                app_state.editor_cursor_pos += 1;
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) {
-                if app_state.editor_cursor_pos > 0 {
-                    remove_char_at(&mut app_state.editor_text, app_state.editor_cursor_pos - 1);
-                    app_state.editor_cursor_pos -= 1;
-                }
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
-                insert_char_at(
-                    &mut app_state.editor_text,
-                    app_state.editor_cursor_pos,
-                    '\n',
-                );
-                app_state.editor_cursor_pos += 1;
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_LEFT) {
-                app_state.editor_cursor_pos = app_state.editor_cursor_pos.saturating_sub(1);
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_RIGHT) {
-                let max_pos = app_state.editor_text.chars().count();
-                app_state.editor_cursor_pos = (app_state.editor_cursor_pos + 1).min(max_pos);
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_UP) {
-                app_state.editor_cursor_pos =
-                    move_cursor_up(&app_state.editor_text, app_state.editor_cursor_pos);
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_DOWN) {
-                app_state.editor_cursor_pos =
-                    move_cursor_down(&app_state.editor_text, app_state.editor_cursor_pos);
-            }
-
-            app_state.editor_cursor_blink_timer += dt;
-            if app_state.editor_cursor_blink_timer >= 0.5 {
-                app_state.editor_cursor_blink_timer -= 0.5;
-                app_state.editor_cursor_visible = !app_state.editor_cursor_visible;
-            }
-        } else {
-            app_state.editor_cursor_visible = true;
-            app_state.editor_cursor_blink_timer = 0.0;
         }
 
         // Drawing
@@ -1728,15 +1612,8 @@ fn main() {
                             app_state.last_input_event,
                             mouse_pos,
                             is_mouse_down,
-                            &app_state.editor_text,
-                            &mut app_state.editor_scroll_y,
-                            &mut app_state.editor_scrollbar_dragging,
-                            &mut app_state.editor_scrollbar_drag_start_y,
-                            &mut app_state.editor_scrollbar_drag_start_scroll,
                             wheel,
-                            &mut app_state.editor_focused,
-                            app_state.editor_cursor_pos,
-                            app_state.editor_cursor_visible,
+                            &mut app_state.text_editor,
                         );
                         if close {
                             close_requested = true;
@@ -1744,7 +1621,7 @@ fn main() {
                         if apply {
                             println!(
                                 "[TextEditor] Apply clicked. Content:\n{}",
-                                app_state.editor_text
+                                app_state.text_editor.text()
                             );
                         }
                     }

@@ -163,15 +163,7 @@ pub struct AppState {
     pub speed_slider_dragging: bool,
 
     // Editor
-    pub editor_text: String,
-    pub editor_scroll_y: f32,
-    pub editor_scrollbar_dragging: bool,
-    pub editor_scrollbar_drag_start_y: f32,
-    pub editor_scrollbar_drag_start_scroll: f32,
-    pub editor_focused: bool,
-    pub editor_cursor_pos: usize,
-    pub editor_cursor_blink_timer: f32,
-    pub editor_cursor_visible: bool,
+    pub text_editor: crate::ui_components::text_editor::TextEditorState,
 
     // Systems
     pub blur_requester: BlurRequester,
@@ -293,15 +285,7 @@ impl AppState {
             speed_slider_dragging: false,
 
             // Editor
-            editor_text: String::new(),
-            editor_scroll_y: 0.0,
-            editor_scrollbar_dragging: false,
-            editor_scrollbar_drag_start_y: 0.0,
-            editor_scrollbar_drag_start_scroll: 0.0,
-            editor_focused: false,
-            editor_cursor_pos: 0,
-            editor_cursor_blink_timer: 0.0,
-            editor_cursor_visible: true,
+            text_editor: Default::default(),
 
             // Systems
             blur_requester: BlurRequester::new(),

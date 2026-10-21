@@ -5,6 +5,9 @@ use crate::ui_components::numeric_slider::{
     NumericSliderInput, NumericSliderState, draw_u32_numeric_slider,
 };
 use crate::ui_components::scrollbar::draw_scrollbar;
+use crate::ui_components::text_editor::{
+    LineCommentHighlighter, TextEditorMouse, TextEditorState, draw_text_editor,
+};
 use crate::ui_components::toggle::draw_toggle;
 use crate::utils::{cubic_bezier, format_bytes, format_count, format_count_short, format_time};
 use crate::window_manager::InputEvent;
@@ -1329,15 +1332,8 @@ pub fn draw_text_editor_overlay(
     input_event: Option<InputEvent>,
     mouse_pos: Vector2,
     is_mouse_down: bool,
-    text: &str,
-    scroll_y: &mut f32,
-    scrollbar_dragging: &mut bool,
-    scrollbar_drag_start_y: &mut f32,
-    scrollbar_drag_start_scroll: &mut f32,
     mouse_wheel: f32,
-    focused: &mut bool,
-    cursor_pos: usize,
-    cursor_visible: bool,
+    editor: &mut TextEditorState,
 ) -> (bool, bool) {
     let eased_t = 1.0 - (1.0 - alpha_factor).powi(3);
     let scale = 0.95 + 0.05 * eased_t;
@@ -1355,200 +1351,88 @@ pub fn draw_text_editor_overlay(
     let border_color = Color::new(0, 135, 200, (255.0 * eased_t) as u8);
     let text_color = Color::new(240, 240, 240, (255.0 * eased_t) as u8);
 
-    let text_area_x = 20.0;
-    let text_area_y = 50.0;
-    let text_area_w = panel_w - 40.0;
-    let text_area_h = 250.0;
-    let line_height = 20.0;
-
-    let lines: Vec<&str> = text.split('\n').collect();
-    let content_height = (lines.len() as f32 * line_height) + 16.0;
-    let max_scroll: f32 = f32::max(content_height - text_area_h, 0.0);
-    *scroll_y = (*scroll_y).clamp(0.0, max_scroll);
-
     let mut close_clicked = false;
     let mut apply_clicked = false;
 
-    {
-        let mut d2d = d.begin_mode2D(camera);
+    let mut d2d = d.begin_mode2D(camera);
 
-        let bg_color = Color::new(45, 45, 48, (255.0 * eased_t) as u8);
-        d2d.draw_rectangle_rec(panel_rect, bg_color);
-        d2d.draw_rectangle_lines_ex(panel_rect, 1.0, border_color);
+    let bg_color = Color::new(45, 45, 48, (255.0 * eased_t) as u8);
+    d2d.draw_rectangle_rec(panel_rect, bg_color);
+    d2d.draw_rectangle_lines_ex(panel_rect, 1.0, border_color);
 
-        let font = d2d.get_font_default();
+    let font = d2d.get_font_default();
+    d2d.draw_text_ex(
+        &font,
+        "Text Editor",
+        Vector2::new(20.0, 20.0),
+        24.0,
+        1.0,
+        text_color,
+    );
 
-        // Title
-        d2d.draw_text_ex(
-            &font,
-            "Text Editor",
-            Vector2::new(20.0, 20.0),
-            24.0,
-            1.0,
-            text_color,
-        );
+    let to_world = |x: f32, y: f32| {
+        Vector2::new(
+            (x - camera.offset.x) / scale + camera.target.x,
+            (y - camera.offset.y) / scale + camera.target.y,
+        )
+    };
+    let mouse_world_pos = to_world(mouse_pos.x, mouse_pos.y);
+    let click_pos = match input_event {
+        Some(InputEvent::MouseDown(p)) => Some(to_world(p.x as f32, p.y as f32)),
+        _ => None,
+    };
 
-        let mouse_world_x = (mouse_pos.x - camera.offset.x) / scale + camera.target.x;
-        let mouse_world_y = (mouse_pos.y - camera.offset.y) / scale + camera.target.y;
-        let mouse_world_pos = Vector2::new(mouse_world_x, mouse_world_y);
+    // Clicks outside the panel leave focus alone, as before.
+    let editor_click = click_pos.filter(|p| panel_rect.check_collision_point_rec(*p));
+    draw_text_editor(
+        &mut d2d,
+        &camera,
+        &font,
+        Rectangle::new(20.0, 50.0, panel_w - 40.0, 250.0),
+        editor,
+        &TextEditorMouse {
+            pos: mouse_world_pos,
+            click: editor_click,
+            down: is_mouse_down,
+            wheel: mouse_wheel,
+        },
+        eased_t,
+        Some(&DEMO_HIGHLIGHTER),
+    );
 
-        let click_pos = if let Some(InputEvent::MouseDown(p)) = input_event {
-            let wx = (p.x as f32 - camera.offset.x) / scale + camera.target.x;
-            let wy = (p.y as f32 - camera.offset.y) / scale + camera.target.y;
-            Some(Vector2::new(wx, wy))
-        } else {
-            None
-        };
-
-        // Text area background
-        let text_area_rect = Rectangle::new(text_area_x, text_area_y, text_area_w, text_area_h);
-        d2d.draw_rectangle_rec(
-            text_area_rect,
-            Color::new(30, 30, 30, (255.0 * eased_t) as u8),
-        );
-        let text_area_border = if *focused {
-            Color::new(0, 170, 255, (255.0 * eased_t) as u8)
-        } else {
-            Color::new(80, 80, 80, (255.0 * eased_t) as u8)
-        };
-        d2d.draw_rectangle_lines_ex(text_area_rect, 1.0, text_area_border);
-
-        // Mouse wheel scrolling
-        if text_area_rect.check_collision_point_rec(mouse_world_pos) && mouse_wheel != 0.0 {
-            let scroll_speed = 30.0;
-            *scroll_y = (*scroll_y - mouse_wheel * scroll_speed).clamp(0.0, max_scroll);
-        }
-
-        // Scissor for text area
-        {
-            let clip_tl = d2d.get_world_to_screen2D(Vector2::new(text_area_x, text_area_y), camera);
-            let clip_br = d2d.get_world_to_screen2D(
-                Vector2::new(text_area_x + text_area_w, text_area_y + text_area_h),
-                camera,
-            );
-            let sx = clip_tl.x as i32;
-            let sy_scissor = clip_tl.y as i32;
-            let sw = (clip_br.x - clip_tl.x) as i32;
-            let sh = (clip_br.y - clip_tl.y) as i32;
-            let mut d_scissor = d2d.begin_scissor_mode(sx, sy_scissor, sw, sh);
-
-            let mut cursor_row = 0;
-            let mut cursor_col = 0;
-            let mut char_count = 0;
-            for (i, line) in lines.iter().enumerate() {
-                let line_len = line.chars().count();
-                if cursor_pos >= char_count && cursor_pos <= char_count + line_len {
-                    cursor_row = i;
-                    cursor_col = cursor_pos - char_count;
-                    break;
-                }
-                char_count += line_len + 1; // +1 for '\n'
-            }
-
-            // Auto-scroll to keep cursor visible
-            if *focused {
-                let cursor_y_in_content = text_area_y + 8.0 + cursor_row as f32 * line_height;
-                let cursor_y_on_screen = cursor_y_in_content - *scroll_y;
-                if cursor_y_on_screen < text_area_y {
-                    *scroll_y = cursor_y_in_content - text_area_y;
-                } else if cursor_y_on_screen + line_height > text_area_y + text_area_h {
-                    *scroll_y = cursor_y_in_content + line_height - (text_area_y + text_area_h);
-                }
-                *scroll_y = (*scroll_y).clamp(0.0, max_scroll);
-            }
-
-            for (i, line) in lines.iter().enumerate() {
-                let y = text_area_y + 8.0 + i as f32 * line_height - *scroll_y;
-                if y + line_height >= text_area_y && y <= text_area_y + text_area_h {
-                    d_scissor.draw_text_ex(
-                        &font,
-                        line,
-                        Vector2::new(text_area_x + 8.0, y),
-                        16.0,
-                        1.0,
-                        text_color,
-                    );
-
-                    if *focused && i == cursor_row && cursor_visible {
-                        let prefix: String = line.chars().take(cursor_col).collect();
-                        let prefix_width = font.measure_text(&prefix, 16.0, 1.0).x;
-                        let cx = text_area_x + 8.0 + prefix_width;
-                        let cy1 = y;
-                        let cy2 = y + line_height;
-                        d_scissor.draw_line_v(
-                            Vector2::new(cx, cy1),
-                            Vector2::new(cx, cy2),
-                            text_color,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Scrollbar (drawn after scissored text so it's always on top)
-        let track_rect = Rectangle::new(
-            text_area_x + text_area_w - 9.0,
-            text_area_y + 1.0,
-            8.0,
-            text_area_h - 2.0,
-        );
-        let scrollbar_interacted = draw_scrollbar(
-            &mut d2d,
-            track_rect,
-            content_height,
-            text_area_h,
-            scroll_y,
-            scrollbar_dragging,
-            scrollbar_drag_start_y,
-            scrollbar_drag_start_scroll,
-            mouse_world_pos,
-            click_pos,
-            is_mouse_down,
-            eased_t,
-        );
-
-        if let Some(pos) = click_pos {
-            if scrollbar_interacted {
-                // スクロールバー操作時はフォーカス変更しない
-            } else if text_area_rect.check_collision_point_rec(pos) {
-                *focused = true;
-            } else if panel_rect.check_collision_point_rec(pos) {
-                *focused = false;
-            }
-        }
-
-        // Buttons
-        let close_rect = Rectangle::new(370.0, 305.0, 100.0, 30.0);
-        let apply_rect = Rectangle::new(480.0, 305.0, 100.0, 30.0);
-
-        if draw_button(
-            &mut d2d,
-            close_rect,
-            "Close",
-            18,
-            true,
-            eased_t,
-            click_pos,
-            Some(mouse_world_pos),
-        ) {
-            close_clicked = true;
-        }
-
-        if draw_button(
-            &mut d2d,
-            apply_rect,
-            "Apply",
-            18,
-            true,
-            eased_t,
-            click_pos,
-            Some(mouse_world_pos),
-        ) {
-            apply_clicked = true;
-        }
-
-        // Click outside panel does NOT close the editor (intentional)
+    let close_rect = Rectangle::new(370.0, 305.0, 100.0, 30.0);
+    let apply_rect = Rectangle::new(480.0, 305.0, 100.0, 30.0);
+    if draw_button(
+        &mut d2d,
+        close_rect,
+        "Close",
+        18,
+        true,
+        eased_t,
+        click_pos,
+        Some(mouse_world_pos),
+    ) {
+        close_clicked = true;
     }
+    if draw_button(
+        &mut d2d,
+        apply_rect,
+        "Apply",
+        18,
+        true,
+        eased_t,
+        click_pos,
+        Some(mouse_world_pos),
+    ) {
+        apply_clicked = true;
+    }
+    // Click outside panel does NOT close the editor (intentional)
 
     (close_clicked, apply_clicked)
 }
+
+/// Shows off highlighting in the debug editor: `#` and `//` lines are dimmed.
+const DEMO_HIGHLIGHTER: LineCommentHighlighter = LineCommentHighlighter {
+    markers: &["#", "//"],
+    color: Color::new(110, 160, 110, 255),
+};
