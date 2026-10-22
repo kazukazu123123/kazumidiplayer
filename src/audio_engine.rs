@@ -70,6 +70,12 @@ pub trait AudioEngine: Send + 'static {
         left.fill(0.0);
         right.fill(0.0);
     }
+
+    /// Voices sounding at the end of the last `render`, shown as the
+    /// polyphony counter. Prerender engines only.
+    fn polyphony(&self) -> u32 {
+        0
+    }
 }
 
 /// Type-erased registration record; build with [`register`].
@@ -96,6 +102,7 @@ trait ErasedEngine: Send {
     fn sample_rate(&self) -> u32;
     fn send_midi_event_at(&mut self, frame: u32, data: u32);
     fn render(&mut self, left: &mut [f32], right: &mut [f32]);
+    fn polyphony(&self) -> u32;
 }
 
 impl<E: AudioEngine> ErasedEngine for E {
@@ -117,6 +124,10 @@ impl<E: AudioEngine> ErasedEngine for E {
 
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         AudioEngine::render(self, left, right)
+    }
+
+    fn polyphony(&self) -> u32 {
+        AudioEngine::polyphony(self)
     }
 }
 
@@ -210,6 +221,7 @@ impl OutputStream {
                             engine.send_midi_event_at(frame, msg);
                         }
                         engine.render(left, right);
+                        engine.polyphony()
                     });
                     match prerender::Session::start(rate, render) {
                         Ok(session) => Some(session),

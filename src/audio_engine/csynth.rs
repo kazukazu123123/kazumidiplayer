@@ -52,4 +52,8 @@ impl AudioEngine for CSynthPrerender {
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         CSynthPrerender::render(self, left, right);
     }
+
+    fn polyphony(&self) -> u32 {
+        CSynthPrerender::polyphony(self)
+    }
 }

@@ -40,7 +40,8 @@ const LIMITER_RELEASE_MS: f32 = 100.0;
 const LIMITER_LOOKAHEAD_MS: f32 = 50.0;
 
 /// Schedules the `(frame offset, message)` pairs, then renders one chunk.
-pub type RenderFn = Box<dyn FnMut(&[(u32, u32)], &mut [f32], &mut [f32]) + Send>;
+/// Returns the voices sounding at its end.
+pub type RenderFn = Box<dyn FnMut(&[(u32, u32)], &mut [f32], &mut [f32]) -> u32 + Send>;
 
 type MidiData = Arc<kazumidiparser::MIDIPlayerData>;
 
@@ -152,6 +153,11 @@ struct State {
     /// while stopped. Compared exactly on play: recomputing it would drift
     /// with the device latency and needlessly re-render.
     resume_at: Option<u64>,
+    /// `(first frame, voices)` per buffered chunk, oldest first, so the
+    /// polyphony shown follows what is heard rather than what is rendered.
+    voice_marks: VecDeque<(u64, u32)>,
+    /// Highest note-on velocity rendering currently drops (0: none).
+    drop_velocity: u32,
     shutdown: bool,
 }
 
@@ -206,6 +212,7 @@ fn restart(state: &mut State) {
     state.started = false;
     state.heard_floor = 0;
     state.resume_at = Some(state.base_ns);
+    state.voice_marks.clear();
 }
 
 pub struct Session {
@@ -234,6 +241,8 @@ impl Session {
                 heard_floor: 0,
                 bend_override: None,
                 resume_at: Some(0),
+                voice_marks: VecDeque::new(),
+                drop_velocity: 0,
                 shutdown: false,
             }),
             wake: Condvar::new(),
@@ -377,6 +386,36 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Highest note-on velocity being dropped to keep up (0: none).
+    pub fn drop_velocity(&self) -> u32 {
+        self.shared.lock().drop_velocity
+    }
+
+    /// Voices sounding in the audio being heard.
+    pub fn polyphony(&self) -> u32 {
+        let mut s = self.shared.lock();
+        heard_polyphony(&mut s)
+    }
+}
+
+/// Voice count of the chunk being heard; drops marks already passed.
+fn heard_polyphony(s: &mut State) -> u32 {
+    let pending = s.latency_frames + s.stash_frames;
+    let heard = s.played - pending.min(s.played);
+    while s
+        .voice_marks
+        .get(1)
+        .is_some_and(|&(start, _)| start <= heard)
+    {
+        s.voice_marks.pop_front();
+    }
+    match s.voice_marks.front() {
+        Some(&(start, voices)) if start <= heard => voices,
+        _ => 0,
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.update(|s| s.shutdown = true);
@@ -399,35 +438,76 @@ impl Tracks {
     }
 
     /// Append every channel message before `end_ns` as `(song ns, message)`,
-    /// in (tick, track) order.
-    fn collect_until(&mut self, end_ns: u64, out: &mut Vec<(u64, u32)>) {
+    /// in (tick, track) order. Without `with_ns` the times are left 0.
+    ///
+    /// Black MIDI can pack millions of events into a second, so this is the
+    /// render loop's main cost: tracks are walked in parallel, and the time
+    /// of each event is not looked up just to test it against the end.
+    fn collect_until(&mut self, end_ns: u64, with_ns: bool, out: &mut Vec<(u64, u32)>) {
         let raw = unsafe { &*self.data.as_ptr() };
-        let end_tick = ns_to_tick(raw, end_ns);
-        let mut events = Vec::new();
-        for (index, cursor) in self.cursors.iter_mut().enumerate() {
-            while cursor.has_event
-                && cursor.abs_tick <= end_tick
-                && tick_to_ns(raw, cursor.abs_tick) < end_ns
-            {
+        // Last tick sounding before `end_ns`, if any.
+        let mut last = ns_to_tick(raw, end_ns);
+        while last > 0 && tick_to_ns(raw, last) >= end_ns {
+            last -= 1;
+        }
+        if tick_to_ns(raw, last) >= end_ns {
+            return;
+        }
+        // Packed (tick, track) sort key, message.
+        fn walk(index: usize, cursor: &mut TrackCursor, last: u32, events: &mut Vec<(u64, u32)>) {
+            while cursor.has_event && cursor.abs_tick <= last {
                 if !cursor.is_tempo {
                     let msg = cursor.status as u32
                         | (cursor.param1 as u32) << 8
                         | (cursor.param2 as u32) << 16;
-                    events.push((cursor.abs_tick, index, msg));
+                    events.push(((cursor.abs_tick as u64) << 32 | index as u64, msg));
                 }
                 if !unsafe { cursor_next(cursor) } {
                     cursor.has_event = false;
                 }
             }
         }
-        events.sort_by_key(|&(tick, index, _)| (tick, index));
-        out.extend(
-            events
-                .into_iter()
-                .map(|(tick, _, msg)| (tick_to_ns(raw, tick), msg)),
-        );
+        let mut events = Vec::new();
+        if self.cursors.len() < PARALLEL_TRACKS {
+            for (index, cursor) in self.cursors.iter_mut().enumerate() {
+                walk(index, cursor, last, &mut events);
+            }
+        } else {
+            use rayon::prelude::*;
+            let parts: Vec<Vec<(u64, u32)>> = synth_pool().install(|| {
+                self.cursors
+                    .par_iter_mut()
+                    .enumerate()
+                    .fold(Vec::new, |mut part, (index, cursor)| {
+                        walk(index, cursor, last, &mut part);
+                        part
+                    })
+                    .collect()
+            });
+            events.reserve(parts.iter().map(Vec::len).sum());
+            for part in parts {
+                events.extend(part);
+            }
+        }
+        events.sort_unstable_by_key(|&(key, _)| key);
+        out.extend(events.into_iter().map(|(key, msg)| {
+            let ns = if with_ns {
+                tick_to_ns(raw, (key >> 32) as u32)
+            } else {
+                0
+            };
+            (ns, msg)
+        }));
     }
 }
+
+/// Rendering more than this many frames behind playback jumps ahead instead
+/// of reading the missed span (see `render_loop`): on files dense enough to
+/// fall behind at all, reading even a short span costs more than it lasts.
+const RESEEK_BEHIND_FRAMES: u64 = CHUNK_FRAMES as u64;
+
+/// From this many tracks on, they are walked in parallel.
+const PARALLEL_TRACKS: usize = 8;
 
 /// Silence the synth and return controllers to neutral before a new run.
 fn reset_messages() -> Vec<u32> {
@@ -509,6 +589,23 @@ impl BendOverride {
     }
 }
 
+/// Below this much buffered audio, quiet notes start being dropped...
+const THIN_START_SECS: f64 = 2.0;
+/// ...rising linearly to every note at this much.
+const THIN_FULL_SECS: f64 = 0.1;
+
+/// Highest note-on velocity to drop with `buffered_secs` of audio left:
+/// 0 (none) above [`THIN_START_SECS`], 1 at it, 127 (all) at
+/// [`THIN_FULL_SECS`] and below.
+fn thin_velocity(buffered_secs: f64) -> u32 {
+    if buffered_secs > THIN_START_SECS {
+        return 0;
+    }
+    let t =
+        ((THIN_START_SECS - buffered_secs) / (THIN_START_SECS - THIN_FULL_SECS)).clamp(0.0, 1.0);
+    (1.0 + t * 126.0).round() as u32
+}
+
 /// Drops the note-ons of a span rendering skipped over, together with the
 /// note-offs that would have ended them. Everything else still applies, so
 /// controllers and pitch bend stay right.
@@ -524,12 +621,13 @@ impl SkipFilter {
         }
     }
 
-    fn filter(&mut self, msg: u32, skipping: bool) -> Option<u32> {
+    /// Drops note-ons of velocity up to `drop_velocity` (0: none, 127: all).
+    fn filter(&mut self, msg: u32, drop_velocity: u32) -> Option<u32> {
         let status = msg & 0xFF;
         let key = (status as usize & 0x0F) * 128 + ((msg >> 8) & 0x7F) as usize;
         let velocity = (msg >> 16) & 0x7F;
         match status & 0xF0 {
-            0x90 if velocity > 0 && skipping => {
+            0x90 if velocity > 0 && velocity <= drop_velocity => {
                 self.dropped[key] = self.dropped[key].saturating_add(1);
                 None
             }
@@ -559,6 +657,8 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
     let mut msgs: Vec<(u32, u32)> = Vec::new();
     let mut bend_override = BendOverride::new(None);
     let mut skip = SkipFilter::new();
+    let mut thin_armed = false;
+    let mut drop_velocity;
     let mut left = vec![0.0f32; CHUNK_FRAMES];
     let mut right = vec![0.0f32; CHUNK_FRAMES];
     // Runs on interleaved stereo, so both channels share one gain (linked)
@@ -586,6 +686,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                     pending.clear();
                     bend_override = BendOverride::new(s.bend_override);
                     skip = SkipFilter::new();
+                    thin_armed = false;
                     msgs = reset_messages()
                         .into_iter()
                         .chain(bend_override.initial())
@@ -598,7 +699,21 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                 }
                 s = shared.wake.wait(s).unwrap_or_else(|e| e.into_inner());
             }
-            let fill = s.ring.len() as f64 / s.max_frames.max(1) as f64;
+            // Thinning arms once this generation has built up its buffer, so
+            // the refill after a seek or start keeps every note, or once
+            // playback outruns rendering (the buffer may never fill).
+            let buffered = s.ring.len();
+            let arm_frames = s.max_frames.min((THIN_START_SECS * rate as f64) as usize);
+            if buffered >= arm_frames {
+                thin_armed = true;
+            }
+            drop_velocity = if thin_armed && s.playing {
+                thin_velocity(buffered as f64 / rate as f64)
+            } else {
+                0
+            };
+            s.drop_velocity = drop_velocity;
+            let fill = buffered as f64 / s.max_frames.max(1) as f64;
             if low_priority && fill < URGENT_BELOW || !low_priority && fill > RELAXED_ABOVE {
                 low_priority = !low_priority;
                 drop(s);
@@ -612,25 +727,37 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
         // Playback ran past what was rendered: jump there, applying the
         // missed span's events except the notes it no longer has time for.
         if played > rendered {
+            thin_armed = true;
             let skip_ns = song_ns(base_ns, played, speed, rate);
-            if let Some(tracks) = tracks.as_mut() {
-                tracks.collect_until(skip_ns, &mut pending);
-            }
-            for &(_, msg) in &pending {
-                if let Some(msg) = skip.filter(msg, true) {
-                    msgs.push((0, bend_override.rewrite(msg)));
+            if played - rendered > RESEEK_BEHIND_FRAMES {
+                // Far behind: reading the whole missed span could take longer
+                // than it lasts and fall further behind each time. Jump there
+                // and silence what was sounding instead.
+                if let Some(t) = tracks.as_mut() {
+                    *t = Tracks::seek(t.data.clone(), skip_ns);
                 }
+                skip = SkipFilter::new();
+                msgs.extend((0..16u32).map(|ch| (0, 0xB0 | ch | 123 << 8)));
+            } else {
+                if let Some(tracks) = tracks.as_mut() {
+                    tracks.collect_until(skip_ns, false, &mut pending);
+                }
+                for &(_, msg) in &pending {
+                    if let Some(msg) = skip.filter(msg, 127) {
+                        msgs.push((0, bend_override.rewrite(msg)));
+                    }
+                }
+                pending.clear();
             }
-            pending.clear();
             rendered = played;
         }
 
         let end_ns = song_ns(base_ns, rendered + CHUNK_FRAMES as u64, speed, rate);
         if let Some(tracks) = tracks.as_mut() {
-            tracks.collect_until(end_ns, &mut pending);
+            tracks.collect_until(end_ns, true, &mut pending);
         }
         for &(ns, msg) in &pending {
-            let Some(msg) = skip.filter(msg, false) else {
+            let Some(msg) = skip.filter(msg, drop_velocity) else {
                 continue;
             };
             let frame = frame_at(base_ns, ns, speed, rate)
@@ -639,7 +766,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
             msgs.push((frame as u32, bend_override.rewrite(msg)));
         }
         pending.clear();
-        render(&msgs, &mut left, &mut right);
+        let voices = render(&msgs, &mut left, &mut right);
         msgs.clear();
         interleaved.clear();
         interleaved.extend(left.iter().zip(&right).flat_map(|(&l, &r)| [l, r]));
@@ -657,6 +784,8 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                     .map(|lr| (lr[0], lr[1])),
             );
             s.started = true;
+            let start = chunk_start.max(s.played);
+            s.voice_marks.push_back((start, voices));
         }
     }
 }
@@ -855,6 +984,8 @@ mod tests {
             heard_floor: 0,
             bend_override: None,
             resume_at: None,
+            voice_marks: VecDeque::new(),
+            drop_velocity: 0,
             shutdown: false,
         };
         restart(&mut state);
@@ -883,6 +1014,8 @@ mod tests {
             heard_floor: 0,
             bend_override: None,
             resume_at: None,
+            voice_marks: VecDeque::new(),
+            drop_velocity: 0,
             shutdown: false,
         }
     }
@@ -953,20 +1086,33 @@ mod tests {
         let off = |key: u32| 0x81 | key << 8;
         let mut f = SkipFilter::new();
         // Held before the skip: its note-off must still pass.
-        assert_eq!(f.filter(on(60), false), Some(on(60)));
+        assert_eq!(f.filter(on(60), 0), Some(on(60)));
         // Pressed and released inside the skip: both dropped.
-        assert_eq!(f.filter(on(62), true), None);
-        assert_eq!(f.filter(off(62), true), None);
+        assert_eq!(f.filter(on(62), 127), None);
+        assert_eq!(f.filter(off(62), 127), None);
         // Pressed in the skip, released after it: the note-off is dropped too.
-        assert_eq!(f.filter(on(64), true), None);
-        assert_eq!(f.filter(off(64), false), None);
+        assert_eq!(f.filter(on(64), 127), None);
+        assert_eq!(f.filter(off(64), 0), None);
         // Velocity-0 note-on counts as a note-off.
-        assert_eq!(f.filter(on(65), true), None);
-        assert_eq!(f.filter(0x91 | 65 << 8, false), None);
+        assert_eq!(f.filter(on(65), 127), None);
+        assert_eq!(f.filter(0x91 | 65 << 8, 0), None);
         // Controllers and bends always pass; so does the held note's release.
-        assert_eq!(f.filter(0xE1 | 64 << 16, true), Some(0xE1 | 64 << 16));
-        assert_eq!(f.filter(off(60), true), Some(off(60)));
-        assert_eq!(f.filter(off(64), false), Some(off(64)));
+        assert_eq!(f.filter(0xE1 | 64 << 16, 127), Some(0xE1 | 64 << 16));
+        assert_eq!(f.filter(off(60), 127), Some(off(60)));
+        assert_eq!(f.filter(off(64), 0), Some(off(64)));
+    }
+
+    #[test]
+    fn thinning_ramps_from_2s_to_100ms() {
+        assert_eq!(thin_velocity(5.0), 0);
+        assert_eq!(thin_velocity(2.0), 1);
+        assert_eq!(thin_velocity(1.05), 64);
+        assert_eq!(thin_velocity(0.1), 127);
+        assert_eq!(thin_velocity(0.0), 127);
+        let mut f = SkipFilter::new();
+        assert_eq!(f.filter(0x90 | 60 << 8 | 40 << 16, 50), None);
+        assert_eq!(f.filter(0x80 | 60 << 8, 0), None);
+        assert!(f.filter(0x90 | 61 << 8 | 60 << 16, 50).is_some());
     }
 
     #[test]
@@ -997,6 +1143,20 @@ mod tests {
     }
 
     #[test]
+    fn polyphony_follows_heard_chunk() {
+        let mut s = numbered(0, 0);
+        s.voice_marks = VecDeque::from([(0, 3), (256, 5), (512, 2)]);
+        assert_eq!(heard_polyphony(&mut s), 3);
+        s.played = 300;
+        assert_eq!(heard_polyphony(&mut s), 5);
+        assert_eq!(s.voice_marks.len(), 2);
+        s.latency_frames = 200;
+        // Heard position never moves the marks back, but early frames read 0.
+        restart(&mut s);
+        assert_eq!(heard_polyphony(&mut s), 0);
+    }
+
+    #[test]
     fn forward_seek_skips_inside_buffer() {
         let mut s = numbered(50, 40);
         assert!(s.skip_to(70));
@@ -1010,5 +1170,59 @@ mod tests {
         assert!(!s.skip_to(49));
         assert!(!s.skip_to(90));
         assert_eq!((s.played, s.ring.len()), (50, 40));
+    }
+}
+
+#[cfg(test)]
+mod stress {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore]
+    fn player_polling_never_stalls() {
+        let path = std::env::var("STRESS_MIDI").unwrap();
+        let data = std::sync::Arc::new(
+            kazumidiparser::MIDIPlayerData::parse(&path, 8, None, None).unwrap(),
+        );
+        let stream = crate::audio_engine::OutputStream::open_engine::<
+            crate::audio_engine::synths::sine::SinePrerender,
+        >()
+        .recv()
+        .unwrap()
+        .unwrap();
+        let p = stream.prerender().unwrap();
+        p.set_data(Some(data));
+        let from_ns: u64 =
+            std::env::var("STRESS_FROM_SECS").map_or(0, |v| v.parse().unwrap()) * 1_000_000_000;
+        let secs: u64 = std::env::var("STRESS_SECS").map_or(20, |v| v.parse().unwrap());
+        eprintln!("parsed");
+        p.play(from_ns, 1.0);
+        let start = Instant::now();
+        let mut worst = Duration::ZERO;
+        let mut last_sec = 0;
+        while start.elapsed() < Duration::from_secs(secs) {
+            let t = Instant::now();
+            let pos = p.position_ns();
+            let buf = p.buffered_ns();
+            let poly = p.polyphony();
+            let vel = p.drop_velocity();
+            let dt = t.elapsed();
+            if dt > worst {
+                worst = dt;
+                eprintln!(
+                    "{:>6.2}s stall {dt:?} pos {pos} buf {buf} poly {poly} vel {vel}",
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            if start.elapsed().as_secs() != last_sec {
+                last_sec = start.elapsed().as_secs();
+                eprintln!(
+                    "t{last_sec:>3} pos {:.2}s buf {:.2}s poly {poly} vel {vel} poll {dt:?}",
+                    pos as f64 / 1e9,
+                    buf as f64 / 1e9
+                );
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
     }
 }

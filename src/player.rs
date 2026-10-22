@@ -22,6 +22,11 @@ pub enum PlayerState {
     Loading = 3,
 }
 
+/// Longest the player thread spends walking events for the display of a
+/// prerender engine in one frame, checked every `DISPLAY_BUDGET_CHECK` events.
+const DISPLAY_BUDGET: Duration = Duration::from_millis(12);
+const DISPLAY_BUDGET_CHECK: u32 = 1024;
+
 pub const DEFAULT_MIDI_EV_BUFFER_SIZE: u32 = 8192;
 pub const MIN_MIDI_EV_BUFFER_SIZE: u32 = 1;
 pub const MAX_MIDI_EV_BUFFER_SIZE: u32 = 16_384;
@@ -162,6 +167,10 @@ pub struct PlayerHandle {
     alive: Arc<AtomicBool>,
     // Prerendered audio waiting to play; `u64::MAX` for realtime outputs.
     audio_buffer_ns: Arc<AtomicU64>,
+    // Voices heard from a prerender engine; `u32::MAX` for realtime outputs.
+    polyphony: Arc<AtomicU32>,
+    // Note-on velocity a prerender engine drops up to; 0 when not skipping.
+    drop_velocity: Arc<AtomicU32>,
 }
 
 impl Clone for PlayerHandle {
@@ -182,6 +191,8 @@ impl Clone for PlayerHandle {
             notes_played: self.notes_played.clone(),
             alive: self.alive.clone(),
             audio_buffer_ns: self.audio_buffer_ns.clone(),
+            polyphony: self.polyphony.clone(),
+            drop_velocity: self.drop_velocity.clone(),
         }
     }
 }
@@ -209,6 +220,10 @@ impl PlayerHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let audio_buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
         let audio_buffer_ns_for_thread = audio_buffer_ns.clone();
+        let polyphony = Arc::new(AtomicU32::new(u32::MAX));
+        let polyphony_for_thread = polyphony.clone();
+        let drop_velocity = Arc::new(AtomicU32::new(0));
+        let drop_velocity_for_thread = drop_velocity.clone();
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -602,6 +617,7 @@ impl PlayerHandle {
                     }
                 }
 
+                let mut display_reseek = None;
                 if player.state == PlayerState::Playing {
                     if let Some(data) = &player.data {
                         // If the requested speed changed, re-anchor at the current position
@@ -627,8 +643,10 @@ impl PlayerHandle {
                         // Prerender outputs ignore the MIDI sent here (it only
                         // drives the display), so pacing it would just make
                         // the display lag the audio: always go direct.
-                        let unlimited = player.unlimited_output.load(Ordering::Relaxed)
-                            || prerender!(player).is_some();
+                        let is_prerender = prerender!(player).is_some();
+                        let unlimited =
+                            player.unlimited_output.load(Ordering::Relaxed) || is_prerender;
+                        let mut display_behind = false;
                         // Unlimited has one unambiguous path: globally ordered,
                         // synchronous direct dispatch. Keep the selected EV mode only
                         // for when Unlimited is turned off again.
@@ -757,7 +775,19 @@ impl PlayerHandle {
                                 .filter(|(_, track)| track.pending && track.pend_tick <= cur_tick)
                                 .map(|(index, track)| Reverse((track.pend_tick, index)))
                                 .collect();
+                            let mut walked = 0u32;
                             while midi_ev_fifo.len() < capacity {
+                                // Prerender: these events only drive the display.
+                                // On files denser than this thread can walk, stop
+                                // for this frame and jump to the audio below.
+                                walked = walked.wrapping_add(1);
+                                if is_prerender
+                                    && walked % DISPLAY_BUDGET_CHECK == 0
+                                    && frame_start.elapsed() > DISPLAY_BUDGET
+                                {
+                                    display_behind = true;
+                                    break;
+                                }
                                 let Some(Reverse((_, track_index))) = due.pop() else {
                                     break;
                                 };
@@ -789,6 +819,10 @@ impl PlayerHandle {
                                     due.push(Reverse((track.pend_tick, track_index)));
                                 }
                             }
+                        }
+
+                        if display_behind {
+                            display_reseek = Some(ideal_position_ns);
                         }
 
                         // A full FIFO only means backpressure when at least one more due
@@ -871,11 +905,27 @@ impl PlayerHandle {
                     }
                 }
 
+                if let Some(position) = display_reseek {
+                    // Skip the rest of what is due: the audio does not depend
+                    // on it, and catching up never would.
+                    player.seek_tracks(position);
+                    *lock_mutex(&active_notes_clone) = [None; 128];
+                    active_count = [0u16; 128];
+                }
+
                 state_clone.store(player.state as u32, Ordering::SeqCst);
                 position_clone.store(player.seek_position_ns, Ordering::SeqCst);
                 notes_played_clone.store(notes_played_count, Ordering::Relaxed);
                 audio_buffer_ns_for_thread.store(
                     prerender!(player).map_or(u64::MAX, |p| p.buffered_ns()),
+                    Ordering::Relaxed,
+                );
+                polyphony_for_thread.store(
+                    prerender!(player).map_or(u32::MAX, |p| p.polyphony()),
+                    Ordering::Relaxed,
+                );
+                drop_velocity_for_thread.store(
+                    prerender!(player).map_or(0, |p| p.drop_velocity()),
                     Ordering::Relaxed,
                 );
                 *lock_mutex(&pitch_bend_range_clone) = player.channel_pitch_bend_range;
@@ -926,6 +976,8 @@ impl PlayerHandle {
             notes_played,
             alive,
             audio_buffer_ns,
+            polyphony,
+            drop_velocity,
         }
     }
 
@@ -988,6 +1040,16 @@ impl PlayerHandle {
     /// Prerendered audio waiting to play, or `None` for a realtime output.
     pub fn audio_buffer_ns(&self) -> Option<u64> {
         Some(self.audio_buffer_ns.load(Ordering::Relaxed)).filter(|&ns| ns != u64::MAX)
+    }
+
+    /// Voices sounding in a prerender engine, or `None` for a realtime output.
+    pub fn polyphony(&self) -> Option<u32> {
+        Some(self.polyphony.load(Ordering::Relaxed)).filter(|&n| n != u32::MAX)
+    }
+
+    /// Velocity notes are being skipped up to, or `None` when not skipping.
+    pub fn skipping_velocity(&self) -> Option<u32> {
+        Some(self.drop_velocity.load(Ordering::Relaxed)).filter(|&v| v > 0)
     }
 
     pub fn set_output(&self, stream: Option<OutputStream>) {

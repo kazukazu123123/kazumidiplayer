@@ -307,6 +307,11 @@ impl CSynthPrerender {
         }
     }
 
+    /// Voices sounding (releasing included) after the last render.
+    pub fn polyphony(&self) -> u32 {
+        self.piano.stats.active
+    }
+
     /// `left.len()` must be a multiple of `QUANTUM`.
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         for (l, r) in left.chunks_mut(QUANTUM).zip(right.chunks_mut(QUANTUM)) {

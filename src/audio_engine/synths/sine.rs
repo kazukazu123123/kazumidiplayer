@@ -277,6 +277,11 @@ impl SinePrerender {
         Ok(Self::new(rate))
     }
 
+    /// Voices sounding (releasing included) after the last render.
+    pub fn polyphony(&self) -> u32 {
+        self.voices.len() as u32
+    }
+
     pub fn rate(&self) -> u32 {
         self.rate
     }

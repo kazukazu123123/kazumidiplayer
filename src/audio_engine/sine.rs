@@ -27,4 +27,8 @@ impl AudioEngine for SinePrerender {
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         SinePrerender::render(self, left, right);
     }
+
+    fn polyphony(&self) -> u32 {
+        SinePrerender::polyphony(self)
+    }
 }

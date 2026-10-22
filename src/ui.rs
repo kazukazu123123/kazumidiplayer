@@ -117,8 +117,6 @@ pub fn draw_media_controls(
     playback_speed: &mut f32,
     speed_slider_dragging: &mut bool,
     content_right: f32,
-    // (buffered, max) prerendered audio; `None` for realtime engines.
-    audio_buffer: Option<(u64, u64)>,
 ) {
     let button_w = 80.0;
     let button_h = 30.0;
@@ -184,24 +182,6 @@ pub fn draw_media_controls(
         14,
         text_color,
     );
-    if let Some((buffered_ns, max_ns)) = audio_buffer {
-        // m:ss.xx, rounded to centiseconds.
-        let mss = |ns: u64| {
-            let cs = (ns + 5_000_000) / 10_000_000;
-            format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
-        };
-        let text = format!("Audio Buffer: {} / {}", mss(buffered_ns), mss(max_ns));
-        let c_text = std::ffi::CString::new(text.as_str()).unwrap_or_default();
-        // Safety: a valid NUL-terminated string; the default font is loaded.
-        let w = unsafe { raylib::ffi::MeasureText(c_text.as_ptr(), 14) };
-        d.draw_text(
-            &text,
-            (content_right as i32 - w).max(slider_x as i32 + 60),
-            y_offset as i32,
-            14,
-            text_color,
-        );
-    }
     d.draw_rectangle(
         slider_x as i32,
         track_y as i32,

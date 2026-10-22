@@ -1203,9 +1203,6 @@ fn main() {
                                 &mut app_state.playback_speed,
                                 &mut app_state.speed_slider_dragging,
                                 cx + cw - 10.0,
-                                engine.audio_buffer_ns().map(|ns| {
-                                    (ns, app_state.audio_buffer_secs as u64 * 1_000_000_000)
-                                }),
                             );
                             if app_state.playback_speed != prev_speed {
                                 engine.set_speed(app_state.playback_speed);
@@ -1290,7 +1287,7 @@ fn main() {
                         .as_ref()
                         .map(|data| data.total_note_on_events())
                         .unwrap_or(0);
-                    let lines = [
+                    let mut lines = vec![
                         format!(
                             "NPS   {}",
                             group_thousands(app_state.nps_value.round() as u64)
@@ -1302,6 +1299,22 @@ fn main() {
                         ),
                         format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
                     ];
+                    // Prerender engines only.
+                    if let Some(voices) = engine.polyphony() {
+                        lines.push(format!("POLY  {}", group_thousands(voices as u64)));
+                    }
+                    if let Some(vel) = engine.skipping_velocity() {
+                        lines.push(format!("Skipping Vel: {vel}"));
+                    }
+                    if let Some(buffered_ns) = engine.audio_buffer_ns() {
+                        // m:ss.xx, rounded to centiseconds.
+                        let mss = |ns: u64| {
+                            let cs = (ns + 5_000_000) / 10_000_000;
+                            format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
+                        };
+                        let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
+                        lines.push(format!("BUF   {} / {}", mss(buffered_ns), mss(max_ns)));
+                    }
                     let font_size = 18;
                     let pad = 8;
                     let line_h = 22;
