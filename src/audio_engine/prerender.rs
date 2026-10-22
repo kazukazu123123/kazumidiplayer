@@ -32,7 +32,7 @@ pub const CHUNK_FRAMES: usize = 256;
 
 pub const DEFAULT_MAX_BUFFER_SECS: u32 = 10;
 pub const MIN_MAX_BUFFER_SECS: u32 = 1;
-pub const MAX_MAX_BUFFER_SECS: u32 = 300;
+pub const MAX_MAX_BUFFER_SECS: u32 = 600;
 
 /// Bytes one buffered frame takes (stereo `f32`).
 pub const BYTES_PER_FRAME: u64 = std::mem::size_of::<(f32, f32)>() as u64;
