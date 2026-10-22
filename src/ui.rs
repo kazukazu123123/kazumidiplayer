@@ -581,7 +581,14 @@ pub fn draw_settings_overlay(
     while let Some(ch) = d.get_char_pressed() {
         numeric_typed.push(ch);
     }
-    let numeric_backspace = d.is_key_pressed(KeyboardKey::KEY_BACKSPACE);
+    // Editing keys repeat while held.
+    let pressed = |d: &RaylibDrawHandle, key| d.is_key_pressed(key) || d.is_key_pressed_repeat(key);
+    let numeric_backspace = pressed(d, KeyboardKey::KEY_BACKSPACE);
+    let numeric_delete = pressed(d, KeyboardKey::KEY_DELETE);
+    let numeric_left = pressed(d, KeyboardKey::KEY_LEFT);
+    let numeric_right = pressed(d, KeyboardKey::KEY_RIGHT);
+    let numeric_home = d.is_key_pressed(KeyboardKey::KEY_HOME);
+    let numeric_end = d.is_key_pressed(KeyboardKey::KEY_END);
     let numeric_enter = d.is_key_pressed(KeyboardKey::KEY_ENTER);
     let numeric_escape = d.is_key_pressed(KeyboardKey::KEY_ESCAPE);
     let numeric_shift =
@@ -757,6 +764,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
@@ -786,6 +798,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
@@ -926,6 +943,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
@@ -1007,6 +1029,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
@@ -1140,6 +1167,11 @@ pub fn draw_settings_overlay(
                             control: numeric_control,
                             typed: numeric_typed.clone(),
                             backspace: numeric_backspace,
+                            delete: numeric_delete,
+                            left: numeric_left,
+                            right: numeric_right,
+                            home: numeric_home,
+                            end: numeric_end,
                             enter: numeric_enter,
                             escape: numeric_escape,
                         };
@@ -1197,6 +1229,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
@@ -1244,6 +1281,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
@@ -1307,6 +1349,11 @@ pub fn draw_settings_overlay(
                         control: numeric_control,
                         typed: numeric_typed.clone(),
                         backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
