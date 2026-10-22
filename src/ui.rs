@@ -517,6 +517,124 @@ pub fn draw_parse_toast(
     draw_loading_panel(d, camera, alpha, "Loaded!", progress, parse_bps, parse_eps);
 }
 
+/// Seconds the mouse rests on a settings row before its tooltip shows.
+const TOOLTIP_DELAY: f64 = 0.5;
+
+/// `tip` once the mouse has rested on it for [`TOOLTIP_DELAY`].
+fn settings_tooltip_ready(tip: Option<&'static str>, now: f64) -> Option<&'static str> {
+    thread_local! {
+        static HOVER: std::cell::Cell<Option<(&'static str, f64)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    HOVER.with(|hover| match (tip, hover.get()) {
+        (None, _) => {
+            hover.set(None);
+            None
+        }
+        (Some(tip), Some((last, since))) if std::ptr::eq(last, tip) => {
+            (now - since >= TOOLTIP_DELAY).then_some(tip)
+        }
+        (Some(tip), _) => {
+            hover.set(Some((tip, now)));
+            None
+        }
+    })
+}
+
+thread_local! {
+    /// Tooltip to draw on top of the frame: (text, mouse in screen space, alpha).
+    static PENDING_TOOLTIP: std::cell::Cell<Option<(&'static str, Vector2, f32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn queue_tooltip(text: &'static str, mouse: Vector2, alpha: f32) {
+    PENDING_TOOLTIP.with(|p| p.set(Some((text, mouse, alpha))));
+}
+
+/// Draw the tooltip queued this frame, if any. Call last, so it lies above
+/// everything else.
+pub fn draw_pending_tooltip(d: &mut impl RaylibDraw, screen_width: i32, screen_height: i32) {
+    if let Some((text, mouse, alpha)) = PENDING_TOOLTIP.with(|p| p.take()) {
+        let bounds = Rectangle::new(0.0, 0.0, screen_width as f32, screen_height as f32);
+        draw_tooltip(d, text, mouse, bounds, alpha);
+    }
+}
+
+/// Split `text` into lines no wider than `max_w` pixels.
+fn wrap_text(text: &str, size: i32, max_w: i32) -> Vec<String> {
+    let measure = |t: &str| {
+        let c = std::ffi::CString::new(t).unwrap_or_default();
+        // Safety: a valid NUL-terminated string; the default font is loaded.
+        unsafe { raylib::ffi::MeasureText(c.as_ptr(), size) }
+    };
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if measure(&candidate) > max_w && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line = word.to_owned();
+        } else {
+            line = candidate;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// A wrapped description box next to the mouse, kept inside `bounds`.
+fn draw_tooltip(
+    d: &mut impl RaylibDraw,
+    text: &str,
+    mouse: Vector2,
+    bounds: Rectangle,
+    alpha: f32,
+) {
+    const SIZE: i32 = 14;
+    const LINE_H: i32 = 17;
+    const PAD: i32 = 8;
+    const MAX_W: i32 = 260;
+    let lines = wrap_text(text, SIZE, MAX_W);
+    let text_w = lines
+        .iter()
+        .map(|l| {
+            let c = std::ffi::CString::new(l.as_str()).unwrap_or_default();
+            // Safety: a valid NUL-terminated string; the default font is loaded.
+            unsafe { raylib::ffi::MeasureText(c.as_ptr(), SIZE) }
+        })
+        .max()
+        .unwrap_or(0);
+    let w = (text_w + PAD * 2) as f32;
+    let h = (lines.len() as i32 * LINE_H + PAD * 2 - (LINE_H - SIZE)) as f32;
+    let mut x = mouse.x + 12.0;
+    let mut y = mouse.y + 18.0;
+    if x + w > bounds.x + bounds.width - 4.0 {
+        x = (bounds.x + bounds.width - 4.0 - w).max(bounds.x + 4.0);
+    }
+    if y + h > bounds.y + bounds.height - 4.0 {
+        // Above the cursor instead.
+        y = (mouse.y - 8.0 - h).max(bounds.y + 4.0);
+    }
+    let rect = Rectangle::new(x, y, w, h);
+    d.draw_rectangle_rec(rect, Color::new(25, 25, 30, (240.0 * alpha) as u8));
+    d.draw_rectangle_lines_ex(rect, 1.0, Color::new(0, 135, 200, (255.0 * alpha) as u8));
+    for (i, line) in lines.iter().enumerate() {
+        d.draw_text(
+            line,
+            x as i32 + PAD,
+            y as i32 + PAD + i as i32 * LINE_H,
+            SIZE,
+            Color::new(225, 230, 240, (255.0 * alpha) as u8),
+        );
+    }
+}
+
 pub fn draw_settings_overlay(
     d: &mut RaylibDrawHandle,
     screen_width: i32,
@@ -643,6 +761,8 @@ pub fn draw_settings_overlay(
         }
     }
     let mut layout = VerticalLayout::new(content_top, 5.0);
+    // Per row: (area in panel space, description shown on hover).
+    let mut tips: Vec<(Rectangle, &'static str)> = Vec::new();
 
     {
         let mut d2d = d.begin_mode2D(camera);
@@ -718,6 +838,7 @@ pub fn draw_settings_overlay(
 
             // Render Mode Toggle
             let y = layout.next(30.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Scroll the piano roll by beats instead of by time. Notes keep the same spacing when the tempo changes, so fast sections don't squash together."));
             let toggle_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(toggle_rect.y, toggle_rect.height) {
                 if draw_toggle(
@@ -736,6 +857,10 @@ pub fn draw_settings_overlay(
 
             // Beat Bounce pulses only the piano-roll zoom at the selected note interval.
             let y = layout.next(30.0);
+            tips.push((
+                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                "Pulse the piano roll's zoom in time with the song's tempo.",
+            ));
             let beat_bounce_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(beat_bounce_rect.y, beat_bounce_rect.height) {
                 if draw_toggle(
@@ -754,6 +879,10 @@ pub fn draw_settings_overlay(
 
             if *beat_bounce_enabled {
                 let y = layout.next(52.0);
+                tips.push((
+                    Rectangle::new(20.0, sy(y), 360.0, 52.0),
+                    "How far the piano roll zooms in on each pulse. 0 turns the pulse off.",
+                ));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -788,6 +917,7 @@ pub fn draw_settings_overlay(
                 }
 
                 let y = layout.next(52.0);
+                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "How often it pulses: 4 = every quarter note, 8 = every eighth note, and so on."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -822,6 +952,10 @@ pub fn draw_settings_overlay(
                 }
 
                 let y = layout.next(30.0);
+                tips.push((
+                    Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                    "Pulse halfway between beats instead of on them.",
+                ));
                 let offbeat_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
                 if is_visible(offbeat_rect.y, offbeat_rect.height) {
                     if draw_toggle(
@@ -841,6 +975,10 @@ pub fn draw_settings_overlay(
 
             // Shaking Window Toggle
             let y = layout.next(30.0);
+            tips.push((
+                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                "Shake the keyboard window along with the notes being played.",
+            ));
             let shake_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(shake_rect.y, shake_rect.height) {
                 if draw_toggle(
@@ -859,6 +997,7 @@ pub fn draw_settings_overlay(
 
             // Integrate Keyboard Toggle
             let y = layout.next(30.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Show the piano keyboard inside the piano roll window instead of as a separate window."));
             let integrate_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(integrate_rect.y, integrate_rect.height) {
                 if draw_toggle(
@@ -877,6 +1016,10 @@ pub fn draw_settings_overlay(
 
             // Autoplay on Load Toggle
             let y = layout.next(30.0);
+            tips.push((
+                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                "Start playing as soon as a MIDI file finishes loading.",
+            ));
             let autoplay_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(autoplay_rect.y, autoplay_rect.height) {
                 if draw_toggle(
@@ -895,6 +1038,7 @@ pub fn draw_settings_overlay(
 
             // Audio engine selector
             let y = layout.next(52.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "What makes the sound. KDMAPI sends notes to OmniMIDI as they play. CSynth plays a piano sample set. Prerender engines render ahead into a buffer: smoother on heavy files, but changes take a moment to be heard."));
             if is_visible(sy(y), 52.0) {
                 let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
                 audio_engine_combo_rect = Some(combo_rect);
@@ -933,6 +1077,7 @@ pub fn draw_settings_overlay(
             // Prerender buffer length; applies immediately.
             {
                 let y = layout.next(52.0);
+                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "How far ahead a prerender engine renders, from 1 second to 10 minutes. More rides out heavy parts but uses more memory. When less than 2 seconds is left, quiet notes are skipped to keep up."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1000,6 +1145,7 @@ pub fn draw_settings_overlay(
 
             // Unlimited Output Toggle
             let y = layout.next(30.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Send every MIDI event the moment it is due, with no per-frame limit. Most accurate timing, but very heavy files can overload the synth."));
             let unlimited_output_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(unlimited_output_rect.y, unlimited_output_rect.height) {
                 if draw_toggle(
@@ -1019,6 +1165,7 @@ pub fn draw_settings_overlay(
             // MIDI events consumed per 60 Hz output frame.
             {
                 let y = layout.next(52.0);
+                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "How many MIDI events can be sent per frame. Larger keeps up with denser files; smaller protects the synth from floods."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1071,6 +1218,7 @@ pub fn draw_settings_overlay(
             }
 
             let y = layout.next(52.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "What to do when a file has more events than one frame can send. Legacy: old behaviour, no buffer. Slowdown: playback slows down until it catches up. Catch Up: keeps real time and skips ahead after the backlog."));
             if is_visible(sy(y), 52.0) {
                 let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
                 midi_ev_mode_combo_rect = Some(combo_rect);
@@ -1113,6 +1261,10 @@ pub fn draw_settings_overlay(
 
             // Pitch Bend Window Toggle
             let y = layout.next(30.0);
+            tips.push((
+                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                "Bend the keyboard window's shape with the song's pitch bend.",
+            ));
             let pitch_bend_window_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(pitch_bend_window_rect.y, pitch_bend_window_rect.height) {
                 if draw_toggle(
@@ -1131,6 +1283,7 @@ pub fn draw_settings_overlay(
 
             // Pitch Bend OS Window Movement Toggle
             let y = layout.next(30.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Move the whole app window sideways with pitch bend. The three spring settings below control how it moves."));
             let pb_move_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(pb_move_rect.y, pb_move_rect.height) {
                 if draw_toggle(
@@ -1148,15 +1301,16 @@ pub fn draw_settings_overlay(
             }
 
             if *pitch_bend_move_window_enabled {
-                for (index, (label, min, max)) in [
-                    ("Spring Mass", 1, 20),
-                    ("Spring Stiffness", 1, 1000),
-                    ("Spring Damping", 0, 200),
+                for (index, (label, min, max, tip)) in [
+                    ("Spring Mass", 1, 20, "How heavy the window feels when pitch bend moves it. Heavier starts and stops more slowly."),
+                    ("Spring Stiffness", 1, 1000, "How strongly the window is pulled to where pitch bend puts it. Higher follows faster."),
+                    ("Spring Damping", 0, 200, "How quickly the window stops wobbling. Low bounces around; high settles at once."),
                 ]
                 .into_iter()
                 .enumerate()
                 {
                     let y = layout.next(52.0);
+                    tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), tip));
                     if is_visible(sy(y), 52.0) {
                         let input = NumericSliderInput {
                             click_pos,
@@ -1194,6 +1348,7 @@ pub fn draw_settings_overlay(
 
             // Pitch Bend Override Toggle
             let y = layout.next(30.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Ignore the pitch bend range the file sets and use the PB Multiplier below for every channel."));
             let pb_override_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(pb_override_rect.y, pb_override_rect.height) {
                 if draw_toggle(
@@ -1219,6 +1374,10 @@ pub fn draw_settings_overlay(
             // Pitch Bend Multiplier Slider (only visible when override is on)
             if *pitch_bend_override {
                 let y = layout.next(52.0);
+                tips.push((
+                    Rectangle::new(20.0, sy(y), 360.0, 52.0),
+                    "The pitch bend range, in semitones, used when PB Range Override is on.",
+                ));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1271,6 +1430,7 @@ pub fn draw_settings_overlay(
             // Parse Threads slider: 1..=hardware threads. Applies to the next load.
             {
                 let y = layout.next(52.0);
+                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "CPU threads used to load a MIDI file. More loads faster. Takes effect on the next load."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1320,6 +1480,7 @@ pub fn draw_settings_overlay(
 
             // Show Statistics toggle
             let y = layout.next(30.0);
+            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Show the stats panel in the top-right corner: notes per second, note count, BPM, and for prerender engines polyphony and buffer."));
             let show_stats_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
             if is_visible(show_stats_rect.y, show_stats_rect.height) {
                 if draw_toggle(
@@ -1339,6 +1500,10 @@ pub fn draw_settings_overlay(
             // Scan Delay slider (debug): artificially slow the piano-roll scan.
             {
                 let y = layout.next(52.0);
+                tips.push((
+                    Rectangle::new(20.0, sy(y), 360.0, 52.0),
+                    "Debug: slows the piano roll's note scan on purpose to test lag. Leave at 0.",
+                ));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1429,6 +1594,25 @@ pub fn draw_settings_overlay(
         {
             let scroll_speed = 30.0;
             *scroll_y = (*scroll_y - mouse_wheel * scroll_speed).clamp(0.0, max_scroll);
+        }
+
+        // Tooltip for the row under the mouse, once it has rested there.
+        let popup_open = audio_engine_combo.open || midi_ev_mode_combo.open;
+        let hovered_tip = (!popup_open
+            && !is_mouse_down
+            && !*scrollbar_dragging
+            && scroll_area_rect.check_collision_point_rec(mouse_world_pos))
+        .then(|| {
+            tips.iter()
+                .find(|(rect, _)| rect.check_collision_point_rec(mouse_world_pos))
+                .map(|&(_, tip)| tip)
+        })
+        .flatten();
+        let now = d2d.get_time();
+        if let Some(tip) = settings_tooltip_ready(hovered_tip, now) {
+            // Drawn at the end of the frame (`draw_pending_tooltip`), above
+            // every other layer.
+            queue_tooltip(tip, mouse_pos, eased_t);
         }
 
         // Close button (fixed coordinates, outside scroll area)

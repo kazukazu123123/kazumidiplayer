@@ -1685,6 +1685,9 @@ fn main() {
             );
         }
 
+        // Topmost layer.
+        ui::draw_pending_tooltip(&mut d, screen_width, screen_height);
+
         if close_requested {
             app_state.overlay_manager.close();
         }
