@@ -190,3 +190,188 @@ pub fn draw_u32_numeric_slider(
 
     enabled && value_box_hovered && input.wheel != 0.0
 }
+
+/// `m:ss` for a duration in seconds.
+pub fn format_duration_secs(secs: u32) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Parses `m:ss`, `m:` or plain seconds (`90`). `None` while incomplete.
+pub fn parse_duration_secs(text: &str) -> Option<u32> {
+    match text.split_once(':') {
+        Some((m, s)) => {
+            let m: u32 = if m.is_empty() { 0 } else { m.parse().ok()? };
+            let s: u32 = if s.is_empty() { 0 } else { s.parse().ok()? };
+            m.checked_mul(60)?.checked_add(s)
+        }
+        None => text.parse().ok(),
+    }
+}
+
+/// A duration spinner: an `m:ss` box with - / + buttons, no slider. The box
+/// takes typed `m:ss` or seconds; the buttons and the wheel over the box
+/// step 1 s (Shift: 10 s, Ctrl: 1 min). `note` is drawn after the label.
+pub fn draw_duration_spinner(
+    d: &mut impl RaylibDraw,
+    rect: Rectangle,
+    label: &str,
+    note: Option<&str>,
+    value: &mut u32,
+    min: u32,
+    max: u32,
+    state: &mut NumericSliderState,
+    input: &NumericSliderInput,
+    alpha: f32,
+    enabled: bool,
+    disabled_text: Option<&str>,
+) -> bool {
+    *value = (*value).clamp(min, max);
+    state.dragging = false;
+    if !enabled {
+        state.editing = false;
+    }
+    let opacity = if enabled { 1.0 } else { 0.45 };
+    let text_color = Color::new(240, 240, 240, (255.0 * alpha * opacity) as u8);
+    let note_color = Color::new(160, 175, 195, (255.0 * alpha * opacity) as u8);
+    let border = Color::new(80, 80, 80, (255.0 * alpha * opacity) as u8);
+    let accent = Color::new(0, 120, 215, (255.0 * alpha) as u8);
+    let minus = Rectangle::new(rect.x, rect.y + 20.0, 28.0, 28.0);
+    let value_box = Rectangle::new(
+        rect.x + 33.0,
+        rect.y + 20.0,
+        if enabled { 90.0 } else { 155.0 },
+        28.0,
+    );
+    let plus = Rectangle::new(rect.x + 128.0, rect.y + 20.0, 28.0, 28.0);
+
+    d.draw_text(label, rect.x as i32, rect.y as i32, 16, text_color);
+    if let Some(note) = note {
+        let c_label = std::ffi::CString::new(label).unwrap_or_default();
+        // Safety: a valid NUL-terminated string; the default font is loaded.
+        let w = unsafe { raylib::ffi::MeasureText(c_label.as_ptr(), 16) };
+        d.draw_text(
+            note,
+            rect.x as i32 + w + 10,
+            rect.y as i32 + 2,
+            14,
+            note_color,
+        );
+    }
+
+    let value_box = if enabled {
+        value_box
+    } else {
+        Rectangle::new(rect.x, value_box.y, value_box.width, value_box.height)
+    };
+    d.draw_rectangle_rec(value_box, Color::new(30, 30, 30, (255.0 * alpha) as u8));
+    d.draw_rectangle_lines_ex(value_box, 1.0, if state.editing { accent } else { border });
+    let value_text = if !enabled {
+        disabled_text.unwrap_or("Disabled").to_owned()
+    } else if state.editing {
+        format!("{}_", state.edit_text)
+    } else {
+        format_duration_secs(*value)
+    };
+    d.draw_text(
+        &value_text,
+        value_box.x as i32 + 6,
+        value_box.y as i32 + 6,
+        if enabled { 16 } else { 14 },
+        text_color,
+    );
+    if !enabled {
+        return false;
+    }
+
+    for (button, text) in [(minus, "-"), (plus, "+")] {
+        let hover = button.check_collision_point_rec(input.mouse_pos);
+        d.draw_rectangle_rec(
+            button,
+            if hover {
+                Color::new(70, 70, 74, (255.0 * alpha) as u8)
+            } else {
+                Color::new(55, 55, 58, (255.0 * alpha) as u8)
+            },
+        );
+        d.draw_rectangle_lines_ex(button, 1.0, border);
+        d.draw_text(
+            text,
+            button.x as i32 + 9,
+            button.y as i32 + 4,
+            18,
+            text_color,
+        );
+    }
+
+    let step = if input.control {
+        60
+    } else if input.shift {
+        10
+    } else {
+        1
+    };
+    if let Some(click) = input.click_pos {
+        if value_box.check_collision_point_rec(click) {
+            if !state.editing {
+                state.edit_text.clear();
+            }
+            state.editing = true;
+        } else {
+            if minus.check_collision_point_rec(click) {
+                *value = value.saturating_sub(step).max(min);
+            } else if plus.check_collision_point_rec(click) {
+                *value = value.saturating_add(step).min(max);
+            }
+            state.editing = false;
+        }
+    }
+
+    let hovered = value_box.check_collision_point_rec(input.mouse_pos);
+    if hovered && input.wheel != 0.0 {
+        let amount = (input.wheel.abs().round() as u32)
+            .max(1)
+            .saturating_mul(step);
+        if input.wheel > 0.0 {
+            *value = value.saturating_add(amount).min(max);
+        } else {
+            *value = value.saturating_sub(amount).max(min);
+        }
+    }
+
+    if state.editing {
+        for &ch in &input.typed {
+            let colon_ok = ch == ':' && !state.edit_text.contains(':');
+            if (ch.is_ascii_digit() || colon_ok) && state.edit_text.len() < 8 {
+                state.edit_text.push(ch);
+            }
+        }
+        if input.backspace {
+            state.edit_text.pop();
+        }
+        // Apply every edit immediately; Enter only leaves editing mode.
+        if let Some(parsed) = parse_duration_secs(&state.edit_text) {
+            *value = parsed.clamp(min, max);
+        }
+        if input.enter || input.escape {
+            state.editing = false;
+        }
+    }
+
+    hovered && input.wheel != 0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_parse_and_format() {
+        assert_eq!(parse_duration_secs("90"), Some(90));
+        assert_eq!(parse_duration_secs("1:30"), Some(90));
+        assert_eq!(parse_duration_secs("5:"), Some(300));
+        assert_eq!(parse_duration_secs(":45"), Some(45));
+        assert_eq!(parse_duration_secs(""), None);
+        assert_eq!(format_duration_secs(300), "5:00");
+        assert_eq!(format_duration_secs(9), "0:09");
+    }
+}

@@ -32,7 +32,10 @@ pub const CHUNK_FRAMES: usize = 256;
 
 pub const DEFAULT_MAX_BUFFER_SECS: u32 = 10;
 pub const MIN_MAX_BUFFER_SECS: u32 = 1;
-pub const MAX_MAX_BUFFER_SECS: u32 = 60;
+pub const MAX_MAX_BUFFER_SECS: u32 = 300;
+
+/// Bytes one buffered frame takes (stereo `f32`).
+pub const BYTES_PER_FRAME: u64 = std::mem::size_of::<(f32, f32)>() as u64;
 
 /// KazuLimiter settings, applied to every prerender engine's output.
 const LIMITER_THRESHOLD_DB: f32 = 0.0;
@@ -371,12 +374,26 @@ impl Session {
                 s.base_ns = heard_ns(s, rate);
                 restart(s);
             }
+            // The ring keeps its allocation; give back what a smaller buffer
+            // no longer needs.
+            let max_frames = s.max_frames;
+            s.ring.shrink_to(max_frames);
         });
     }
 
     /// Song position of the audio being heard.
     pub fn position_ns(&self) -> u64 {
         heard_ns(&mut self.shared.lock(), self.shared.rate)
+    }
+
+    /// Output rate in Hz.
+    pub fn rate(&self) -> u32 {
+        self.shared.rate
+    }
+
+    /// Memory the buffer holds allocated, in bytes.
+    pub fn memory_bytes(&self) -> u64 {
+        self.shared.lock().ring.capacity() as u64 * BYTES_PER_FRAME
     }
 
     /// Rendered audio waiting to be played, in wall-clock nanoseconds.

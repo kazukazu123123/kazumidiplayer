@@ -1315,6 +1315,9 @@ fn main() {
                         let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
                         lines.push(format!("BUF   {} / {}", mss(buffered_ns), mss(max_ns)));
                     }
+                    if let Some((bytes, _)) = engine.buffer_memory() {
+                        lines.push(format!("MEM   {}", utils::format_bytes(bytes)));
+                    }
                     let font_size = 18;
                     let pad = 8;
                     let line_h = 22;
@@ -1565,6 +1568,7 @@ fn main() {
                             &mut app_state.settings_audio_engine_combo,
                             &mut app_state.audio_buffer_secs,
                             &mut app_state.settings_audio_buffer_slider,
+                            engine.buffer_memory(),
                             &mut app_state.midi_ev_mode,
                             &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,

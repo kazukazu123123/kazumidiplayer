@@ -171,6 +171,10 @@ pub struct PlayerHandle {
     polyphony: Arc<AtomicU32>,
     // Note-on velocity a prerender engine drops up to; 0 when not skipping.
     drop_velocity: Arc<AtomicU32>,
+    // Prerender buffer allocation in bytes and output rate; `u64::MAX` / 0
+    // for realtime outputs.
+    buffer_memory: Arc<AtomicU64>,
+    output_rate: Arc<AtomicU32>,
 }
 
 impl Clone for PlayerHandle {
@@ -193,6 +197,8 @@ impl Clone for PlayerHandle {
             audio_buffer_ns: self.audio_buffer_ns.clone(),
             polyphony: self.polyphony.clone(),
             drop_velocity: self.drop_velocity.clone(),
+            buffer_memory: self.buffer_memory.clone(),
+            output_rate: self.output_rate.clone(),
         }
     }
 }
@@ -224,6 +230,10 @@ impl PlayerHandle {
         let polyphony_for_thread = polyphony.clone();
         let drop_velocity = Arc::new(AtomicU32::new(0));
         let drop_velocity_for_thread = drop_velocity.clone();
+        let buffer_memory = Arc::new(AtomicU64::new(u64::MAX));
+        let buffer_memory_for_thread = buffer_memory.clone();
+        let output_rate = Arc::new(AtomicU32::new(0));
+        let output_rate_for_thread = output_rate.clone();
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -928,6 +938,14 @@ impl PlayerHandle {
                     prerender!(player).map_or(0, |p| p.drop_velocity()),
                     Ordering::Relaxed,
                 );
+                buffer_memory_for_thread.store(
+                    prerender!(player).map_or(u64::MAX, |p| p.memory_bytes()),
+                    Ordering::Relaxed,
+                );
+                output_rate_for_thread.store(
+                    prerender!(player).map_or(0, |p| p.rate()),
+                    Ordering::Relaxed,
+                );
                 *lock_mutex(&pitch_bend_range_clone) = player.channel_pitch_bend_range;
 
                 if player.state != PlayerState::Playing {
@@ -978,6 +996,8 @@ impl PlayerHandle {
             audio_buffer_ns,
             polyphony,
             drop_velocity,
+            buffer_memory,
+            output_rate,
         }
     }
 
@@ -1050,6 +1070,13 @@ impl PlayerHandle {
     /// Velocity notes are being skipped up to, or `None` when not skipping.
     pub fn skipping_velocity(&self) -> Option<u32> {
         Some(self.drop_velocity.load(Ordering::Relaxed)).filter(|&v| v > 0)
+    }
+
+    /// Prerender buffer allocation in bytes and output rate, or `None` for a
+    /// realtime output.
+    pub fn buffer_memory(&self) -> Option<(u64, u32)> {
+        let bytes = self.buffer_memory.load(Ordering::Relaxed);
+        (bytes != u64::MAX).then(|| (bytes, self.output_rate.load(Ordering::Relaxed)))
     }
 
     pub fn set_output(&self, stream: Option<OutputStream>) {

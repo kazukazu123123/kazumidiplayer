@@ -564,6 +564,9 @@ pub fn draw_settings_overlay(
     audio_engine_combo: &mut ComboBoxState,
     audio_buffer_secs: &mut u32,
     audio_buffer_slider: &mut NumericSliderState,
+    // Prerender buffer (allocated bytes, output rate); `None` while no
+    // prerender engine is open.
+    buffer_memory: Option<(u64, u32)>,
     midi_ev_mode: &mut usize,
     midi_ev_mode_combo: &mut ComboBoxState,
     parse_threads: &mut u32,
@@ -929,10 +932,23 @@ pub fn draw_settings_overlay(
                     let enabled = crate::audio_engine::EngineSelection::from_index(*audio_engine)
                         .render_mode()
                         == crate::audio_engine::RenderMode::Prerender;
-                    wheel_consumed |= draw_u32_numeric_slider(
+                    // Full-buffer size, at the open engine's rate (48 kHz
+                    // until one is open).
+                    let rate = buffer_memory.map_or(48_000, |(_, r)| r.max(1)) as u64;
+                    let full = *audio_buffer_secs as u64
+                        * rate
+                        * crate::audio_engine::prerender::BYTES_PER_FRAME;
+                    let note = match buffer_memory {
+                        Some((used, _)) => {
+                            format!("Memory: {} / {}", format_bytes(used), format_bytes(full))
+                        }
+                        None => format!("Memory: up to {}", format_bytes(full)),
+                    };
+                    wheel_consumed |= crate::ui_components::numeric_slider::draw_duration_spinner(
                         &mut d_scissor,
                         Rectangle::new(20.0, sy(y), 275.0, 52.0),
-                        "Max Audio Buffer (sec)",
+                        "Max Audio Buffer",
+                        enabled.then_some(note.as_str()),
                         audio_buffer_secs,
                         crate::audio_engine::prerender::MIN_MAX_BUFFER_SECS,
                         crate::audio_engine::prerender::MAX_MAX_BUFFER_SECS,
