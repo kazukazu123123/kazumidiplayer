@@ -205,6 +205,19 @@ impl State {
     }
 }
 
+/// Size the ring's allocation to the maximum buffer, so growing never
+/// overshoots it (a `VecDeque` doubles) and a smaller one gives memory back.
+/// It may exceed the maximum by up to one chunk.
+fn fit_ring(s: &mut State) {
+    let frames = s.max_frames + CHUNK_FRAMES;
+    if s.ring.capacity() > frames {
+        s.ring.shrink_to(frames);
+    } else {
+        let extra = frames - s.ring.len();
+        s.ring.reserve_exact(extra);
+    }
+}
+
 /// Restart rendering from the current state.
 fn restart(state: &mut State) {
     state.generation += 1;
@@ -251,6 +264,7 @@ impl Session {
             wake: Condvar::new(),
             rate,
         });
+        fit_ring(&mut shared.lock());
 
         let (tx_shutdown, rx_shutdown) = std::sync::mpsc::channel::<()>();
         let (tx_ready, rx_ready) = std::sync::mpsc::channel();
@@ -374,10 +388,7 @@ impl Session {
                 s.base_ns = heard_ns(s, rate);
                 restart(s);
             }
-            // The ring keeps its allocation; give back what a smaller buffer
-            // no longer needs.
-            let max_frames = s.max_frames;
-            s.ring.shrink_to(max_frames);
+            fit_ring(s);
         });
     }
 
@@ -391,9 +402,9 @@ impl Session {
         self.shared.rate
     }
 
-    /// Memory the buffer holds allocated, in bytes.
+    /// Memory the buffered audio takes, in bytes.
     pub fn memory_bytes(&self) -> u64 {
-        self.shared.lock().ring.capacity() as u64 * BYTES_PER_FRAME
+        self.shared.lock().ring.len() as u64 * BYTES_PER_FRAME
     }
 
     /// Rendered audio waiting to be played, in wall-clock nanoseconds.
