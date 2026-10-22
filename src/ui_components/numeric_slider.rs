@@ -5,6 +5,8 @@ pub struct NumericSliderState {
     pub dragging: bool,
     pub editing: bool,
     pub edit_text: String,
+    /// The whole `edit_text` is selected: the next key replaces it.
+    pub select_all: bool,
 }
 
 pub struct NumericSliderInput {
@@ -267,11 +269,25 @@ pub fn draw_duration_spinner(
     d.draw_rectangle_lines_ex(value_box, 1.0, if state.editing { accent } else { border });
     let value_text = if !enabled {
         disabled_text.unwrap_or("Disabled").to_owned()
-    } else if state.editing {
+    } else if state.editing && !state.select_all {
         format!("{}_", state.edit_text)
+    } else if state.editing {
+        state.edit_text.clone()
     } else {
         format_duration_secs(*value)
     };
+    if enabled && state.editing && state.select_all {
+        let c_text = std::ffi::CString::new(value_text.as_str()).unwrap_or_default();
+        // Safety: a valid NUL-terminated string; the default font is loaded.
+        let w = unsafe { raylib::ffi::MeasureText(c_text.as_ptr(), 16) };
+        d.draw_rectangle(
+            value_box.x as i32 + 4,
+            value_box.y as i32 + 5,
+            w + 4,
+            18,
+            Color::new(0, 90, 170, (255.0 * alpha) as u8),
+        );
+    }
     d.draw_text(
         &value_text,
         value_box.x as i32 + 6,
@@ -312,8 +328,11 @@ pub fn draw_duration_spinner(
     };
     if let Some(click) = input.click_pos {
         if value_box.check_collision_point_rec(click) {
+            // Start from the current value, selected, so the box never goes
+            // blank: typing replaces it, Backspace clears it.
             if !state.editing {
-                state.edit_text.clear();
+                state.edit_text = format_duration_secs(*value);
+                state.select_all = true;
             }
             state.editing = true;
         } else {
@@ -339,6 +358,10 @@ pub fn draw_duration_spinner(
     }
 
     if state.editing {
+        if state.select_all && (input.backspace || !input.typed.is_empty()) {
+            state.edit_text.clear();
+            state.select_all = false;
+        }
         for &ch in &input.typed {
             let colon_ok = ch == ':' && !state.edit_text.contains(':');
             if (ch.is_ascii_digit() || colon_ok) && state.edit_text.len() < 8 {
@@ -354,6 +377,7 @@ pub fn draw_duration_spinner(
         }
         if input.enter || input.escape {
             state.editing = false;
+            state.select_all = false;
         }
     }
 
