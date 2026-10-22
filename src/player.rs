@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -42,6 +43,8 @@ pub enum PlayerCommand {
     SetParseThreads(u32),
     /// Replace the output (audio engine switch).
     SetOutput(Option<OutputStream>),
+    /// Longest prerendered audio buffer, in seconds.
+    SetAudioBufferSecs(u32),
 }
 
 pub enum PlayerFeedback {
@@ -157,6 +160,8 @@ pub struct PlayerHandle {
     notes_played: Arc<AtomicU64>,
     // False once the player thread has unwound; see `AliveGuard`.
     alive: Arc<AtomicBool>,
+    // Prerendered audio waiting to play; `u64::MAX` for realtime outputs.
+    audio_buffer_ns: Arc<AtomicU64>,
 }
 
 impl Clone for PlayerHandle {
@@ -176,6 +181,7 @@ impl Clone for PlayerHandle {
             playback_speed: self.playback_speed.clone(),
             notes_played: self.notes_played.clone(),
             alive: self.alive.clone(),
+            audio_buffer_ns: self.audio_buffer_ns.clone(),
         }
     }
 }
@@ -201,6 +207,8 @@ impl PlayerHandle {
         let playback_speed = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let notes_played = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
+        let audio_buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
+        let audio_buffer_ns_for_thread = audio_buffer_ns.clone();
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -274,6 +282,13 @@ impl PlayerHandle {
             let mut midi_ev_catch_up = false;
             let mut legacy_midi_output = true;
             let mut midi_ev_fifo = VecDeque::<BufferedMidiEvent>::new();
+            let mut audio_buffer_secs = crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS;
+            // The prerender session of the current output, if any.
+            macro_rules! prerender {
+                ($player:ident) => {
+                    $player.stream.as_ref().and_then(|s| s.prerender())
+                };
+            }
 
             let mut player = MIDIPlayer::new(
                 kdmapi_for_thread,
@@ -293,8 +308,15 @@ impl PlayerHandle {
                             applied_speed = read_speed(&playback_speed_clone);
                             playback_base_ns = player.seek_position_ns;
                             playback_start = Instant::now();
+                            if let Some(p) = prerender!(player) {
+                                p.play(player.seek_position_ns, applied_speed);
+                            }
                         }
                         PlayerCommand::Pause => {
+                            if let Some(p) = prerender!(player) {
+                                // Resume exactly where the kept buffer begins.
+                                player.seek_position_ns = p.pause();
+                            }
                             midi_ev_fifo.clear();
                             player.send_all_notes_off();
                             player.state = PlayerState::Paused;
@@ -302,6 +324,10 @@ impl PlayerHandle {
                             active_count = [0u16; 128];
                         }
                         PlayerCommand::Stop => {
+                            if let Some(p) = prerender!(player) {
+                                p.pause();
+                                p.seek(0);
+                            }
                             midi_ev_fifo.clear();
                             player.reset_playback_state();
                             player.state = PlayerState::Stopped;
@@ -326,6 +352,11 @@ impl PlayerHandle {
                             playback_base_ns = latest_pos;
                             playback_start = Instant::now();
                             player.seek_tracks(latest_pos);
+                            if let Some(p) = prerender!(player) {
+                                // May land a few frames off when skipping
+                                // inside the buffer; follow the audio.
+                                player.seek_position_ns = p.seek(latest_pos);
+                            }
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
                             *lock_mutex(&pitch_bend_clone) = [8192; 16];
@@ -334,6 +365,10 @@ impl PlayerHandle {
                             state_clone.store(player.state as u32, Ordering::SeqCst);
                         }
                         PlayerCommand::LoadFile(path) => {
+                            if let Some(p) = prerender!(player) {
+                                p.pause();
+                                p.set_data(None);
+                            }
                             midi_ev_fifo.clear();
                             if let Some(ref stream) = player.stream {
                                 // Do not let output queued for the old file delay its
@@ -377,6 +412,9 @@ impl PlayerHandle {
                             } else if !enabled && prev {
                                 player.send_pitch_bend_range_restore();
                             }
+                            if let Some(p) = prerender!(player) {
+                                p.set_bend_override(player.bend_override());
+                            }
                         }
                         PlayerCommand::SetPitchBendMultiplier(multiplier) => {
                             let prev = player.pitch_bend_multiplier.load(Ordering::SeqCst);
@@ -387,6 +425,9 @@ impl PlayerHandle {
                                 && multiplier != prev
                             {
                                 player.send_pitch_bend_range_override();
+                            }
+                            if let Some(p) = prerender!(player) {
+                                p.set_bend_override(player.bend_override());
                             }
                         }
                         PlayerCommand::SetUnlimitedOutput(enabled) => {
@@ -420,6 +461,9 @@ impl PlayerHandle {
                         PlayerCommand::SetSpeed(speed) => {
                             let clamped = speed.clamp(0.05, 4.0);
                             playback_speed_clone.store(clamped.to_bits(), Ordering::Relaxed);
+                            if let Some(p) = prerender!(player) {
+                                p.set_speed(clamped);
+                            }
                         }
                         PlayerCommand::SetParseThreads(threads) => {
                             parser_worker_for_thread.set_threads(threads);
@@ -431,6 +475,27 @@ impl PlayerHandle {
                             player.send_all_notes_off();
                             player.stream = stream;
                             player.reset_playback_state();
+                            if let Some(p) = prerender!(player) {
+                                p.set_bend_override(player.bend_override());
+                                p.set_max_buffer_secs(audio_buffer_secs);
+                                p.set_data(player.data.clone());
+                                if player.state == PlayerState::Playing {
+                                    applied_speed = read_speed(&playback_speed_clone);
+                                    p.play(player.seek_position_ns, applied_speed);
+                                } else {
+                                    p.seek(player.seek_position_ns);
+                                }
+                            } else if player.state == PlayerState::Playing {
+                                // Leaving prerender: continue on the wall clock.
+                                playback_base_ns = player.seek_position_ns;
+                                playback_start = Instant::now();
+                            }
+                        }
+                        PlayerCommand::SetAudioBufferSecs(secs) => {
+                            audio_buffer_secs = secs;
+                            if let Some(p) = prerender!(player) {
+                                p.set_max_buffer_secs(secs);
+                            }
                         }
                     }
                 }
@@ -459,6 +524,10 @@ impl PlayerHandle {
 
                             *lock_mutex(&current_midi_data_for_thread) = Some(data.clone());
 
+                            if let Some(p) = prerender!(player) {
+                                p.set_data(Some(data.clone()));
+                                p.seek(0);
+                            }
                             player.load_parsed_data(Some(data));
                             duration_clone.store(player.get_duration_ns(), Ordering::SeqCst);
 
@@ -547,11 +616,19 @@ impl PlayerHandle {
                         let since_anchor_ns = (playback_start.elapsed().as_nanos() as f64
                             * applied_speed as f64)
                             as u64;
-                        let ideal_position_ns = playback_base_ns.saturating_add(since_anchor_ns);
+                        // Prerendered output is the clock: follow what is audible.
+                        let ideal_position_ns = match prerender!(player) {
+                            Some(p) => p.position_ns(),
+                            None => playback_base_ns.saturating_add(since_anchor_ns),
+                        };
                         let cur_tick = ns_to_tick(unsafe { &*data.as_ptr() }, ideal_position_ns);
                         player.seek_position_ns = ideal_position_ns;
 
-                        let unlimited = player.unlimited_output.load(Ordering::Relaxed);
+                        // Prerender outputs ignore the MIDI sent here (it only
+                        // drives the display), so pacing it would just make
+                        // the display lag the audio: always go direct.
+                        let unlimited = player.unlimited_output.load(Ordering::Relaxed)
+                            || prerender!(player).is_some();
                         // Unlimited has one unambiguous path: globally ordered,
                         // synchronous direct dispatch. Keep the selected EV mode only
                         // for when Unlimited is turned off again.
@@ -670,17 +747,20 @@ impl PlayerHandle {
                         } else {
                             // Fill the bounded FIFO from all tracks in timestamp order.
                             // Track index is the stable tie-breaker for simultaneous events.
+                            // A min-heap of due tracks keeps each pick O(log tracks):
+                            // scanning every track per event stalls this thread for
+                            // seconds on files with tens of thousands of tracks.
+                            let mut due: BinaryHeap<Reverse<(u32, usize)>> = player
+                                .tracks
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, track)| track.pending && track.pend_tick <= cur_tick)
+                                .map(|(index, track)| Reverse((track.pend_tick, index)))
+                                .collect();
                             while midi_ev_fifo.len() < capacity {
-                                let next_track = player
-                                    .tracks
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, track)| {
-                                        track.pending && track.pend_tick <= cur_tick
-                                    })
-                                    .min_by_key(|(index, track)| (track.pend_tick, *index))
-                                    .map(|(index, _)| index);
-                                let Some(track_index) = next_track else { break };
+                                let Some(Reverse((_, track_index))) = due.pop() else {
+                                    break;
+                                };
                                 let track = &mut player.tracks[track_index];
                                 submit_event!(BufferedMidiEvent {
                                     tick: track.pend_tick,
@@ -704,6 +784,9 @@ impl PlayerHandle {
                                         track.pend_p2 = track.cursor.param2;
                                         break;
                                     }
+                                }
+                                if track.pending && track.pend_tick <= cur_tick {
+                                    due.push(Reverse((track.pend_tick, track_index)));
                                 }
                             }
                         }
@@ -777,6 +860,9 @@ impl PlayerHandle {
                         if player.seek_position_ns >= max_ns && (use_legacy_traversal || drained) {
                             player.seek_position_ns = max_ns;
                             player.state = PlayerState::Stopped;
+                            if let Some(p) = prerender!(player) {
+                                p.pause();
+                            }
                             player.reset_playback_state();
                             *lock_mutex(&active_notes_clone) = [None; 128];
                             active_count = [0u16; 128];
@@ -788,10 +874,22 @@ impl PlayerHandle {
                 state_clone.store(player.state as u32, Ordering::SeqCst);
                 position_clone.store(player.seek_position_ns, Ordering::SeqCst);
                 notes_played_clone.store(notes_played_count, Ordering::Relaxed);
+                audio_buffer_ns_for_thread.store(
+                    prerender!(player).map_or(u64::MAX, |p| p.buffered_ns()),
+                    Ordering::Relaxed,
+                );
                 *lock_mutex(&pitch_bend_range_clone) = player.channel_pitch_bend_range;
 
                 if player.state != PlayerState::Playing {
                     thread::sleep(Duration::from_millis(10));
+                } else if prerender!(player).is_some() {
+                    // Only the display follows this loop; once per frame is
+                    // enough, and the audio clock keeps it in step.
+                    if let Some(remaining) =
+                        MIDI_EV_FRAME_DURATION.checked_sub(frame_start.elapsed())
+                    {
+                        thread::sleep(remaining);
+                    }
                 } else if legacy_midi_output {
                     // This was the pre-buffer cadence: run continuously and let the
                     // hard-coded per-pass event ceiling provide the only throttling.
@@ -827,6 +925,7 @@ impl PlayerHandle {
             playback_speed,
             notes_played,
             alive,
+            audio_buffer_ns,
         }
     }
 
@@ -878,6 +977,17 @@ impl PlayerHandle {
 
     pub fn set_speed(&self, speed: f32) {
         let _ = self.tx_command.send(PlayerCommand::SetSpeed(speed));
+    }
+
+    pub fn set_audio_buffer_secs(&self, secs: u32) {
+        let _ = self
+            .tx_command
+            .send(PlayerCommand::SetAudioBufferSecs(secs));
+    }
+
+    /// Prerendered audio waiting to play, or `None` for a realtime output.
+    pub fn audio_buffer_ns(&self) -> Option<u64> {
+        Some(self.audio_buffer_ns.load(Ordering::Relaxed)).filter(|&ns| ns != u64::MAX)
     }
 
     pub fn set_output(&self, stream: Option<OutputStream>) {
@@ -1010,6 +1120,13 @@ impl MIDIPlayer {
             self.channel_rpn_lsb[ch] = 127;
             self.channel_pitch_bend_range[ch] = multiplier as f32;
         }
+    }
+
+    /// Forced bend range for prerender sessions, if Pitch Bend Override is on.
+    fn bend_override(&self) -> Option<u8> {
+        self.pitch_bend_override
+            .load(Ordering::SeqCst)
+            .then(|| self.pitch_bend_multiplier.load(Ordering::SeqCst))
     }
 
     fn send_pitch_bend_range_restore(&mut self) {

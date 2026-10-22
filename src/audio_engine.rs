@@ -1,21 +1,41 @@
 //! Pluggable MIDI output backends.
 //!
-//! Adding an engine: implement [`AudioEngine`] in `audio_engine/<name>.rs`, then
+//! Adding an engine: put a built-in synth in `audio_engine/synths/<name>.rs`,
+//! implement [`AudioEngine`] in `audio_engine/<name>.rs`, then
 //! list it in [`ENGINES`] with [`register`]. Opening off the UI thread,
 //! queueing, discarding output for a previous file, ordering and serializing
 //! calls are handled here; the engine never sees two calls at once.
 
+mod csynth;
 mod kdmapi;
 mod pending;
+pub mod prerender;
+mod sine;
+pub mod synths;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
+/// How an engine produces audio.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderMode {
+    /// Plays each message as it is sent.
+    #[default]
+    Realtime,
+    /// Renders the file ahead of playback into a buffer ([`prerender`]).
+    /// Such engines implement [`AudioEngine::render`] and, for sample-accurate
+    /// timing, [`AudioEngine::send_midi_event_at`].
+    Prerender,
+}
+
 /// One MIDI output backend.
 pub trait AudioEngine: Send + 'static {
     /// Name shown in the settings combo box.
     const LABEL: &'static str;
+
+    /// How this engine renders. Defaults to [`RenderMode::Realtime`].
+    const RENDER_MODE: RenderMode = RenderMode::Realtime;
 
     /// Open the engine. Runs on a background thread, so it may block
     /// (e.g. while samples download).
@@ -31,11 +51,31 @@ pub trait AudioEngine: Send + 'static {
     /// Release the engine. Called once on the worker thread after the last
     /// message, once the output is no longer selected.
     fn close(&mut self);
+
+    /// Schedule a message `frame` frames into the next `render` call.
+    /// Prerender engines only; the default applies it at the start of it.
+    fn send_midi_event_at(&mut self, frame: u32, data: u32) {
+        let _ = frame;
+        self.send_midi_event(data);
+    }
+
+    /// Output rate of [`render`](AudioEngine::render). Prerender engines only.
+    fn sample_rate(&self) -> u32 {
+        48_000
+    }
+
+    /// Render the next `left.len()` frames (always a multiple of
+    /// [`prerender::CHUNK_FRAMES`]). Prerender engines only.
+    fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
+        left.fill(0.0);
+        right.fill(0.0);
+    }
 }
 
 /// Type-erased registration record; build with [`register`].
 pub struct EngineDef {
     label: &'static str,
+    render_mode: RenderMode,
     open: fn() -> Result<SharedEngine, String>,
 }
 
@@ -44,6 +84,7 @@ type SharedEngine = Arc<Mutex<dyn ErasedEngine>>;
 pub const fn register<E: AudioEngine>() -> EngineDef {
     EngineDef {
         label: E::LABEL,
+        render_mode: E::RENDER_MODE,
         open: || E::open().map(|e| Arc::new(Mutex::new(e)) as SharedEngine),
     }
 }
@@ -52,6 +93,9 @@ pub const fn register<E: AudioEngine>() -> EngineDef {
 trait ErasedEngine: Send {
     fn send_midi_event(&mut self, data: u32) -> u32;
     fn close(&mut self);
+    fn sample_rate(&self) -> u32;
+    fn send_midi_event_at(&mut self, frame: u32, data: u32);
+    fn render(&mut self, left: &mut [f32], right: &mut [f32]);
 }
 
 impl<E: AudioEngine> ErasedEngine for E {
@@ -62,12 +106,27 @@ impl<E: AudioEngine> ErasedEngine for E {
     fn close(&mut self) {
         AudioEngine::close(self)
     }
+
+    fn sample_rate(&self) -> u32 {
+        AudioEngine::sample_rate(self)
+    }
+
+    fn send_midi_event_at(&mut self, frame: u32, data: u32) {
+        AudioEngine::send_midi_event_at(self, frame, data)
+    }
+
+    fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
+        AudioEngine::render(self, left, right)
+    }
 }
 
 /// Every selectable engine, in combo box order. Index 0 is the default.
 /// Append new engines: the saved setting is an index into this list.
 pub const ENGINES: &[EngineDef] = &[
     register::<crate::kdmapi::KDMAPIStream>(),
+    register::<synths::csynth::CSynthStream>(),
+    register::<synths::csynth::CSynthPrerender>(),
+    register::<synths::sine::SinePrerender>(),
 ];
 
 const ENGINE_COUNT: usize = ENGINES.len();
@@ -100,8 +159,12 @@ impl EngineSelection {
         ENGINES[self.0].label
     }
 
+    pub fn render_mode(self) -> RenderMode {
+        ENGINES[self.0].render_mode
+    }
+
     pub fn start(self) -> Receiver<Result<OutputStream, String>> {
-        OutputStream::open(ENGINES[self.0].open)
+        OutputStream::open(ENGINES[self.0].open, ENGINES[self.0].render_mode)
     }
 }
 
@@ -117,10 +180,16 @@ pub struct OutputStream {
     queue: pending::MidiSender,
     engine: SharedEngine,
     queued_since_flush: AtomicBool,
+    /// Present for [`RenderMode::Prerender`] engines. MIDI sent through the
+    /// `send_*` methods is then ignored: the session renders the file itself.
+    prerender: Option<prerender::Session>,
 }
 
 impl OutputStream {
-    fn open(open: fn() -> Result<SharedEngine, String>) -> Receiver<Result<OutputStream, String>> {
+    fn open(
+        open: fn() -> Result<SharedEngine, String>,
+        mode: RenderMode,
+    ) -> Receiver<Result<OutputStream, String>> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let engine = match open() {
@@ -130,11 +199,34 @@ impl OutputStream {
                     return;
                 }
             };
+            let prerender = match mode {
+                RenderMode::Realtime => None,
+                RenderMode::Prerender => {
+                    let rate = lock(&engine).sample_rate();
+                    let render_engine = engine.clone();
+                    let render: prerender::RenderFn = Box::new(move |msgs, left, right| {
+                        let mut engine = lock(&render_engine);
+                        for &(frame, msg) in msgs {
+                            engine.send_midi_event_at(frame, msg);
+                        }
+                        engine.render(left, right);
+                    });
+                    match prerender::Session::start(rate, render) {
+                        Ok(session) => Some(session),
+                        Err(e) => {
+                            lock(&engine).close();
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    }
+                }
+            };
             let (queue, input) = pending::channel();
             let stream = OutputStream {
                 queue,
                 engine: engine.clone(),
                 queued_since_flush: AtomicBool::new(false),
+                prerender,
             };
             if tx.send(Ok(stream)).is_err() {
                 lock(&engine).close();
@@ -167,11 +259,14 @@ impl OutputStream {
 
     #[cfg(test)]
     pub(crate) fn open_engine<E: AudioEngine>() -> Receiver<Result<OutputStream, String>> {
-        Self::open(register::<E>().open)
+        Self::open(register::<E>().open, E::RENDER_MODE)
     }
 
     /// Queue a message without blocking the caller.
     pub fn send_direct_data(&self, data: u32) -> u32 {
+        if self.prerender.is_some() {
+            return 0;
+        }
         self.queued_since_flush.store(true, Ordering::Relaxed);
         self.queue.send(data);
         0
@@ -179,6 +274,9 @@ impl OutputStream {
 
     /// Send on the caller's thread, in order with earlier queued messages.
     pub fn send_direct_data_blocking(&mut self, data: u32) -> u32 {
+        if self.prerender.is_some() {
+            return 0;
+        }
         if *self.queued_since_flush.get_mut() {
             if !self.queue.flush() {
                 return 0;
@@ -186,6 +284,11 @@ impl OutputStream {
             *self.queued_since_flush.get_mut() = false;
         }
         lock(&self.engine).send_midi_event(data)
+    }
+
+    /// The prerender session, for [`RenderMode::Prerender`] engines.
+    pub fn prerender(&self) -> Option<&prerender::Session> {
+        self.prerender.as_ref()
     }
 
     /// Make output already queued for the previous file obsolete.

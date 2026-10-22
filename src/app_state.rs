@@ -142,6 +142,8 @@ pub struct AppState {
     pub midi_ev_mode: usize,
     /// Index into `AudioEngine::ALL`.
     pub audio_engine: usize,
+    /// Longest prerendered audio buffer, in seconds.
+    pub audio_buffer_secs: u32,
 
     // UI (non-editor)
     pub last_input_event: Option<InputEvent>,
@@ -158,6 +160,7 @@ pub struct AppState {
         crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
+    pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_scan_delay_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_parse_threads_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub speed_slider_dragging: bool,
@@ -264,6 +267,7 @@ impl AppState {
             midi_ev_buffer_size: crate::player::DEFAULT_MIDI_EV_BUFFER_SIZE,
             midi_ev_mode: 0,
             audio_engine: 0,
+            audio_buffer_secs: crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS,
 
             // UI (non-editor)
             last_input_event: None,
@@ -280,6 +284,8 @@ impl AppState {
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
+            settings_audio_buffer_slider:
+                crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_scan_delay_slider: Default::default(),
             settings_parse_threads_slider: Default::default(),
             speed_slider_dragging: false,

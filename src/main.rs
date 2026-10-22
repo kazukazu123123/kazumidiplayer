@@ -1,5 +1,6 @@
 mod app_state;
 mod audio_engine;
+mod audio_limiter;
 mod blur_requester;
 mod flip_3d;
 mod kazumidiparser_cursor;
@@ -129,6 +130,7 @@ fn main() {
     let startup_audio_engine = audio_engine::EngineSelection::from_index(app_state.audio_engine);
     let mut pending_audio_engine = Some((startup_audio_engine, startup_audio_engine.start()));
     let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, None);
+    engine.set_audio_buffer_secs(app_state.audio_buffer_secs);
 
     let mut render_texture = rl
         .load_render_texture(
@@ -1171,6 +1173,12 @@ fn main() {
                                 duration_ns,
                                 current_event,
                                 gen_frac,
+                                // Buffered audio is wall-clock time; scale to song time.
+                                engine.audio_buffer_ns().map(|buffered| {
+                                    playback_position_ns.saturating_add(
+                                        (buffered as f64 * app_state.playback_speed as f64) as u64,
+                                    )
+                                }),
                             ) {
                                 let clamped_mouse_x = local_mouse.x.clamp(seek_x, seek_x + seek_w);
                                 let t = (clamped_mouse_x - seek_x) / seek_w;
@@ -1195,6 +1203,9 @@ fn main() {
                                 &mut app_state.playback_speed,
                                 &mut app_state.speed_slider_dragging,
                                 cx + cw - 10.0,
+                                engine.audio_buffer_ns().map(|ns| {
+                                    (ns, app_state.audio_buffer_secs as u64 * 1_000_000_000)
+                                }),
                             );
                             if app_state.playback_speed != prev_speed {
                                 engine.set_speed(app_state.playback_speed);
@@ -1493,6 +1504,7 @@ fn main() {
                         let prev_midi_ev_mode = app_state.midi_ev_mode;
                         let prev_parse_threads = app_state.parse_threads;
                         let prev_audio_engine = app_state.audio_engine;
+                        let prev_audio_buffer_secs = app_state.audio_buffer_secs;
                         if ui::draw_settings_overlay(
                             d,
                             screen_width,
@@ -1538,6 +1550,8 @@ fn main() {
                             &mut app_state.settings_midi_ev_buffer_size_slider,
                             &mut app_state.audio_engine,
                             &mut app_state.settings_audio_engine_combo,
+                            &mut app_state.audio_buffer_secs,
+                            &mut app_state.settings_audio_buffer_slider,
                             &mut app_state.midi_ev_mode,
                             &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,
@@ -1564,6 +1578,9 @@ fn main() {
                         if app_state.midi_ev_mode != prev_midi_ev_mode {
                             engine.set_legacy_midi_output(app_state.midi_ev_mode == 0);
                             engine.set_midi_ev_catch_up(app_state.midi_ev_mode == 2);
+                        }
+                        if app_state.audio_buffer_secs != prev_audio_buffer_secs {
+                            engine.set_audio_buffer_secs(app_state.audio_buffer_secs);
                         }
                         if app_state.parse_threads != prev_parse_threads {
                             engine.set_parse_threads(app_state.parse_threads);

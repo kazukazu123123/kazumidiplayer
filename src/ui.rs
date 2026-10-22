@@ -44,6 +44,8 @@ pub fn draw_seek_bar(
     // Note-generation progress (furthest generated tick / whole MIDI), 0..1.
     // Drawn as a colored span under the playback fill so the scan is visible.
     gen_frac: Option<f32>,
+    // Prerender only: song position up to which audio has been rendered.
+    rendered_end_ns: Option<u64>,
 ) -> bool {
     let seek_bar_bg_color = if is_loading {
         Color::DARKGRAY
@@ -65,6 +67,19 @@ pub fn draw_seek_bar(
                 &[(0.0, frac, Color::new(70, 90, 150, 255))],
                 None,
                 Color::new(0, 0, 0, 0),
+            );
+        }
+
+        // Rendered-ahead span, under the playback fill so only the part past
+        // the playhead shows.
+        if let Some(end_ns) = rendered_end_ns {
+            let end = ((end_ns.min(duration_ns) as f64 / duration_ns as f64) * w as f64) as i32;
+            d.draw_rectangle(
+                x as i32,
+                y as i32,
+                end,
+                h as i32,
+                Color::new(90, 160, 230, 255),
             );
         }
 
@@ -102,6 +117,8 @@ pub fn draw_media_controls(
     playback_speed: &mut f32,
     speed_slider_dragging: &mut bool,
     content_right: f32,
+    // (buffered, max) prerendered audio; `None` for realtime engines.
+    audio_buffer: Option<(u64, u64)>,
 ) {
     let button_w = 80.0;
     let button_h = 30.0;
@@ -167,6 +184,24 @@ pub fn draw_media_controls(
         14,
         text_color,
     );
+    if let Some((buffered_ns, max_ns)) = audio_buffer {
+        // m:ss.xx, rounded to centiseconds.
+        let mss = |ns: u64| {
+            let cs = (ns + 5_000_000) / 10_000_000;
+            format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
+        };
+        let text = format!("Audio Buffer: {} / {}", mss(buffered_ns), mss(max_ns));
+        let c_text = std::ffi::CString::new(text.as_str()).unwrap_or_default();
+        // Safety: a valid NUL-terminated string; the default font is loaded.
+        let w = unsafe { raylib::ffi::MeasureText(c_text.as_ptr(), 14) };
+        d.draw_text(
+            &text,
+            (content_right as i32 - w).max(slider_x as i32 + 60),
+            y_offset as i32,
+            14,
+            text_color,
+        );
+    }
     d.draw_rectangle(
         slider_x as i32,
         track_y as i32,
@@ -547,6 +582,8 @@ pub fn draw_settings_overlay(
     midi_ev_buffer_size_slider: &mut NumericSliderState,
     audio_engine: &mut usize,
     audio_engine_combo: &mut ComboBoxState,
+    audio_buffer_secs: &mut u32,
+    audio_buffer_slider: &mut NumericSliderState,
     midi_ev_mode: &mut usize,
     midi_ev_mode_combo: &mut ComboBoxState,
     parse_threads: &mut u32,
@@ -893,6 +930,56 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // Prerender buffer length; applies immediately.
+            {
+                let y = layout.next(52.0);
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    let enabled = crate::audio_engine::EngineSelection::from_index(*audio_engine)
+                        .render_mode()
+                        == crate::audio_engine::RenderMode::Prerender;
+                    wheel_consumed |= draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        "Max Audio Buffer (sec)",
+                        audio_buffer_secs,
+                        crate::audio_engine::prerender::MIN_MAX_BUFFER_SECS,
+                        crate::audio_engine::prerender::MAX_MAX_BUFFER_SECS,
+                        audio_buffer_slider,
+                        &input,
+                        eased_t,
+                        enabled,
+                        Some("Realtime engine"),
+                    );
+                }
+            }
+
+            // Prerender engines render the file themselves, so the MIDI output
+            // pacing settings below have nothing to act on.
+            let prerender_engine = crate::audio_engine::EngineSelection::from_index(*audio_engine)
+                .render_mode()
+                == crate::audio_engine::RenderMode::Prerender;
+            let ev_bypassed = *unlimited_output || prerender_engine;
+            let bypass_text = if prerender_engine {
+                "Bypassed (Prerender)"
+            } else {
+                "Bypassed (Direct)"
+            };
+            if ev_bypassed {
+                midi_ev_mode_combo.open = false;
+            }
+
             // Unlimited Output Toggle
             let y = layout.next(30.0);
             let unlimited_output_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
@@ -902,7 +989,7 @@ pub fn draw_settings_overlay(
                     unlimited_output_rect,
                     "Unlimited Output",
                     unlimited_output_animation,
-                    true,
+                    !prerender_engine,
                     eased_t,
                     click_pos,
                     Some(mouse_world_pos),
@@ -927,7 +1014,7 @@ pub fn draw_settings_overlay(
                         enter: numeric_enter,
                         escape: numeric_escape,
                     };
-                    let slider_enabled = !*unlimited_output && *midi_ev_mode != 0;
+                    let slider_enabled = !ev_bypassed && *midi_ev_mode != 0;
                     let mut fixed_value = if *midi_ev_mode == 0 { 8192 } else { 1 };
                     let displayed_value = if slider_enabled {
                         &mut *midi_ev_buffer_size
@@ -939,8 +1026,8 @@ pub fn draw_settings_overlay(
                     } else {
                         "MIDI EV Buffer Size"
                     };
-                    let disabled_text = if *unlimited_output {
-                        "Bypassed (Direct)"
+                    let disabled_text = if ev_bypassed {
+                        bypass_text
                     } else {
                         "8192 (Fixed)"
                     };
@@ -964,7 +1051,7 @@ pub fn draw_settings_overlay(
             if is_visible(sy(y), 52.0) {
                 let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
                 midi_ev_mode_combo_rect = Some(combo_rect);
-                let was_open = midi_ev_mode_combo.open && !*unlimited_output;
+                let was_open = midi_ev_mode_combo.open && !ev_bypassed;
                 draw_combo_box(
                     &mut d_scissor,
                     combo_rect,
@@ -978,8 +1065,8 @@ pub fn draw_settings_overlay(
                     midi_ev_mode_combo,
                     click_pos,
                     eased_t,
-                    !*unlimited_output,
-                    Some("Bypassed (Direct)"),
+                    !ev_bypassed,
+                    Some(bypass_text),
                 );
 
                 // The popup overlays later settings, so clicks handled by its header
