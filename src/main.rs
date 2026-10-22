@@ -1315,9 +1315,6 @@ fn main() {
                         let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
                         lines.push(format!("BUF   {} / {}", mss(buffered_ns), mss(max_ns)));
                     }
-                    if let Some((bytes, _)) = engine.buffer_memory() {
-                        lines.push(format!("MEM   {}", utils::format_bytes(bytes)));
-                    }
                     let font_size = 18;
                     let pad = 8;
                     let line_h = 22;
