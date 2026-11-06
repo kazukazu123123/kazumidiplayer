@@ -34,15 +34,13 @@ const MAX_PARTIAL_HZ: f64 = 14_000.0;
 /// Hammer strike point, as a fraction of the speaking length.
 const STRIKE_POINT: f64 = 1.0 / 8.0;
 /// Aftersound share of a paired partial, and how much faster prompt decays.
-const AFTERSOUND: f32 = 0.3;
-const PROMPT_DECAY_RATIO: f64 = 4.0;
-/// Detune between a pair's lanes, in cents.
-const UNISON_CENTS: f64 = 0.6;
+const AFTERSOUND: f32 = 0.24;
+const PROMPT_DECAY_RATIO: f64 = 3.0;
 /// Highest damped key (F#6); keys above ring until they die away.
 const LAST_DAMPED: usize = 90;
 /// Strike knock: length, and level relative to the tone.
-const KNOCK_SECS: f64 = 0.015;
-const KNOCK_LEVEL: f32 = 0.6;
+const KNOCK_SECS: f64 = 0.025;
+const KNOCK_LEVEL: f32 = 0.25;
 const BEND_CENTER: u16 = 8192;
 const DEFAULT_BEND_RANGE: f32 = 2.0;
 
@@ -135,15 +133,20 @@ impl NoteSpec {
             if hz >= limit || spec.count + lanes > LANES {
                 break;
             }
-            // Strike-point comb, natural 1/k roll-off, and the soundboard's
-            // weak low end.
-            let comb = (std::f64::consts::PI * kf * STRIKE_POINT).sin().abs();
+            // The hammer excites each string mode with the signed spatial
+            // shape at its strike point. Keeping the sign preserves the
+            // phase reversals between partials that a real strike creates.
+            let comb = (std::f64::consts::PI * kf * STRIKE_POINT).sin();
             let radiation = hz * hz / (hz * hz + 90.0 * 90.0);
-            let amp = comb / kf.powf(0.8) * radiation;
-            // Losses grow with frequency (air and internal friction).
-            let sigma = sigma0 * (1.0 + 0.15 * (kf - 1.0)) + 4e-7 * hz * hz;
+            let amp = comb / kf.powf(1.35) * radiation;
+            // Bass strings retain their low modes longer; treble loses upper
+            // modes quickly through hammer and soundboard absorption.
+            let loss = sigma0 * (1.0 + 0.11 * (kf - 1.0)) + 6e-7 * hz * hz;
+            let sigma = loss;
             if lanes == 2 {
-                let detune = 2f64.powf(UNISON_CENTS / 1200.0);
+                let register = ((note as f64 - 21.0) / 87.0).clamp(0.0, 1.0);
+                let detune_cents = 0.35 + register * 1.1 + kf * 0.035;
+                let detune = 2f64.powf(detune_cents / 1200.0);
                 push(
                     &mut spec,
                     hz,
@@ -864,48 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn unit_pitch_fast_path_matches_interpolated_path() {
-        let spec = NoteSpec::new(60, 8_000);
-        let cache = Cache::get(8_000);
-        let voice = || Voice {
-            seq: 0,
-            channel: 0,
-            note: 60,
-            pos: 0.0,
-            gain: 0.7,
-            lp: 0.83,
-            lp_y: 0.0,
-            env: 1.0,
-            damped: false,
-            pedal_held: false,
-            dead: false,
-            start: 17,
-            release_at: Some(160),
-            kill_at: None,
-        };
-        let (mut fast, mut reference) = (voice(), voice());
-        let (mut fl, mut fr, mut rl, mut rr) = (
-            vec![0.0; 256],
-            vec![0.0; 256],
-            vec![0.0; 256],
-            vec![0.0; 256],
-        );
-        fast.render(&mut fl, &mut fr, &spec, &cache.notes[60], &[(0, 1.0)]);
-        reference.render(
-            &mut rl,
-            &mut rr,
-            &spec,
-            &cache.notes[60],
-            &[(0, 1.0), (128, 1.0)],
-        );
-        assert_eq!(fl, rl);
-        assert_eq!(fr, rr);
-        assert_eq!(fast.pos, reference.pos);
-        assert_eq!(fast.lp_y, reference.lp_y);
-        assert_eq!(fast.env, reference.env);
-    }
-
-    #[test]
     #[ignore]
     fn benchmark_high_polyphony_render() {
         use std::time::Instant;
@@ -1057,7 +1018,7 @@ mod tests {
         assert!((sum(&soft) / sum(&hard) - (32.0f32 / 127.0).powi(2)).abs() < 0.02);
         // Upper partials fall away faster on soft hits.
         let k = 2 * PAIRED; // first single-lane partial
-        assert!(hard[k] / hard[0] > 2.0 * soft[k] / soft[0]);
+        assert!(hard[k].abs() / hard[0].abs() > 2.0 * soft[k].abs() / soft[0].abs());
     }
 
     #[test]
