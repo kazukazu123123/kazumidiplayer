@@ -49,8 +49,8 @@ const DEFAULT_BEND_RANGE: f32 = 2.0;
 /// A voice whose lanes have all decayed below this is dropped.
 const SILENT: f32 = 1e-4;
 
-/// Below this many voices per thread, splitting costs more than it saves.
-const MIN_VOICES_PER_THREAD: usize = 64;
+/// Voices grouped into each reusable layer.
+const VOICES_PER_LAYER: usize = 128;
 
 fn note_hz(note: usize) -> f64 {
     440.0 * 2f64.powf((note as f64 - 69.0) / 12.0)
@@ -206,9 +206,10 @@ fn step(
     im: &mut [f32; LANES],
     cos: &[f32; LANES],
     sin: &[f32; LANES],
+    count: usize,
 ) -> f32 {
     let mut sum = 0.0;
-    for k in 0..LANES {
+    for k in 0..count {
         let (a, b) = (re[k], im[k]);
         re[k] = a * cos[k] - b * sin[k];
         im[k] = a * sin[k] + b * cos[k];
@@ -246,7 +247,7 @@ struct Osc {
 impl Osc {
     #[inline(always)]
     fn tick(&mut self, spec: &NoteSpec, cos: &[f32; LANES], sin: &[f32; LANES]) -> f32 {
-        let mut s = step(&mut self.re, &mut self.im, cos, sin);
+        let mut s = step(&mut self.re, &mut self.im, cos, sin, spec.count);
         if self.age < spec.knock_frames {
             let x = next_noise(&mut self.rng) * self.knock;
             self.knock_y += spec.knock_lp * (x - self.knock_y);
@@ -257,8 +258,8 @@ impl Osc {
         s
     }
 
-    fn audible(&self) -> bool {
-        (0..LANES).any(|k| self.re[k] * self.re[k] + self.im[k] * self.im[k] > SILENT * SILENT)
+    fn audible(&self, spec: &NoteSpec) -> bool {
+        (0..spec.count).any(|k| self.re[k] * self.re[k] + self.im[k] * self.im[k] > SILENT * SILENT)
     }
 }
 
@@ -321,7 +322,7 @@ fn render_note(note: usize, rate: u32) -> CachedNote {
     for _ in 0..len {
         out.push(osc.tick(&spec, &cos, &sin));
         // Stop once every lane is inaudible (after the knock).
-        if osc.age >= spec.knock_frames && out.len() % 1024 == 0 && !osc.audible() {
+        if osc.age >= spec.knock_frames && out.len() % 1024 == 0 && !osc.audible(&spec) {
             break;
         }
     }
@@ -410,27 +411,50 @@ impl Voice {
         let (mut pos, mut y, mut env) = (self.pos, self.lp_y, self.env);
         let lp = self.lp;
         let mut ended = false;
-        'segments: for (si, &(from, ratio)) in bends.iter().enumerate() {
-            let to = bends.get(si + 1).map_or(len, |b| b.0);
-            let (lo, hi) = (from.max(start), to.min(end));
-            if lo >= hi {
-                continue;
+        if bends.len() == 1 && bends[0].1 == 1.0 && pos.fract() == 0.0 {
+            let mut index = pos as usize;
+            let available = s.len().saturating_sub(index.saturating_add(1));
+            let frames = (end - start).min(available);
+            let sample_end = start + frames;
+            let damp_start = damp_from.clamp(start, sample_end);
+            for i in start..damp_start {
+                y += lp * (s[index] as f32 - y);
+                left[i] += y * gl * env;
+                right[i] += y * gr * env;
+                index += 1;
             }
-            let mid = damp_from.clamp(lo, hi);
-            for (range, damp) in [(lo..mid, 1.0), (mid..hi, spec.damper)] {
-                for i in range {
-                    let idx = pos as usize;
-                    if idx + 1 >= s.len() {
-                        ended = true;
-                        break 'segments;
+            for i in damp_start..sample_end {
+                y += lp * (s[index] as f32 - y);
+                left[i] += y * gl * env;
+                right[i] += y * gr * env;
+                env *= spec.damper;
+                index += 1;
+            }
+            ended = sample_end < end;
+            pos = index as f64;
+        } else {
+            'segments: for (si, &(from, ratio)) in bends.iter().enumerate() {
+                let to = bends.get(si + 1).map_or(len, |b| b.0);
+                let (lo, hi) = (from.max(start), to.min(end));
+                if lo >= hi {
+                    continue;
+                }
+                let mid = damp_from.clamp(lo, hi);
+                for (range, damp) in [(lo..mid, 1.0), (mid..hi, spec.damper)] {
+                    for i in range {
+                        let idx = pos as usize;
+                        if idx + 1 >= s.len() {
+                            ended = true;
+                            break 'segments;
+                        }
+                        let frac = (pos - idx as f64) as f32;
+                        let (a, b) = (s[idx] as f32, s[idx + 1] as f32);
+                        y += lp * (a + (b - a) * frac - y);
+                        left[i] += y * gl * env;
+                        right[i] += y * gr * env;
+                        env *= damp;
+                        pos += ratio as f64;
                     }
-                    let frac = (pos - idx as f64) as f32;
-                    let (a, b) = (s[idx] as f32, s[idx + 1] as f32);
-                    y += lp * (a + (b - a) * frac - y);
-                    left[i] += y * gl * env;
-                    right[i] += y * gr * env;
-                    env *= damp;
-                    pos += ratio as f64;
                 }
             }
         }
@@ -469,6 +493,25 @@ impl Channel {
     }
 }
 
+struct MixLayer {
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+impl MixLayer {
+    fn new() -> Self {
+        Self {
+            left: Vec::new(),
+            right: Vec::new(),
+        }
+    }
+
+    fn resize(&mut self, len: usize) {
+        self.left.resize(len, 0.0);
+        self.right.resize(len, 0.0);
+    }
+}
+
 pub struct PianoPrerender {
     rate: u32,
     notes: Box<[NoteSpec; 128]>,
@@ -483,6 +526,7 @@ pub struct PianoPrerender {
     next_seq: u64,
     /// Per channel, `(start frame, pitch ratio)` segments of this render.
     bends: [Vec<(usize, f32)>; 16],
+    layers: Vec<MixLayer>,
 }
 
 impl PianoPrerender {
@@ -497,6 +541,7 @@ impl PianoPrerender {
             held: vec![std::collections::VecDeque::new(); 16 * 128],
             next_seq: 0,
             bends: std::array::from_fn(|_| Vec::new()),
+            layers: Vec::new(),
         }
     }
 
@@ -686,41 +731,49 @@ impl PianoPrerender {
         self.scheduled = scheduled;
         let (bends, notes, cache) = (&self.bends, &self.notes, &*self.cache);
 
-        let per_thread = self
-            .voices
-            .len()
-            .div_ceil(crate::audio_engine::prerender::synth_pool().current_num_threads())
-            .max(MIN_VOICES_PER_THREAD);
+        let layer_count = self.voices.len().div_ceil(VOICES_PER_LAYER);
         left.fill(0.0);
         right.fill(0.0);
-        if self.voices.len() <= per_thread {
+        if self.layers.len() < layer_count {
+            self.layers.resize_with(layer_count, MixLayer::new);
+        }
+        for layer in self.layers.iter_mut().take(layer_count) {
+            layer.resize(len);
+            layer.left.fill(0.0);
+            layer.right.fill(0.0);
+        }
+        if layer_count <= 1 {
             for v in &mut self.voices {
                 let (n, b) = (v.note as usize, &bends[v.channel as usize]);
                 v.render(left, right, &notes[n], &cache.notes[n], b);
             }
         } else {
             use rayon::prelude::*;
+            let layers = &mut self.layers[..layer_count];
             let voices = &mut self.voices;
-            let mix = crate::audio_engine::prerender::synth_pool().install(|| {
+            crate::audio_engine::prerender::synth_pool().install(|| {
                 voices
-                    .par_chunks_mut(per_thread)
-                    .map(|voices| {
-                        let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
+                    .par_chunks_mut(VOICES_PER_LAYER)
+                    .zip(layers.par_iter_mut())
+                    .for_each(|(voices, layer)| {
                         for v in voices {
                             let (n, b) = (v.note as usize, &bends[v.channel as usize]);
-                            v.render(&mut l, &mut r, &notes[n], &cache.notes[n], b);
+                            v.render(
+                                &mut layer.left,
+                                &mut layer.right,
+                                &notes[n],
+                                &cache.notes[n],
+                                b,
+                            );
                         }
-                        (l, r)
-                    })
-                    .reduce_with(|(mut al, mut ar), (bl, br)| {
-                        al.iter_mut().zip(&bl).for_each(|(a, b)| *a += b);
-                        ar.iter_mut().zip(&br).for_each(|(a, b)| *a += b);
-                        (al, ar)
-                    })
+                    });
             });
-            if let Some((l, r)) = mix {
-                left.copy_from_slice(&l);
-                right.copy_from_slice(&r);
+            for layer in &self.layers[..layer_count] {
+                left.iter_mut().zip(&layer.left).for_each(|(a, b)| *a += b);
+                right
+                    .iter_mut()
+                    .zip(&layer.right)
+                    .for_each(|(a, b)| *a += b);
             }
         }
         // Not clamped: peaks are left to the prerender limiter.
@@ -808,6 +861,70 @@ mod tests {
         for i in 0..300u32 {
             e.send_at(100 + i % 100, OFF | (i % 128) << 8);
         }
+    }
+
+    #[test]
+    fn unit_pitch_fast_path_matches_interpolated_path() {
+        let spec = NoteSpec::new(60, 8_000);
+        let cache = Cache::get(8_000);
+        let voice = || Voice {
+            seq: 0,
+            channel: 0,
+            note: 60,
+            pos: 0.0,
+            gain: 0.7,
+            lp: 0.83,
+            lp_y: 0.0,
+            env: 1.0,
+            damped: false,
+            pedal_held: false,
+            dead: false,
+            start: 17,
+            release_at: Some(160),
+            kill_at: None,
+        };
+        let (mut fast, mut reference) = (voice(), voice());
+        let (mut fl, mut fr, mut rl, mut rr) = (
+            vec![0.0; 256],
+            vec![0.0; 256],
+            vec![0.0; 256],
+            vec![0.0; 256],
+        );
+        fast.render(&mut fl, &mut fr, &spec, &cache.notes[60], &[(0, 1.0)]);
+        reference.render(
+            &mut rl,
+            &mut rr,
+            &spec,
+            &cache.notes[60],
+            &[(0, 1.0), (128, 1.0)],
+        );
+        assert_eq!(fl, rl);
+        assert_eq!(fr, rr);
+        assert_eq!(fast.pos, reference.pos);
+        assert_eq!(fast.lp_y, reference.lp_y);
+        assert_eq!(fast.env, reference.env);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_high_polyphony_render() {
+        use std::time::Instant;
+
+        let mut e = PianoPrerender::new(48_000);
+        for i in 0..2_048u32 {
+            let note = i % 128;
+            e.send_at(0, ON | note << 8 | 100 << 16);
+        }
+        let (mut l, mut r) = (vec![0.0; 256], vec![0.0; 256]);
+        e.render(&mut l, &mut r);
+        let started = Instant::now();
+        for _ in 0..200 {
+            e.render(&mut l, &mut r);
+        }
+        eprintln!(
+            "2048 voices x 256 frames x 200 chunks: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -899,7 +1016,7 @@ mod tests {
         re[0] = 1.0;
         let (w, r) = (spec.omegas[0], spec.decays[0] as f64);
         for n in 1..=48_000 {
-            let got = step(&mut re, &mut im, &cos, &sin) as f64;
+            let got = step(&mut re, &mut im, &cos, &sin, spec.count) as f64;
             let exact = r.powi(n) * (w * n as f64).sin();
             assert!((got - exact).abs() < 2e-3, "frame {n}: {got} vs {exact}");
         }
