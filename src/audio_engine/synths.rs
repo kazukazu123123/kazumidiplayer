@@ -2,4 +2,4 @@
 //! `AudioEngine` impl in `audio_engine/<name>.rs`.
 
 pub mod csynth;
-pub mod sine;
+pub mod piano;

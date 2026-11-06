@@ -1213,7 +1213,7 @@ mod stress {
             kazumidiparser::MIDIPlayerData::parse(&path, 8, None, None).unwrap(),
         );
         let stream = crate::audio_engine::OutputStream::open_engine::<
-            crate::audio_engine::synths::sine::SinePrerender,
+            crate::audio_engine::synths::piano::PianoPrerender,
         >()
         .recv()
         .unwrap()

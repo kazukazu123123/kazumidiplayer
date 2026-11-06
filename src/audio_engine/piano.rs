@@ -1,12 +1,12 @@
-use super::synths::sine::SinePrerender;
+use super::synths::piano::PianoPrerender;
 use super::{AudioEngine, RenderMode};
 
-impl AudioEngine for SinePrerender {
-    const LABEL: &'static str = "Sine (Debug, Prerender)";
+impl AudioEngine for PianoPrerender {
+    const LABEL: &'static str = "Piano (Prerender)";
     const RENDER_MODE: RenderMode = RenderMode::Prerender;
 
     fn open() -> Result<Self, String> {
-        SinePrerender::open()
+        PianoPrerender::open()
     }
 
     fn send_midi_event(&mut self, data: u32) -> u32 {
@@ -25,10 +25,10 @@ impl AudioEngine for SinePrerender {
     }
 
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
-        SinePrerender::render(self, left, right);
+        PianoPrerender::render(self, left, right);
     }
 
     fn polyphony(&self) -> u32 {
-        SinePrerender::polyphony(self)
+        PianoPrerender::polyphony(self)
     }
 }

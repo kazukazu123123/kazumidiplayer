@@ -1,0 +1,982 @@
+//! Additive physical-ish piano. Every note is a bank of damped rotating
+//! phasors (one complex multiply per sample per lane) shaped by formulas for
+//! the main features of a real grand:
+//!
+//! - **Stiff strings**: partial k sits at `k f0 sqrt(1 + B k^2) / sqrt(1 + B)`
+//!   with the inharmonicity B rising from ~1e-4 in the bass to ~1e-2 at C8.
+//! - **Hammer**: struck at 1/8 of the string, so partials near multiples of
+//!   8 are weak (`|sin(pi k / 8)|`); the felt acts as a low-pass whose corner
+//!   rises with velocity, so harder hits are brighter, not just louder.
+//! - **Two-stage decay**: the lower partials each get a pair of slightly
+//!   detuned lanes, a loud fast-decaying "prompt sound" and a quiet slow
+//!   "aftersound", which gives the beating and the long tail of real
+//!   unison strings. Losses grow with frequency, and the fundamental's
+//!   decay time shrinks from ~25 s at A0 to ~0.6 s at C8.
+//! - **Soundboard**: weak radiation below ~90 Hz, plus a short low-passed
+//!   noise "knock" at the strike.
+//! - **Dampers**: note-off adds strong damping (none above F#6, like a real
+//!   piano); the sustain pedal (CC64) defers it.
+//! - **Stereo**: notes are spread low-left to high-right (player's view).
+//!
+//! Per-channel pitch bend (range set by RPN 0, default 2 semitones) changes
+//! pitch sample-accurately, held notes included. Unlimited polyphony; voices
+//! render in parallel on every logical core.
+
+/// Overall level before polyphonic summing. Calibrated so a 48-note full-velocity
+/// chord sits near the prerender limiter's -0.5 dBFS ceiling without heavy gain reduction.
+const VOICE_GAIN: f32 = 0.1;
+/// SIMD-friendly lane count per voice.
+const LANES: usize = 32;
+/// Partials that get a prompt/aftersound lane pair; the rest get one lane.
+const PAIRED: usize = 8;
+/// Upper bound of partial frequencies.
+const MAX_PARTIAL_HZ: f64 = 14_000.0;
+/// Hammer strike point, as a fraction of the speaking length.
+const STRIKE_POINT: f64 = 1.0 / 8.0;
+/// Aftersound share of a paired partial, and how much faster prompt decays.
+const AFTERSOUND: f32 = 0.3;
+const PROMPT_DECAY_RATIO: f64 = 4.0;
+/// Detune between a pair's lanes, in cents.
+const UNISON_CENTS: f64 = 0.6;
+/// Highest damped key (F#6); keys above ring until they die away.
+const LAST_DAMPED: usize = 90;
+/// Strike knock: length, and level relative to the tone.
+const KNOCK_SECS: f64 = 0.015;
+const KNOCK_LEVEL: f32 = 0.6;
+const BEND_CENTER: u16 = 8192;
+const DEFAULT_BEND_RANGE: f32 = 2.0;
+
+/// A voice whose lanes have all decayed below this is dropped.
+const SILENT: f32 = 1e-4;
+
+/// Below this many voices per thread, splitting costs more than it saves.
+const MIN_VOICES_PER_THREAD: usize = 64;
+
+fn note_hz(note: usize) -> f64 {
+    440.0 * 2f64.powf((note as f64 - 69.0) / 12.0)
+}
+
+/// String inharmonicity coefficient: lowest around E2, rising both ways.
+fn inharmonicity(note: usize) -> f64 {
+    let n = note as f64;
+    10f64.powf(-4.0 + (n - 40.0).max(0.0) * 0.028) * (1.0 + (40.0 - n).max(0.0) * 0.05)
+}
+
+/// 60 dB decay time of a note's aftersound fundamental, in seconds.
+fn decay_secs(note: usize) -> f64 {
+    let x = (note as f64 - 21.0).clamp(0.0, 87.0) / 87.0;
+    25.0 * (0.6f64 / 25.0).powf(x)
+}
+
+/// Felt low-pass of the hammer at velocity `v` (0-1) for a partial.
+fn hammer_filter(hz: f32, f0: f32, v: f32) -> f32 {
+    let corner = (500.0 + 5_500.0 * v * v).max(2.0 * f0);
+    1.0 / (1.0 + (hz / corner).powi(2))
+}
+
+/// Per-note synthesis constants, computed once per sample rate.
+#[derive(Clone, Copy)]
+struct NoteSpec {
+    /// Phase advance per frame of each lane, in radians.
+    omegas: [f64; LANES],
+    /// Per-frame amplitude multiplier of each lane while undamped.
+    decays: [f32; LANES],
+    /// Velocity-independent amplitude of each lane.
+    amps: [f32; LANES],
+    /// Frequency of each lane, in Hz (for the hammer filter).
+    hz: [f32; LANES],
+    /// Lanes in use.
+    count: usize,
+    f0: f32,
+    /// Extra per-frame multiplier once the damper is down (1 = no damper).
+    damper: f32,
+    /// Knock: one-pole low-pass coefficient, per-frame decay, length.
+    knock_lp: f32,
+    knock_decay: f32,
+    knock_frames: u32,
+    /// Output gains.
+    left: f32,
+    right: f32,
+}
+
+impl NoteSpec {
+    fn new(note: usize, rate: u32) -> Self {
+        let sr = rate as f64;
+        let f0 = note_hz(note);
+        let b = inharmonicity(note);
+        let sigma0 = 6.9 / decay_secs(note);
+        let mut spec = Self {
+            omegas: [0.0; LANES],
+            decays: [0.0; LANES],
+            amps: [0.0; LANES],
+            hz: [0.0; LANES],
+            count: 0,
+            f0: f0 as f32,
+            damper: 1.0,
+            knock_lp: 0.0,
+            knock_decay: 0.0,
+            knock_frames: (KNOCK_SECS * sr) as u32,
+            left: 0.0,
+            right: 0.0,
+        };
+        let push = |spec: &mut Self, hz: f64, sigma: f64, amp: f64| {
+            let i = spec.count;
+            spec.omegas[i] = std::f64::consts::TAU * hz / sr;
+            spec.decays[i] = (-sigma / sr).exp() as f32;
+            spec.amps[i] = amp as f32;
+            spec.hz[i] = hz as f32;
+            spec.count += 1;
+        };
+        let limit = MAX_PARTIAL_HZ.min(sr * 0.45);
+        for k in 1.. {
+            let kf = k as f64;
+            let hz = kf * f0 * ((1.0 + b * kf * kf) / (1.0 + b)).sqrt();
+            let lanes = if k <= PAIRED { 2 } else { 1 };
+            if hz >= limit || spec.count + lanes > LANES {
+                break;
+            }
+            // Strike-point comb, natural 1/k roll-off, and the soundboard's
+            // weak low end.
+            let comb = (std::f64::consts::PI * kf * STRIKE_POINT).sin().abs();
+            let radiation = hz * hz / (hz * hz + 90.0 * 90.0);
+            let amp = comb / kf.powf(0.8) * radiation;
+            // Losses grow with frequency (air and internal friction).
+            let sigma = sigma0 * (1.0 + 0.15 * (kf - 1.0)) + 4e-7 * hz * hz;
+            if lanes == 2 {
+                let detune = 2f64.powf(UNISON_CENTS / 1200.0);
+                push(
+                    &mut spec,
+                    hz,
+                    sigma * PROMPT_DECAY_RATIO,
+                    amp * (1.0 - AFTERSOUND as f64),
+                );
+                push(&mut spec, hz * detune, sigma, amp * AFTERSOUND as f64);
+            } else {
+                push(&mut spec, hz, sigma * PROMPT_DECAY_RATIO * 0.5, amp);
+            }
+        }
+        if note <= LAST_DAMPED {
+            // Dampers stop bass strings more slowly.
+            let damp_secs = 0.08 + 0.4 * (1.0 - (note as f64 - 21.0).max(0.0) / 69.0);
+            spec.damper = (-6.9 / (damp_secs * sr)).exp() as f32;
+        }
+        let knock_hz = 250.0 + 8.0 * f0.min(1_500.0);
+        spec.knock_lp = (1.0 - (-std::f64::consts::TAU * knock_hz / sr).exp()) as f32;
+        spec.knock_decay = (-5.0 / (KNOCK_SECS * sr)).exp() as f32;
+        // Constant-power pan, low keys left.
+        let pan = ((note as f64 - 21.0) / 87.0).clamp(0.0, 1.0) * 0.6 + 0.2;
+        let angle = pan * std::f64::consts::FRAC_PI_2;
+        spec.left = angle.cos() as f32;
+        spec.right = angle.sin() as f32;
+        spec
+    }
+
+    /// Per-frame rotation of each lane at pitch `ratio`, times `damp`.
+    fn rotation(&self, ratio: f32, damp: f32) -> ([f32; LANES], [f32; LANES]) {
+        let (mut cos, mut sin) = ([0.0; LANES], [0.0; LANES]);
+        for k in 0..self.count {
+            let w = self.omegas[k] * ratio as f64;
+            let r = self.decays[k] as f64 * damp as f64;
+            cos[k] = (r * w.cos()) as f32;
+            sin[k] = (r * w.sin()) as f32;
+        }
+        (cos, sin)
+    }
+}
+
+/// Lane amplitudes for a velocity (0-127). The tone is normalized at full
+/// velocity, so softer hits are both quieter and darker, matching the SF2
+/// engine's squared velocity response.
+fn lane_amps(velocity: u8, spec: &NoteSpec) -> [f32; LANES] {
+    let v = velocity as f32 / 127.0;
+    let energy = |v: f32| -> f32 {
+        (0..spec.count)
+            .map(|k| (spec.amps[k] * hammer_filter(spec.hz[k], spec.f0, v)).powi(2))
+            .sum::<f32>()
+            .sqrt()
+    };
+    let gain = VOICE_GAIN * v * v / energy(v).max(f32::EPSILON);
+    std::array::from_fn(|k| spec.amps[k] * hammer_filter(spec.hz[k], spec.f0, v) * gain)
+}
+
+/// Advance every lane one frame; returns the sum of the sine parts.
+#[inline(always)]
+fn step(
+    re: &mut [f32; LANES],
+    im: &mut [f32; LANES],
+    cos: &[f32; LANES],
+    sin: &[f32; LANES],
+) -> f32 {
+    let mut sum = 0.0;
+    for k in 0..LANES {
+        let (a, b) = (re[k], im[k]);
+        re[k] = a * cos[k] - b * sin[k];
+        im[k] = a * sin[k] + b * cos[k];
+        sum += im[k];
+    }
+    sum
+}
+
+/// xorshift32 step mapped to [-1, 1].
+#[inline(always)]
+fn next_noise(state: &mut u32) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+/// Per-voice state that changes every frame.
+#[derive(Clone, Copy)]
+struct Osc {
+    /// Lane phasors: amplitude and phase as a complex number; the output is
+    /// the imaginary part, so strings start at rest and move like sines.
+    re: [f32; LANES],
+    im: [f32; LANES],
+    /// Frames since note-on.
+    age: u32,
+    rng: u32,
+    /// Knock level and low-pass state.
+    knock: f32,
+    knock_y: f32,
+}
+
+impl Osc {
+    #[inline(always)]
+    fn tick(&mut self, spec: &NoteSpec, cos: &[f32; LANES], sin: &[f32; LANES]) -> f32 {
+        let mut s = step(&mut self.re, &mut self.im, cos, sin);
+        if self.age < spec.knock_frames {
+            let x = next_noise(&mut self.rng) * self.knock;
+            self.knock_y += spec.knock_lp * (x - self.knock_y);
+            s += self.knock_y;
+            self.knock *= spec.knock_decay;
+            self.age += 1;
+        }
+        s
+    }
+
+    fn audible(&self) -> bool {
+        (0..LANES).any(|k| self.re[k] * self.re[k] + self.im[k] * self.im[k] > SILENT * SILENT)
+    }
+}
+
+/// Length of each cached note.
+const CACHE_SECS: f64 = 15.0;
+/// Fade at the end of notes still sounding when the cache runs out.
+const CACHE_FADE_SECS: f64 = 0.5;
+
+/// One key's prerendered full-velocity strike: undamped, at rest pitch,
+/// mono, stored as i16 scaled by `scale`. Trailing silence is trimmed.
+struct CachedNote {
+    samples: Vec<i16>,
+    /// Value of i16 full scale.
+    scale: f32,
+}
+
+/// All 128 keys at one sample rate.
+struct Cache {
+    notes: Vec<CachedNote>,
+}
+
+impl Cache {
+    /// The cache for `rate`, rendered once per process (all keys in
+    /// parallel) and shared by every engine at that rate.
+    fn get(rate: u32) -> std::sync::Arc<Self> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        static CACHES: OnceLock<Mutex<HashMap<u32, Arc<Cache>>>> = OnceLock::new();
+        let mut caches = CACHES.get_or_init(Default::default).lock().unwrap();
+        caches
+            .entry(rate)
+            .or_insert_with(|| {
+                use rayon::prelude::*;
+                let notes = crate::audio_engine::prerender::synth_pool().install(|| {
+                    (0..128)
+                        .into_par_iter()
+                        .map(|n| render_note(n, rate))
+                        .collect()
+                });
+                Arc::new(Self { notes })
+            })
+            .clone()
+    }
+}
+
+/// Render key `note` struck at full velocity for `CACHE_SECS`.
+fn render_note(note: usize, rate: u32) -> CachedNote {
+    let spec = NoteSpec::new(note, rate);
+    let len = (CACHE_SECS * rate as f64) as usize;
+    let mut osc = Osc {
+        re: lane_amps(127, &spec),
+        im: [0.0; LANES],
+        age: 0,
+        rng: 0x9E37_79B9 ^ (note as u32).wrapping_mul(0x85EB_CA6B) | 1,
+        knock: KNOCK_LEVEL * VOICE_GAIN,
+        knock_y: 0.0,
+    };
+    let (cos, sin) = spec.rotation(1.0, 1.0);
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        out.push(osc.tick(&spec, &cos, &sin));
+        // Stop once every lane is inaudible (after the knock).
+        if osc.age >= spec.knock_frames && out.len() % 1024 == 0 && !osc.audible() {
+            break;
+        }
+    }
+    let last = out
+        .iter()
+        .rposition(|s| s.abs() > SILENT)
+        .map_or(0, |i| i + 1);
+    out.truncate(last);
+    if out.len() == len {
+        let fade = ((CACHE_FADE_SECS * rate as f64) as usize).min(len);
+        for (i, s) in out[len - fade..].iter_mut().enumerate() {
+            let x = i as f32 / fade as f32;
+            *s *= 0.5 + 0.5 * (std::f32::consts::PI * x).cos();
+        }
+    }
+    let peak = out
+        .iter()
+        .fold(0.0f32, |m, s| m.max(s.abs()))
+        .max(f32::EPSILON);
+    let to_i16 = i16::MAX as f32 / peak;
+    CachedNote {
+        samples: out.iter().map(|s| (s * to_i16).round() as i16).collect(),
+        scale: peak / i16::MAX as f32,
+    }
+}
+
+struct Voice {
+    /// Creation order; `voices` stays sorted by it.
+    seq: u64,
+    channel: u8,
+    note: u8,
+    /// Read position in the cached note, in frames.
+    pos: f64,
+    /// Velocity loudness, times the note's i16 scale.
+    gain: f32,
+    /// Velocity brightness: one-pole low-pass coefficient (1 = bypass).
+    lp: f32,
+    lp_y: f32,
+    /// Damper envelope.
+    env: f32,
+    /// Damper down (note released, pedal up).
+    damped: bool,
+    /// Key released while the sustain pedal was down.
+    pedal_held: bool,
+    dead: bool,
+    // Within the current render, set while applying its events. Recording
+    // them up front lets every voice render the whole chunk on its own.
+    /// First frame it sounds (its note-on frame, else 0).
+    start: usize,
+    /// Frame the damper falls.
+    release_at: Option<usize>,
+    /// Frame it is cut off (player reset).
+    kill_at: Option<usize>,
+}
+
+impl Voice {
+    fn releasing(&self) -> bool {
+        self.damped || self.release_at.is_some()
+    }
+
+    fn alive(&self) -> bool {
+        self.kill_at.is_none()
+    }
+
+    /// Add this voice's part of the render into `left`/`right`, then fold
+    /// the render's events into its state for the next one. `bends` is its
+    /// channel's `(start frame, pitch ratio)` segments for this render.
+    fn render(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+        spec: &NoteSpec,
+        cached: &CachedNote,
+        bends: &[(usize, f32)],
+    ) {
+        let len = left.len();
+        let end = self.kill_at.unwrap_or(len).min(len);
+        let start = self.start.min(end);
+        let damp_from = if self.damped {
+            start
+        } else {
+            self.release_at.unwrap_or(end).clamp(start, end)
+        };
+        let s = &cached.samples;
+        let (gl, gr) = (spec.left * self.gain, spec.right * self.gain);
+        let (mut pos, mut y, mut env) = (self.pos, self.lp_y, self.env);
+        let lp = self.lp;
+        let mut ended = false;
+        'segments: for (si, &(from, ratio)) in bends.iter().enumerate() {
+            let to = bends.get(si + 1).map_or(len, |b| b.0);
+            let (lo, hi) = (from.max(start), to.min(end));
+            if lo >= hi {
+                continue;
+            }
+            let mid = damp_from.clamp(lo, hi);
+            for (range, damp) in [(lo..mid, 1.0), (mid..hi, spec.damper)] {
+                for i in range {
+                    let idx = pos as usize;
+                    if idx + 1 >= s.len() {
+                        ended = true;
+                        break 'segments;
+                    }
+                    let frac = (pos - idx as f64) as f32;
+                    let (a, b) = (s[idx] as f32, s[idx + 1] as f32);
+                    y += lp * (a + (b - a) * frac - y);
+                    left[i] += y * gl * env;
+                    right[i] += y * gr * env;
+                    env *= damp;
+                    pos += ratio as f64;
+                }
+            }
+        }
+        (self.pos, self.lp_y, self.env) = (pos, y, env);
+        self.damped |= self.release_at.is_some();
+        let silent = env * self.gain * (i16::MAX as f32) < SILENT;
+        self.dead = self.kill_at.is_some() || ended || silent;
+        self.start = 0;
+        self.release_at = None;
+        self.kill_at = None;
+    }
+}
+
+/// Controller state of one MIDI channel.
+#[derive(Clone, Copy)]
+struct Channel {
+    bend: u16,
+    /// Semitones at full bend.
+    range: f32,
+    /// Selected RPN (MSB, LSB); 127/127 is none.
+    rpn: (u8, u8),
+    sustain: bool,
+}
+
+impl Channel {
+    const RESET: Self = Self {
+        bend: BEND_CENTER,
+        range: DEFAULT_BEND_RANGE,
+        rpn: (127, 127),
+        sustain: false,
+    };
+
+    fn ratio(&self) -> f32 {
+        let semitones = (self.bend as f32 - BEND_CENTER as f32) / BEND_CENTER as f32 * self.range;
+        2f32.powf(semitones / 12.0)
+    }
+}
+
+pub struct PianoPrerender {
+    rate: u32,
+    notes: Box<[NoteSpec; 128]>,
+    cache: std::sync::Arc<Cache>,
+    voices: Vec<Voice>,
+    /// `(frame offset, message)` for the next render, in send order.
+    scheduled: Vec<(u32, u32)>,
+    channels: [Channel; 16],
+    /// Per (channel, key), serials of voices pressed and not yet released,
+    /// oldest first. Entries of voices dropped meanwhile are skipped.
+    held: Vec<std::collections::VecDeque<u64>>,
+    next_seq: u64,
+    /// Per channel, `(start frame, pitch ratio)` segments of this render.
+    bends: [Vec<(usize, f32)>; 16],
+}
+
+impl PianoPrerender {
+    fn new(rate: u32) -> Self {
+        Self {
+            rate,
+            notes: Box::new(std::array::from_fn(|note| NoteSpec::new(note, rate))),
+            cache: Cache::get(rate),
+            voices: Vec::new(),
+            scheduled: Vec::new(),
+            channels: [Channel::RESET; 16],
+            held: vec![std::collections::VecDeque::new(); 16 * 128],
+            next_seq: 0,
+            bends: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    /// Start every channel's bend segments at its current pitch.
+    fn begin_render(&mut self) {
+        for (bends, channel) in self.bends.iter_mut().zip(&self.channels) {
+            bends.clear();
+            bends.push((0, channel.ratio()));
+        }
+    }
+
+    /// The channel's pitch changed at `frame`: start a new segment.
+    fn bend_changed(&mut self, channel: usize, frame: usize) {
+        let ratio = self.channels[channel].ratio();
+        let bends = &mut self.bends[channel];
+        match bends.last_mut() {
+            Some(last) if last.0 == frame => last.1 = ratio,
+            _ => bends.push((frame, ratio)),
+        }
+    }
+
+    /// Run at the default output's rate.
+    pub fn open() -> Result<Self, String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let rate = cpal::default_host()
+            .default_output_device()
+            .ok_or("No audio output device found")?
+            .default_output_config()
+            .map_err(|e| format!("No usable output format: {e}"))?
+            .sample_rate();
+        Ok(Self::new(rate))
+    }
+
+    /// Voices sounding (releasing included) after the last render.
+    pub fn polyphony(&self) -> u32 {
+        self.voices.len() as u32
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Schedule a message `frame` frames into the next `render`.
+    pub fn send_at(&mut self, frame: u32, data: u32) {
+        self.scheduled.push((frame, data));
+    }
+
+    /// Drop the damper on `channel`'s keys released under the pedal.
+    fn pedal_up(&mut self, channel: u8, frame: usize) {
+        for v in &mut self.voices {
+            if v.channel == channel && v.pedal_held {
+                v.pedal_held = false;
+                if v.alive() && !v.releasing() {
+                    v.release_at = Some(frame);
+                }
+            }
+        }
+    }
+
+    /// Record `msg` at `frame` of the coming render on the voices.
+    fn apply(&mut self, frame: usize, msg: u32) {
+        let status = (msg & 0xFF) as u8;
+        let p1 = ((msg >> 8) & 0x7F) as u8;
+        let p2 = ((msg >> 16) & 0x7F) as u8;
+        let channel = status & 0x0F;
+        match status & 0xF0 {
+            0x90 if p2 > 0 => {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                let spec = &self.notes[p1 as usize];
+                let v = p2 as f32 / 127.0;
+                // Softer hits: the felt corner falls, so the tone darkens.
+                let lp = if p2 == 127 {
+                    1.0
+                } else {
+                    let corner = (500.0 + 5_500.0 * v * v).max(2.0 * spec.f0);
+                    1.0 - (-std::f32::consts::TAU * corner / self.rate as f32).exp()
+                };
+                self.held[channel as usize * 128 + p1 as usize].push_back(seq);
+                self.voices.push(Voice {
+                    seq,
+                    channel,
+                    note: p1,
+                    pos: 0.0,
+                    gain: v.powf(1.5) * self.cache.notes[p1 as usize].scale,
+                    lp,
+                    lp_y: 0.0,
+                    env: 1.0,
+                    damped: false,
+                    pedal_held: false,
+                    dead: false,
+                    start: frame,
+                    release_at: None,
+                    kill_at: None,
+                });
+            }
+            0x80 | 0x90 => {
+                // Release the oldest held voice for this key.
+                let sustain = self.channels[channel as usize].sustain;
+                let queue = &mut self.held[channel as usize * 128 + p1 as usize];
+                while let Some(seq) = queue.pop_front() {
+                    if let Ok(i) = self.voices.binary_search_by_key(&seq, |v| v.seq) {
+                        let v = &mut self.voices[i];
+                        if v.alive() && !v.releasing() && !v.pedal_held {
+                            if sustain {
+                                v.pedal_held = true;
+                            } else {
+                                v.release_at = Some(frame);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            0xE0 => {
+                self.channels[channel as usize].bend = p1 as u16 | (p2 as u16) << 7;
+                self.bend_changed(channel as usize, frame);
+            }
+            0xB0 if p1 == 64 => {
+                let down = p2 >= 64;
+                let ch = &mut self.channels[channel as usize];
+                let was = std::mem::replace(&mut ch.sustain, down);
+                if was && !down {
+                    self.pedal_up(channel, frame);
+                }
+            }
+            0xB0 if matches!(p1, 6 | 38 | 100 | 101 | 121) => {
+                let ch = &mut self.channels[channel as usize];
+                match p1 {
+                    101 => ch.rpn.0 = p2,
+                    100 => ch.rpn.1 = p2,
+                    // RPN 0: pitch bend sensitivity (semitones, then cents).
+                    6 if ch.rpn == (0, 0) => ch.range = p2 as f32 + ch.range.fract(),
+                    38 if ch.rpn == (0, 0) => ch.range = ch.range.trunc() + p2 as f32 / 100.0,
+                    // Reset all controllers: centre the wheel, deselect RPN,
+                    // lift the pedal.
+                    121 => {
+                        ch.bend = BEND_CENTER;
+                        ch.rpn = (127, 127);
+                        if std::mem::replace(&mut ch.sustain, false) {
+                            self.pedal_up(channel, frame);
+                        }
+                    }
+                    _ => return,
+                }
+                self.bend_changed(channel as usize, frame);
+            }
+            // All sound off / all notes off.
+            0xB0 if p1 == 120 || p1 == 123 => {
+                for v in &mut self.voices {
+                    if v.alive() && !v.releasing() && v.channel == channel {
+                        v.pedal_held = false;
+                        v.release_at = Some(frame);
+                    }
+                }
+                let keys = channel as usize * 128..(channel as usize + 1) * 128;
+                self.held[keys].iter_mut().for_each(|q| q.clear());
+            }
+            0xF0 if status == 0xFF => {
+                for v in self.voices.iter_mut().filter(|v| v.alive()) {
+                    v.kill_at = Some(frame);
+                }
+                self.channels = [Channel::RESET; 16];
+                self.held.iter_mut().for_each(|q| q.clear());
+                for ch in 0..16 {
+                    self.bend_changed(ch, frame);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Voices render independently on the synth pool (one thread per logical
+    /// core, below normal priority), each group into its own buffers; the
+    /// buffers are summed.
+    pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let len = left.len();
+        // Stable: same-frame events keep their send order.
+        let mut scheduled = std::mem::take(&mut self.scheduled);
+        scheduled.sort_by_key(|&(frame, _)| frame);
+        self.begin_render();
+        for &(frame, msg) in &scheduled {
+            // Offsets past the chunk (shouldn't happen) apply at its end.
+            self.apply((frame as usize).min(len), msg);
+        }
+        scheduled.clear();
+        self.scheduled = scheduled;
+        let (bends, notes, cache) = (&self.bends, &self.notes, &*self.cache);
+
+        let per_thread = self
+            .voices
+            .len()
+            .div_ceil(crate::audio_engine::prerender::synth_pool().current_num_threads())
+            .max(MIN_VOICES_PER_THREAD);
+        left.fill(0.0);
+        right.fill(0.0);
+        if self.voices.len() <= per_thread {
+            for v in &mut self.voices {
+                let (n, b) = (v.note as usize, &bends[v.channel as usize]);
+                v.render(left, right, &notes[n], &cache.notes[n], b);
+            }
+        } else {
+            use rayon::prelude::*;
+            let voices = &mut self.voices;
+            let mix = crate::audio_engine::prerender::synth_pool().install(|| {
+                voices
+                    .par_chunks_mut(per_thread)
+                    .map(|voices| {
+                        let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
+                        for v in voices {
+                            let (n, b) = (v.note as usize, &bends[v.channel as usize]);
+                            v.render(&mut l, &mut r, &notes[n], &cache.notes[n], b);
+                        }
+                        (l, r)
+                    })
+                    .reduce_with(|(mut al, mut ar), (bl, br)| {
+                        al.iter_mut().zip(&bl).for_each(|(a, b)| *a += b);
+                        ar.iter_mut().zip(&br).for_each(|(a, b)| *a += b);
+                        (al, ar)
+                    })
+            });
+            if let Some((l, r)) = mix {
+                left.copy_from_slice(&l);
+                right.copy_from_slice(&r);
+            }
+        }
+        // Not clamped: peaks are left to the prerender limiter.
+        self.voices.retain(|v| !v.dead);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ON: u32 = 0x90;
+    const OFF: u32 = 0x80;
+
+    fn peak(l: &[f32]) -> f32 {
+        l.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Render `secs` seconds in 512-frame chunks; returns the left channel.
+    fn run(e: &mut PianoPrerender, frames: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        let (mut l, mut r) = (vec![0.0; 512], vec![0.0; 512]);
+        while out.len() < frames {
+            e.render(&mut l, &mut r);
+            out.extend_from_slice(&l);
+        }
+        out
+    }
+
+    #[test]
+    fn note_starts_at_its_frame_and_damper_stops_it() {
+        let mut e = PianoPrerender::new(48_000);
+        let (mut l, mut r) = (vec![0.0; 4_800], vec![0.0; 4_800]);
+        e.send_at(10, ON | 60 << 8 | 100 << 16);
+        e.send_at(2_400, OFF | 60 << 8);
+        e.render(&mut l, &mut r);
+        assert!(l[..10].iter().all(|&s| s == 0.0));
+        assert!(peak(&l[11..2_400]) > 0.0);
+        // Dampers kill middle C within about half a second.
+        run(&mut e, 48_000);
+        assert!(e.voices.is_empty());
+    }
+
+    #[test]
+    fn treble_keys_have_no_damper() {
+        let mut e = PianoPrerender::new(48_000);
+        e.send_at(0, ON | 100 << 8 | 100 << 16);
+        e.send_at(100, OFF | 100 << 8);
+        // A damper would silence it within 0.1 s.
+        run(&mut e, 12_000);
+        assert_eq!(e.voices.len(), 1);
+        assert_eq!(e.notes[100].damper, 1.0);
+    }
+
+    #[test]
+    fn sustain_pedal_defers_the_damper() {
+        let mut e = PianoPrerender::new(48_000);
+        e.send_at(0, 0xB0 | 64 << 8 | 127 << 16);
+        e.send_at(0, ON | 60 << 8 | 100 << 16);
+        e.send_at(100, OFF | 60 << 8);
+        run(&mut e, 48_000);
+        assert_eq!(e.voices.len(), 1, "pedal should hold the note");
+        e.send_at(0, 0xB0 | 64 << 8);
+        run(&mut e, 48_000);
+        assert!(e.voices.is_empty());
+    }
+
+    #[test]
+    fn reset_cuts_voices_at_its_frame() {
+        let mut e = PianoPrerender::new(1_000);
+        let (mut l, mut r) = (vec![0.0; 100], vec![0.0; 100]);
+        e.send_at(0, ON | 69 << 8 | 127 << 16);
+        e.send_at(20, 0xFF);
+        e.send_at(30, ON | 60 << 8 | 127 << 16);
+        e.render(&mut l, &mut r);
+        assert!(l[1..20].iter().any(|&s| s != 0.0));
+        assert!(l[20..30].iter().all(|&s| s == 0.0));
+        assert_eq!(e.voices.len(), 1);
+    }
+
+    fn many_notes(e: &mut PianoPrerender) {
+        for i in 0..1_000u32 {
+            e.send_at(i % 256, ON | (i % 128) << 8 | (1 + i % 127) << 16);
+        }
+        for i in 0..300u32 {
+            e.send_at(100 + i % 100, OFF | (i % 128) << 8);
+        }
+    }
+
+    #[test]
+    fn threaded_mix_matches_serial() {
+        let mut threaded = PianoPrerender::new(48_000);
+        many_notes(&mut threaded);
+        let (mut l, mut r) = (vec![0.0; 512], vec![0.0; 512]);
+        threaded.render(&mut l, &mut r);
+
+        let mut serial = PianoPrerender::new(48_000);
+        many_notes(&mut serial);
+        let mut scheduled = std::mem::take(&mut serial.scheduled);
+        scheduled.sort_by_key(|&(frame, _)| frame);
+        serial.begin_render();
+        for &(frame, msg) in &scheduled {
+            serial.apply(frame as usize, msg);
+        }
+        let (mut el, mut er) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+        for v in &mut serial.voices {
+            let n = v.note as usize;
+            let b = &serial.bends[v.channel as usize];
+            v.render(
+                &mut el,
+                &mut er,
+                &serial.notes[n],
+                &serial.cache.notes[n],
+                b,
+            );
+        }
+        for (a, b) in l.iter().zip(&el).chain(r.iter().zip(&er)) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn low_notes_lean_left() {
+        let low = NoteSpec::new(30, 48_000);
+        let high = NoteSpec::new(100, 48_000);
+        assert!(low.left > low.right && high.right > high.left);
+        assert!((low.left.powi(2) + low.right.powi(2) - 1.0).abs() < 1e-5);
+    }
+
+    /// Zero crossings, i.e. ~2 * Hz / rate for a lone sine-like note.
+    fn crossings(l: &[f32]) -> usize {
+        l.windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count()
+    }
+
+    #[test]
+    fn pitch_bend_shifts_held_note_at_its_frame() {
+        // At 8 kHz note 100 keeps only its first partial (as a lane pair).
+        let mut e = PianoPrerender::new(8_000);
+        assert_eq!(NoteSpec::new(100, 8_000).count, 2);
+        let (mut l, mut r) = (vec![0.0; 1_600], vec![0.0; 1_600]);
+        e.send_at(0, ON | 100 << 8 | 127 << 16);
+        e.render(&mut l, &mut r);
+        let before = crossings(&l[400..]);
+        // Full up bend at default range: +2 semitones.
+        e.send_at(0, 0xE0 | 127 << 8 | 127 << 16);
+        e.render(&mut l, &mut r);
+        let after = crossings(&l[..1_200]);
+        let ratio = after as f32 / before as f32;
+        assert!((ratio - 2f32.powf(2.0 / 12.0)).abs() < 0.02, "{ratio}");
+    }
+
+    #[test]
+    fn rpn_sets_bend_range_and_reset_restores() {
+        let mut e = PianoPrerender::new(48_000);
+        for msg in [0xB0 | 101 << 8, 0xB0 | 100 << 8, 0xB0 | 6 << 8 | 12 << 16] {
+            e.send_at(0, msg);
+        }
+        e.send_at(0, 0xE0 | 127 << 8 | 127 << 16);
+        let (mut l, mut r) = (vec![0.0; 256], vec![0.0; 256]);
+        e.render(&mut l, &mut r);
+        // Full bend at 12 semitones: about an octave up.
+        assert!((e.channels[0].ratio() - 2.0).abs() < 0.01);
+        e.send_at(10, 0xB0 | 121 << 8);
+        e.render(&mut l, &mut r);
+        assert_eq!(e.channels[0].ratio(), 1.0);
+        assert_eq!(e.bends[0], vec![(0, e.bends[0][0].1), (10, 1.0)]);
+    }
+
+    #[test]
+    fn phasor_tracks_damped_sine() {
+        let spec = NoteSpec::new(69, 48_000);
+        let (cos, sin) = spec.rotation(1.0, 1.0);
+        let (mut re, mut im) = ([0.0; LANES], [0.0; LANES]);
+        re[0] = 1.0;
+        let (w, r) = (spec.omegas[0], spec.decays[0] as f64);
+        for n in 1..=48_000 {
+            let got = step(&mut re, &mut im, &cos, &sin) as f64;
+            let exact = r.powi(n) * (w * n as f64).sin();
+            assert!((got - exact).abs() < 2e-3, "frame {n}: {got} vs {exact}");
+        }
+    }
+
+    #[test]
+    fn partials_are_stretched_and_fundamental_in_tune() {
+        let spec = NoteSpec::new(69, 48_000);
+        assert!((spec.hz[0] / 440.0 - 1.0).abs() < 1e-6);
+        // Lane 2 is partial 2's prompt lane; stiff strings run sharp.
+        assert!(spec.hz[2] > 880.0);
+        // Treble strings are stiffer than mid ones.
+        assert!(inharmonicity(100) > 10.0 * inharmonicity(50));
+    }
+
+    #[test]
+    fn strike_point_mutes_the_eighth_partial() {
+        let spec = NoteSpec::new(40, 48_000);
+        // Partials 1-8 are pairs (lanes 0-15); partial 8 is lanes 14/15.
+        assert!(spec.amps[14] < 1e-6);
+        assert!(spec.amps[0] > 0.0);
+    }
+
+    #[test]
+    fn prompt_decays_faster_than_aftersound_and_treble_faster_than_bass() {
+        let mid = NoteSpec::new(60, 48_000);
+        assert!(mid.decays[0] < mid.decays[1]);
+        assert!(NoteSpec::new(90, 48_000).decays[1] < mid.decays[1]);
+    }
+
+    #[test]
+    fn velocity_sets_loudness_and_brightness() {
+        let spec = NoteSpec::new(60, 48_000);
+        let soft = lane_amps(32, &spec);
+        let hard = lane_amps(127, &spec);
+        let sum = |a: &[f32]| a.iter().sum::<f32>();
+        // Match the SF2 engine's velocity^2 gain curve.
+        assert!((sum(&soft) / sum(&hard) - (32.0f32 / 127.0).powi(2)).abs() < 0.02);
+        // Upper partials fall away faster on soft hits.
+        let k = 2 * PAIRED; // first single-lane partial
+        assert!(hard[k] / hard[0] > 2.0 * soft[k] / soft[0]);
+    }
+
+    #[test]
+    fn treble_note_decays_and_is_dropped_while_held() {
+        let mut e = PianoPrerender::new(8_000);
+        e.send_at(0, ON | 100 << 8 | 127 << 16);
+        let first = peak(&run(&mut e, 2_048)[1_000..]);
+        let later = peak(&run(&mut e, 8_000));
+        assert!(later < first * 0.8, "no decay while held");
+        // Never released, but eventually silent and removed.
+        run(&mut e, 8_000 * 60);
+        assert!(e.voices.is_empty());
+    }
+
+    #[test]
+    fn cache_is_shared_trimmed_and_capped_at_15s() {
+        let a = Cache::get(8_000);
+        assert!(std::sync::Arc::ptr_eq(&a, &Cache::get(8_000)));
+        let max = (CACHE_SECS * 8_000.0) as usize;
+        assert!(a.notes.iter().all(|n| n.samples.len() <= max));
+        // Bass rings for many seconds; treble is trimmed short.
+        assert!(a.notes[21].samples.len() > max * 2 / 3);
+        assert!(a.notes[21].samples.last().unwrap().abs() < 100);
+        assert!(a.notes[100].samples.len() < max / 4);
+    }
+
+    #[test]
+    fn soft_hits_are_quieter_and_darker() {
+        let mut e = PianoPrerender::new(48_000);
+        e.send_at(0, ON | 60 << 8 | 127 << 16);
+        e.send_at(0, ON | 60 << 8 | 40 << 16);
+        let (mut l, mut r) = (vec![0.0; 16], vec![0.0; 16]);
+        e.render(&mut l, &mut r);
+        let (hard, soft) = (&e.voices[0], &e.voices[1]);
+        assert!(soft.gain < hard.gain);
+        assert_eq!(hard.lp, 1.0);
+        assert!(soft.lp < 1.0);
+    }
+}

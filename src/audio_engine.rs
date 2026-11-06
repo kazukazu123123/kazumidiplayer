@@ -9,8 +9,8 @@
 mod csynth;
 mod kdmapi;
 mod pending;
+mod piano;
 pub mod prerender;
-mod sine;
 pub mod synths;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,7 +65,7 @@ pub trait AudioEngine: Send + 'static {
     }
 
     /// Render the next `left.len()` frames (always a multiple of
-    /// [`prerender::CHUNK_FRAMES`]). Prerender engines only.
+    /// [`prerender::CHUNK_FRAMES]). Prerender engines only.
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         left.fill(0.0);
         right.fill(0.0);
@@ -131,13 +131,13 @@ impl<E: AudioEngine> ErasedEngine for E {
     }
 }
 
-/// Every selectable engine, in combo box order. Index 0 is the default.
+/// Every selectable built-in engine, in combo box order. Index 0 is the default.
 /// Append new engines: the saved setting is an index into this list.
 pub const ENGINES: &[EngineDef] = &[
     register::<crate::kdmapi::KDMAPIStream>(),
     register::<synths::csynth::CSynthStream>(),
     register::<synths::csynth::CSynthPrerender>(),
-    register::<synths::sine::SinePrerender>(),
+    register::<synths::piano::PianoPrerender>(),
 ];
 
 const ENGINE_COUNT: usize = ENGINES.len();
