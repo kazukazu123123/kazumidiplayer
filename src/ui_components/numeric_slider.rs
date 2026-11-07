@@ -253,10 +253,11 @@ pub fn draw_u32_numeric_slider(
         Color::new(95, 95, 95, (255.0 * alpha * opacity) as u8)
     };
     let slider = Rectangle::new(rect.x, rect.y + 28.0, 140.0, 20.0);
-    let value_box_width = if enabled { 68.0 } else { 127.0 };
+    let value_box_width = if enabled { 68.0 } else { 170.0 };
+    let buttons_x = if enabled { 222.0 } else { 265.0 };
     let value_box = Rectangle::new(rect.x + 148.0, rect.y + 20.0, value_box_width, 28.0);
-    let minus = Rectangle::new(rect.x + 222.0, rect.y + 20.0, 24.0, 28.0);
-    let plus = Rectangle::new(rect.x + 251.0, rect.y + 20.0, 24.0, 28.0);
+    let minus = Rectangle::new(rect.x + buttons_x, rect.y + 20.0, 24.0, 28.0);
+    let plus = Rectangle::new(rect.x + buttons_x + 29.0, rect.y + 20.0, 24.0, 28.0);
 
     d.draw_text(label, rect.x as i32, rect.y as i32, 16, text_color);
     d.draw_rectangle(
