@@ -400,6 +400,8 @@ impl Voice {
         spec: &NoteSpec,
         cached: &CachedNote,
         bends: &[(usize, f32)],
+        channel_gain: f32,
+        channel_pan: f32,
     ) {
         let len = left.len();
         let end = self.kill_at.unwrap_or(len).min(len);
@@ -410,7 +412,14 @@ impl Voice {
             self.release_at.unwrap_or(end).clamp(start, end)
         };
         let s = &cached.samples;
-        let (gl, gr) = (spec.left * self.gain, spec.right * self.gain);
+        let (pan_left, pan_right) = {
+            let angle = channel_pan.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+            (angle.cos(), angle.sin())
+        };
+        let (gl, gr) = (
+            spec.left * self.gain * channel_gain * pan_left * 1.4142,
+            spec.right * self.gain * channel_gain * pan_right * 1.4142,
+        );
         let (mut pos, mut y, mut env) = (self.pos, self.lp_y, self.env);
         let lp = self.lp;
         let mut ended = false;
@@ -479,6 +488,14 @@ struct Channel {
     range: f32,
     /// Selected RPN (MSB, LSB); 127/127 is none.
     rpn: (u8, u8),
+    /// MIDI channel volume (CC7), normalized.
+    volume: f32,
+    /// MIDI channel expression (CC11), normalized.
+    expression: f32,
+    /// MIDI channel pan (CC10), normalized left to right.
+    pan: f32,
+    /// Soft pedal (CC67).
+    soft: bool,
     sustain: bool,
 }
 
@@ -487,6 +504,10 @@ impl Channel {
         bend: BEND_CENTER,
         range: DEFAULT_BEND_RANGE,
         rpn: (127, 127),
+        volume: 1.0,
+        expression: 1.0,
+        pan: 0.5,
+        soft: false,
         sustain: false,
     };
 
@@ -629,7 +650,13 @@ impl PianoPrerender {
                     channel,
                     note: p1,
                     pos: 0.0,
-                    gain: v.powf(1.5) * self.cache.notes[p1 as usize].scale,
+                    gain: v.powf(1.5)
+                        * self.cache.notes[p1 as usize].scale
+                        * if self.channels[channel as usize].soft {
+                            0.7
+                        } else {
+                            1.0
+                        },
                     lp,
                     lp_y: 0.0,
                     env: 1.0,
@@ -663,14 +690,21 @@ impl PianoPrerender {
                 self.channels[channel as usize].bend = p1 as u16 | (p2 as u16) << 7;
                 self.bend_changed(channel as usize, frame);
             }
-            0xB0 if p1 == 64 => {
-                let down = p2 >= 64;
-                let ch = &mut self.channels[channel as usize];
-                let was = std::mem::replace(&mut ch.sustain, down);
-                if was && !down {
-                    self.pedal_up(channel, frame);
+            0xB0 if matches!(p1, 7 | 10 | 11 | 64 | 66 | 67) => match p1 {
+                7 => self.channels[channel as usize].volume = p2 as f32 / 127.0,
+                10 => self.channels[channel as usize].pan = p2 as f32 / 127.0,
+                11 => self.channels[channel as usize].expression = p2 as f32 / 127.0,
+                64 => {
+                    let down = p2 >= 64;
+                    let was = std::mem::replace(&mut self.channels[channel as usize].sustain, down);
+                    if was && !down {
+                        self.pedal_up(channel, frame);
+                    }
                 }
-            }
+                66 => {}
+                67 => self.channels[channel as usize].soft = p2 >= 64,
+                _ => unreachable!(),
+            },
             0xB0 if matches!(p1, 6 | 38 | 100 | 101 | 121) => {
                 let ch = &mut self.channels[channel as usize];
                 match p1 {
@@ -684,6 +718,10 @@ impl PianoPrerender {
                     121 => {
                         ch.bend = BEND_CENTER;
                         ch.rpn = (127, 127);
+                        ch.volume = 1.0;
+                        ch.expression = 1.0;
+                        ch.pan = 0.5;
+                        ch.soft = false;
                         if std::mem::replace(&mut ch.sustain, false) {
                             self.pedal_up(channel, frame);
                         }
@@ -732,7 +770,8 @@ impl PianoPrerender {
         }
         scheduled.clear();
         self.scheduled = scheduled;
-        let (bends, notes, cache) = (&self.bends, &self.notes, &*self.cache);
+        let (bends, notes, cache, channels) =
+            (&self.bends, &self.notes, &*self.cache, self.channels);
 
         let layer_count = self.voices.len().div_ceil(VOICES_PER_LAYER);
         left.fill(0.0);
@@ -748,7 +787,18 @@ impl PianoPrerender {
         if layer_count <= 1 {
             for v in &mut self.voices {
                 let (n, b) = (v.note as usize, &bends[v.channel as usize]);
-                v.render(left, right, &notes[n], &cache.notes[n], b);
+                let channel_state = channels[v.channel as usize];
+                let channel_gain = channel_state.volume * channel_state.expression;
+                let channel_pan = channel_state.pan;
+                v.render(
+                    left,
+                    right,
+                    &notes[n],
+                    &cache.notes[n],
+                    b,
+                    channel_gain,
+                    channel_pan,
+                );
             }
         } else {
             use rayon::prelude::*;
@@ -761,12 +811,17 @@ impl PianoPrerender {
                     .for_each(|(voices, layer)| {
                         for v in voices {
                             let (n, b) = (v.note as usize, &bends[v.channel as usize]);
+                            let channel_state = channels[v.channel as usize];
+                            let channel_gain = channel_state.volume * channel_state.expression;
+                            let channel_pan = channel_state.pan;
                             v.render(
                                 &mut layer.left,
                                 &mut layer.right,
                                 &notes[n],
                                 &cache.notes[n],
                                 b,
+                                channel_gain,
+                                channel_pan,
                             );
                         }
                     });
@@ -913,6 +968,9 @@ mod tests {
                 &serial.notes[n],
                 &serial.cache.notes[n],
                 b,
+                serial.channels[v.channel as usize].volume
+                    * serial.channels[v.channel as usize].expression,
+                serial.channels[v.channel as usize].pan,
             );
         }
         for (a, b) in l.iter().zip(&el).chain(r.iter().zip(&er)) {
