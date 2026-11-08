@@ -672,6 +672,10 @@ pub fn draw_settings_overlay(
     pitch_bend_multiplier: &mut u8,
     unlimited_output: &mut bool,
     unlimited_output_animation: f32,
+    s16_clipping: &mut bool,
+    s16_clipping_animation: f32,
+    // When the S16 warning popup was opened (program time); `None` closed.
+    s16_warning_opened_at: &mut Option<f64>,
     midi_ev_buffer_size: &mut u32,
     scrollbar_dragging: &mut bool,
     scrollbar_drag_start_y: &mut f32,
@@ -766,6 +770,8 @@ pub fn draw_settings_overlay(
 
     {
         let mut d2d = d.begin_mode2D(camera);
+        // Program time, shared by the S16 warning popup and its countdown.
+        let frame_time = d2d.get_time();
 
         // Panel Background and Border
         let bg_color = Color::new(45, 45, 48, (255.0 * eased_t) as u8);
@@ -796,6 +802,20 @@ pub fn draw_settings_overlay(
         } else {
             None
         };
+
+        // The S16 warning sits above every control: while it is open nothing
+        // underneath may react. Its clicks come from the original position.
+        let warning_open = s16_warning_opened_at.is_some();
+        let warning_click = if warning_open { click_pos } else { None };
+        if warning_open {
+            click_pos = None;
+            audio_engine_combo.open = false;
+            midi_ev_mode_combo.open = false;
+            // Escape closes the warning without touching the toggle.
+            if numeric_escape {
+                *s16_warning_opened_at = None;
+            }
+        }
 
         // Wheel scrolling is applied after the controls are drawn, unless one of
         // them (a numeric slider's value box) used the wheel itself.
@@ -1134,6 +1154,34 @@ pub fn draw_settings_overlay(
                 .render_mode()
                 == crate::audio_engine::RenderMode::Prerender;
             let ev_bypassed = *unlimited_output || prerender_engine;
+
+            // S16 Clipping Toggle (prerender engines only)
+            let y = layout.next(30.0);
+            tips.push((
+                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                "Reproduce the old 16-bit output: no limiter, so samples past full scale wrap around and heavy parts fuzz and hiss. Only prerender engines have a limiter to skip.",
+            ));
+            let s16_clipping_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            if is_visible(s16_clipping_rect.y, s16_clipping_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    s16_clipping_rect,
+                    "S16 Clipping",
+                    s16_clipping_animation,
+                    prerender_engine,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    if *s16_clipping {
+                        *s16_clipping = false;
+                    } else {
+                        // Enabling goes through the read-through warning.
+                        *s16_warning_opened_at = Some(frame_time);
+                    }
+                }
+            }
+
             let bypass_text = if prerender_engine {
                 "Bypassed (Prerender)"
             } else {
@@ -1590,6 +1638,7 @@ pub fn draw_settings_overlay(
 
         if !wheel_consumed
             && mouse_wheel != 0.0
+            && !warning_open
             && scroll_area_rect.check_collision_point_rec(mouse_world_pos)
         {
             let scroll_speed = 30.0;
@@ -1597,7 +1646,7 @@ pub fn draw_settings_overlay(
         }
 
         // Tooltip for the row under the mouse, once it has rested there.
-        let popup_open = audio_engine_combo.open || midi_ev_mode_combo.open;
+        let popup_open = audio_engine_combo.open || midi_ev_mode_combo.open || warning_open;
         let hovered_tip = (!popup_open
             && !is_mouse_down
             && !*scrollbar_dragging
@@ -1631,6 +1680,149 @@ pub fn draw_settings_overlay(
         } else if let Some(pos) = click_pos {
             if !panel_rect.check_collision_point_rec(pos) {
                 close_clicked = true;
+            }
+        }
+
+        // S16 Clipping warning: drawn above every control. It must be read
+        // through (5 s) before Enable lights up; Shift+Click skips the wait.
+        if let Some(opened_at) = *s16_warning_opened_at {
+            const WAIT_SECS: f64 = 5.0;
+            let elapsed = (frame_time - opened_at).max(0.0);
+            let remaining = (WAIT_SECS - elapsed).max(0.0);
+            let ready = remaining == 0.0 || numeric_shift;
+
+            // Dim the whole panel, then put the window above the dim layer.
+            d2d.draw_rectangle_rec(
+                panel_rect,
+                Color::new(0, 0, 0, (190.0 * eased_t) as u8),
+            );
+
+            let window = Rectangle::new(30.0, 55.0, 340.0, 235.0);
+            d2d.draw_rectangle_rec(
+                window,
+                Color::new(60, 6, 6, (255.0 * eased_t) as u8),
+            );
+            // Flashy: the border pulses red the whole time.
+            let pulse = (0.55 + 0.45 * (frame_time * 5.0).sin().abs()) as f32;
+            let border_alpha = (pulse * eased_t * 255.0) as u8;
+            d2d.draw_rectangle_lines_ex(
+                window,
+                3.0,
+                Color::new(255, 45, 45, border_alpha),
+            );
+
+            // Centered text via the default font, as the tooltip helper does.
+            let measured = |text: &str, size: i32| -> i32 {
+                let c = std::ffi::CString::new(text).unwrap_or_default();
+                // Safety: a valid NUL-terminated string; the default font is loaded.
+                unsafe { raylib::ffi::MeasureText(c.as_ptr(), size) }
+            };
+            let centered_x = |text: &str, size: i32| -> i32 {
+                (window.x + (window.width - measured(text, size) as f32) / 2.0) as i32
+            };
+
+            let title = "WARNING";
+            d2d.draw_text(
+                title,
+                centered_x(title, 28),
+                72,
+                28,
+                Color::new(255, 60, 50, (255.0 * eased_t) as u8),
+            );
+
+            const BODY: &str = "Enabling S16 Clipping skips the output limiter. Samples past full scale wrap around to the opposite end, like 16-bit overflow, so dense parts turn into harsh fuzz. It can get seriously loud: turn the volume down first.";
+            let mut line_y = 104.0;
+            for line in wrap_text(BODY, 14, 300) {
+                d2d.draw_text(
+                    line.as_str(),
+                    (window.x + 20.0) as i32,
+                    line_y as i32,
+                    14,
+                    Color::new(235, 220, 220, (255.0 * eased_t) as u8),
+                );
+                line_y += 19.0;
+            }
+
+            let status: String = if ready {
+                "You can enable it now.".to_string()
+            } else {
+                format!("You can enable it in {}s", remaining.ceil() as u64)
+            };
+            d2d.draw_text(
+                status.as_str(),
+                centered_x(status.as_str(), 16),
+                (line_y + 6.0) as i32,
+                16,
+                Color::new(255, 230, 180, (255.0 * eased_t) as u8),
+            );
+            let hint = "Shift+Click skips the wait.";
+            d2d.draw_text(
+                hint,
+                centered_x(hint, 13),
+                (line_y + 28.0) as i32,
+                13,
+                Color::new(170, 140, 140, (255.0 * eased_t) as u8),
+            );
+
+            let enable_rect = Rectangle::new(window.x + 20.0, 240.0, 148.0, 32.0);
+            let cancel_rect = Rectangle::new(
+                window.x + window.width - 168.0,
+                240.0,
+                148.0,
+                32.0,
+            );
+            if ready {
+                // Unlocked: hot red, pulsing like the border.
+                let is_hovered =
+                    enable_rect.check_collision_point_rec(mouse_world_pos);
+                let bg = if is_hovered { 235 } else { 170 };
+                d2d.draw_rectangle_rec(
+                    enable_rect,
+                    Color::new(bg, 22, 22, (255.0 * eased_t) as u8),
+                );
+                d2d.draw_rectangle_lines_ex(
+                    enable_rect,
+                    2.0,
+                    Color::new(255, 80, 60, border_alpha),
+                );
+                d2d.draw_text(
+                    "Enable",
+                    enable_rect.x as i32 + 10,
+                    enable_rect.y as i32 + 8,
+                    18,
+                    Color::new(255, 240, 240, (255.0 * eased_t) as u8),
+                );
+            } else {
+                let label = format!("Enable in {}s", remaining.ceil() as u64);
+                draw_button(
+                    &mut d2d,
+                    enable_rect,
+                    label.as_str(),
+                    18,
+                    false,
+                    eased_t,
+                    warning_click,
+                    Some(mouse_world_pos),
+                );
+            }
+            draw_button(
+                &mut d2d,
+                cancel_rect,
+                "Cancel",
+                18,
+                true,
+                eased_t,
+                warning_click,
+                Some(mouse_world_pos),
+            );
+
+            if let Some(click) = warning_click {
+                if cancel_rect.check_collision_point_rec(click) {
+                    *s16_warning_opened_at = None;
+                } else if ready && enable_rect.check_collision_point_rec(click) {
+                    *s16_warning_opened_at = None;
+                    *s16_clipping = true;
+                }
             }
         }
     }

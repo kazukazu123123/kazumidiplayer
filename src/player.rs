@@ -50,6 +50,8 @@ pub enum PlayerCommand {
     SetOutput(Option<OutputStream>),
     /// Longest prerendered audio buffer, in seconds.
     SetAudioBufferSecs(u32),
+    /// S16 Clipping: no limiter, hard-clipped peaks instead.
+    SetS16Clipping(bool),
 }
 
 pub enum PlayerFeedback {
@@ -308,6 +310,7 @@ impl PlayerHandle {
             let mut legacy_midi_output = true;
             let mut midi_ev_fifo = VecDeque::<BufferedMidiEvent>::new();
             let mut audio_buffer_secs = crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS;
+            let mut s16_clipping = false;
             // The prerender session of the current output, if any.
             macro_rules! prerender {
                 ($player:ident) => {
@@ -458,6 +461,15 @@ impl PlayerHandle {
                         PlayerCommand::SetUnlimitedOutput(enabled) => {
                             player.unlimited_output.store(enabled, Ordering::SeqCst);
                         }
+                        PlayerCommand::SetS16Clipping(enabled) => {
+                            s16_clipping = enabled;
+                            if let Some(ref stream) = player.stream {
+                                stream.set_limiter_bypassed(enabled);
+                            }
+                            if let Some(p) = prerender!(player) {
+                                p.set_limiter_bypassed(enabled);
+                            }
+                        }
                         PlayerCommand::SetMidiEvBufferSize(size) => {
                             midi_ev_buffer_size = size
                                 .clamp(MIN_MIDI_EV_BUFFER_SIZE, MAX_MIDI_EV_BUFFER_SIZE)
@@ -500,9 +512,14 @@ impl PlayerHandle {
                             player.send_all_notes_off();
                             player.stream = stream;
                             player.reset_playback_state();
+                            // Re-apply S16 Clipping to the new output.
+                            if let Some(ref stream) = player.stream {
+                                stream.set_limiter_bypassed(s16_clipping);
+                            }
                             if let Some(p) = prerender!(player) {
                                 p.set_bend_override(player.bend_override());
                                 p.set_max_buffer_secs(audio_buffer_secs);
+                                p.set_limiter_bypassed(s16_clipping);
                                 p.set_data(player.data.clone());
                                 if player.state == PlayerState::Playing {
                                     applied_speed = read_speed(&playback_speed_clone);
@@ -1027,6 +1044,12 @@ impl PlayerHandle {
         let _ = self
             .tx_command
             .send(PlayerCommand::SetUnlimitedOutput(enabled));
+    }
+
+    /// S16 Clipping: no limiter, samples past full scale wrap around.
+    /// Only prerender engines honor it.
+    pub fn set_s16_clipping(&self, enabled: bool) {
+        let _ = self.tx_command.send(PlayerCommand::SetS16Clipping(enabled));
     }
 
     pub fn set_midi_ev_buffer_size(&self, size: u32) {

@@ -56,4 +56,8 @@ impl AudioEngine for CSynthPrerender {
     fn polyphony(&self) -> u32 {
         CSynthPrerender::polyphony(self)
     }
+
+    fn set_limiter_bypassed(&mut self, bypassed: bool) {
+        CSynthPrerender::set_limiter_bypassed(self, bypassed);
+    }
 }

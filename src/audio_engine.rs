@@ -76,6 +76,13 @@ pub trait AudioEngine: Send + 'static {
     fn polyphony(&self) -> u32 {
         0
     }
+
+    /// Bypass the engine's own output limiter, for S16 Clipping. Some
+    /// prerender engines run a second limiter inside the synth; engines
+    /// without one ignore this.
+    fn set_limiter_bypassed(&mut self, bypassed: bool) {
+        let _ = bypassed;
+    }
 }
 
 /// Type-erased registration record; build with [`register`].
@@ -103,6 +110,7 @@ trait ErasedEngine: Send {
     fn send_midi_event_at(&mut self, frame: u32, data: u32);
     fn render(&mut self, left: &mut [f32], right: &mut [f32]);
     fn polyphony(&self) -> u32;
+    fn set_limiter_bypassed(&mut self, bypassed: bool);
 }
 
 impl<E: AudioEngine> ErasedEngine for E {
@@ -128,6 +136,10 @@ impl<E: AudioEngine> ErasedEngine for E {
 
     fn polyphony(&self) -> u32 {
         AudioEngine::polyphony(self)
+    }
+
+    fn set_limiter_bypassed(&mut self, bypassed: bool) {
+        AudioEngine::set_limiter_bypassed(self, bypassed)
     }
 }
 
@@ -301,6 +313,12 @@ impl OutputStream {
     /// The prerender session, for [`RenderMode::Prerender`] engines.
     pub fn prerender(&self) -> Option<&prerender::Session> {
         self.prerender.as_ref()
+    }
+
+    /// S16 Clipping: bypass the engine's own output limiter.
+    /// Engines without one ignore it.
+    pub fn set_limiter_bypassed(&self, bypassed: bool) {
+        lock(&self.engine).set_limiter_bypassed(bypassed);
     }
 
     /// Make output already queued for the previous file obsolete.

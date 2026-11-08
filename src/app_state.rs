@@ -137,6 +137,13 @@ pub struct AppState {
     pub pitch_bend_multiplier: u8, // 1-127 (semitones)
     pub unlimited_output_enabled: bool,
     pub unlimited_output_animation: f32,
+    /// S16 Clipping: no limiter, wrap-around overflow instead
+    /// (prerender engines only).
+    pub s16_clipping_enabled: bool,
+    pub s16_clipping_animation: f32,
+    /// When the S16 enable warning was opened, as program time in seconds
+    /// from `get_time()`; `None` when closed.
+    pub s16_warning_opened_at: Option<f64>,
     pub midi_ev_buffer_size: u32,
     /// 0 = legacy/no buffer, 1 = buffered slowdown, 2 = buffered catch-up.
     pub midi_ev_mode: usize,
@@ -264,6 +271,9 @@ impl AppState {
             pitch_bend_multiplier: 12, // default 12 semitones
             unlimited_output_enabled: false,
             unlimited_output_animation: 0.0,
+            s16_clipping_enabled: false,
+            s16_clipping_animation: 0.0,
+            s16_warning_opened_at: None,
             midi_ev_buffer_size: crate::player::DEFAULT_MIDI_EV_BUFFER_SIZE,
             midi_ev_mode: 0,
             audio_engine: 0,

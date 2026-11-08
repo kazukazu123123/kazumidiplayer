@@ -260,6 +260,7 @@ fn open(shutdown: Sender<()>) -> Result<(cpal::Stream, CSynthStream), String> {
 pub struct CSynthPrerender {
     piano: PianoProcessor,
     limiter: Limiter,
+    limiter_bypassed: bool,
     rate: u32,
     interleaved: Vec<f32>,
 }
@@ -282,6 +283,7 @@ impl CSynthPrerender {
         Ok(Self {
             piano: PianoProcessor::new(samples, rate),
             limiter: csynth::output_limiter(rate),
+            limiter_bypassed: false,
             rate,
             interleaved: Vec::with_capacity(QUANTUM * 2),
         })
@@ -289,6 +291,11 @@ impl CSynthPrerender {
 
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// S16 Clipping: bypass this engine's own output limiter.
+    pub fn set_limiter_bypassed(&mut self, bypassed: bool) {
+        self.limiter_bypassed = bypassed;
     }
 
     /// Apply a message at the current render position.
@@ -316,15 +323,24 @@ impl CSynthPrerender {
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         for (l, r) in left.chunks_mut(QUANTUM).zip(right.chunks_mut(QUANTUM)) {
             self.piano.process(l, r);
-            self.interleaved.clear();
-            for i in 0..QUANTUM {
-                self.interleaved.push(l[i]);
-                self.interleaved.push(r[i]);
-            }
-            self.limiter.process(&mut self.interleaved);
-            for i in 0..QUANTUM {
-                l[i] = self.interleaved[i * 2];
-                r[i] = self.interleaved[i * 2 + 1];
+            if self.limiter_bypassed {
+                // S16 Clipping: no limiter; samples past full scale wrap
+                // around to the other end, like the old s16 output.
+                for (l, r) in l.iter_mut().zip(r.iter_mut()) {
+                    *l = (*l + 1.0).rem_euclid(2.0) - 1.0;
+                    *r = (*r + 1.0).rem_euclid(2.0) - 1.0;
+                }
+            } else {
+                self.interleaved.clear();
+                for i in 0..QUANTUM {
+                    self.interleaved.push(l[i]);
+                    self.interleaved.push(r[i]);
+                }
+                self.limiter.process(&mut self.interleaved);
+                for i in 0..QUANTUM {
+                    l[i] = self.interleaved[i * 2];
+                    r[i] = self.interleaved[i * 2 + 1];
+                }
             }
         }
     }

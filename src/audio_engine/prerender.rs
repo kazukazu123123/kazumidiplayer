@@ -38,6 +38,8 @@ pub const MAX_MAX_BUFFER_SECS: u32 = 600;
 pub const BYTES_PER_FRAME: u64 = std::mem::size_of::<(f32, f32)>() as u64;
 
 /// KazuLimiter settings, applied to every prerender engine's output.
+/// S16 Clipping skips it; overflowing samples wrap around instead,
+/// reproducing the 16-bit output's fuzzing noise.
 const LIMITER_THRESHOLD_DB: f32 = 0.0;
 const LIMITER_RELEASE_MS: f32 = 100.0;
 const LIMITER_LOOKAHEAD_MS: f32 = 50.0;
@@ -161,6 +163,9 @@ struct State {
     voice_marks: VecDeque<(u64, u32)>,
     /// Highest note-on velocity rendering currently drops (0: none).
     drop_velocity: u32,
+    /// S16 Clipping: skip the output limiter; overflowing samples wrap
+    /// around to the other end of the 16-bit range.
+    limiter_bypassed: bool,
     shutdown: bool,
 }
 
@@ -259,6 +264,7 @@ impl Session {
                 resume_at: Some(0),
                 voice_marks: VecDeque::new(),
                 drop_velocity: 0,
+                limiter_bypassed: false,
                 shutdown: false,
             }),
             wake: Condvar::new(),
@@ -390,6 +396,12 @@ impl Session {
             }
             fit_ring(s);
         });
+    }
+
+    /// S16 Clipping: `true` skips the output limiter; samples past full
+    /// scale wrap around. Takes effect on the next chunk.
+    pub fn set_limiter_bypassed(&self, bypassed: bool) {
+        self.update(|s| s.limiter_bypassed = bypassed);
     }
 
     /// Song position of the audio being heard.
@@ -687,6 +699,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
     let mut skip = SkipFilter::new();
     let mut thin_armed = false;
     let mut drop_velocity;
+    let mut limiter_bypassed;
     let mut left = vec![0.0f32; CHUNK_FRAMES];
     let mut right = vec![0.0f32; CHUNK_FRAMES];
     // Runs on interleaved stereo, so both channels share one gain (linked)
@@ -741,6 +754,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                 0
             };
             s.drop_velocity = drop_velocity;
+            limiter_bypassed = s.limiter_bypassed;
             let fill = buffered as f64 / s.max_frames.max(1) as f64;
             if low_priority && fill < URGENT_BELOW || !low_priority && fill > RELAXED_ABOVE {
                 low_priority = !low_priority;
@@ -798,7 +812,17 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
         msgs.clear();
         interleaved.clear();
         interleaved.extend(left.iter().zip(&right).flat_map(|(&l, &r)| [l, r]));
-        limiter.process(&mut interleaved);
+        if limiter_bypassed {
+            // S16 Clipping: no limiter. A sample past ±full scale wraps
+            // around to the other end of the 16-bit range, the way s16
+            // overflow did. A f32 output plays the same wrapped wave, so
+            // the sound never depends on the device format.
+            for sample in &mut interleaved {
+                *sample = (*sample + 1.0).rem_euclid(2.0) - 1.0;
+            }
+        } else {
+            limiter.process(&mut interleaved);
+        }
         let chunk_start = rendered;
         rendered += CHUNK_FRAMES as u64;
 
@@ -1014,6 +1038,7 @@ mod tests {
             resume_at: None,
             voice_marks: VecDeque::new(),
             drop_velocity: 0,
+            limiter_bypassed: false,
             shutdown: false,
         };
         restart(&mut state);
@@ -1044,6 +1069,7 @@ mod tests {
             resume_at: None,
             voice_marks: VecDeque::new(),
             drop_velocity: 0,
+            limiter_bypassed: false,
             shutdown: false,
         }
     }

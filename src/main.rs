@@ -416,6 +416,12 @@ fn main() {
             anim_speed,
         );
         animate_toggle(
+            app_state.s16_clipping_enabled,
+            &mut app_state.s16_clipping_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
             app_state.show_stats,
             &mut app_state.show_stats_animation,
             dt,
@@ -742,6 +748,7 @@ fn main() {
                 if !text_editor_focused {
                     app_state.settings_scroll_y = 0.0;
                     app_state.settings_scrollbar_dragging = false;
+                    app_state.s16_warning_opened_at = None;
                     app_state
                         .overlay_manager
                         .open(app_state::AppOverlay::Settings);
@@ -1513,6 +1520,7 @@ fn main() {
                         let prev_pb_override = app_state.pitch_bend_override_enabled;
                         let prev_pb_multiplier = app_state.pitch_bend_multiplier;
                         let prev_unlimited_output = app_state.unlimited_output_enabled;
+                        let prev_s16_clipping = app_state.s16_clipping_enabled;
                         let prev_midi_ev_buffer_size = app_state.midi_ev_buffer_size;
                         let prev_midi_ev_mode = app_state.midi_ev_mode;
                         let prev_parse_threads = app_state.parse_threads;
@@ -1555,6 +1563,9 @@ fn main() {
                             &mut app_state.pitch_bend_multiplier,
                             &mut app_state.unlimited_output_enabled,
                             app_state.unlimited_output_animation,
+                            &mut app_state.s16_clipping_enabled,
+                            app_state.s16_clipping_animation,
+                            &mut app_state.s16_warning_opened_at,
                             &mut app_state.midi_ev_buffer_size,
                             &mut app_state.settings_scrollbar_dragging,
                             &mut app_state.settings_scrollbar_drag_start_y,
@@ -1585,6 +1596,9 @@ fn main() {
                         }
                         if app_state.unlimited_output_enabled != prev_unlimited_output {
                             engine.set_unlimited_output(app_state.unlimited_output_enabled);
+                        }
+                        if app_state.s16_clipping_enabled != prev_s16_clipping {
+                            engine.set_s16_clipping(app_state.s16_clipping_enabled);
                         }
                         if app_state.midi_ev_buffer_size != prev_midi_ev_buffer_size {
                             engine.set_midi_ev_buffer_size(app_state.midi_ev_buffer_size);
