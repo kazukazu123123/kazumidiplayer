@@ -721,23 +721,25 @@ pub fn draw_settings_overlay(
     // Ease-out cubic: 1 - (1 - t)^3
     let eased_t = 1.0 - (1.0 - alpha_factor).powi(3);
 
-    // Panel drawing with Camera2D for perfect scaling and no drift
+    // Expand into unused window space while keeping a compact minimum size.
     let scale = 0.95 + 0.05 * eased_t;
+    let panel_width = (screen_width as f32 - 32.0).clamp(400.0, 720.0);
+    let panel_height = (screen_height as f32 - 32.0).clamp(350.0, 760.0);
     let camera = Camera2D {
-        target: Vector2::new(200.0, 175.0), // Center of 400x350 panel
-        offset: Vector2::new(screen_width as f32 / 2.0, screen_height as f32 / 2.0), // Center of screen
+        target: Vector2::new(panel_width / 2.0, panel_height / 2.0),
+        offset: Vector2::new(screen_width as f32 / 2.0, screen_height as f32 / 2.0),
         rotation: 0.0,
         zoom: scale,
     };
 
     let mut close_clicked = false;
-    let panel_rect = Rectangle::new(0.0, 0.0, 400.0, 350.0);
+    let panel_rect = Rectangle::new(0.0, 0.0, panel_width, panel_height);
     let border_color = Color::new(0, 135, 200, (255.0 * eased_t) as u8);
     let text_color = Color::new(240, 240, 240, (255.0 * eased_t) as u8);
 
     // Scroll area configuration
     let content_top = 50.0;
-    let content_bottom = 300.0;
+    let content_bottom = panel_height - 50.0;
     let viewport_height = content_bottom - content_top;
 
     // Simple vertical layout engine: tracks next Y and max content height automatically
@@ -764,7 +766,18 @@ pub fn draw_settings_overlay(
             self.max_bottom + bottom_padding
         }
     }
-    let mut layout = VerticalLayout::new(content_top, 5.0);
+    let mut left_layout = VerticalLayout::new(content_top, 5.0);
+    let mut right_layout = VerticalLayout::new(content_top, 5.0);
+    let two_columns = panel_width >= 660.0;
+    let column_gap = 20.0;
+    let column_width = if two_columns {
+        // Numeric controls use a fixed internal layout that needs this much room.
+        ((panel_width - 60.0) / 2.0).max(300.0)
+    } else {
+        panel_width - 40.0
+    };
+    let mut layout = &mut left_layout;
+    let mut column_x = 20.0;
     // Per row: (area in panel space, description shown on hover).
     let mut tips: Vec<(Rectangle, &'static str)> = Vec::new();
 
@@ -849,7 +862,7 @@ pub fn draw_settings_overlay(
                 d_scissor.draw_text_ex(
                     &font,
                     "Rendering:",
-                    Vector2::new(20.0, sy(y)),
+                    Vector2::new(column_x, sy(y)),
                     18.0,
                     spacing,
                     text_color,
@@ -858,8 +871,8 @@ pub fn draw_settings_overlay(
 
             // Render Mode Toggle
             let y = layout.next(30.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Scroll the piano roll by beats instead of by time. Notes keep the same spacing when the tempo changes, so fast sections don't squash together."));
-            let toggle_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Scroll the piano roll by beats instead of by time. Notes keep the same spacing when the tempo changes, so fast sections don't squash together."));
+            let toggle_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(toggle_rect.y, toggle_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -878,10 +891,10 @@ pub fn draw_settings_overlay(
             // Beat Bounce pulses only the piano-roll zoom at the selected note interval.
             let y = layout.next(30.0);
             tips.push((
-                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                Rectangle::new(column_x, sy(y), column_width, 30.0),
                 "Pulse the piano roll's zoom in time with the song's tempo.",
             ));
-            let beat_bounce_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            let beat_bounce_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(beat_bounce_rect.y, beat_bounce_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -900,7 +913,7 @@ pub fn draw_settings_overlay(
             if *beat_bounce_enabled {
                 let y = layout.next(52.0);
                 tips.push((
-                    Rectangle::new(20.0, sy(y), 360.0, 52.0),
+                    Rectangle::new(column_x, sy(y), column_width, 52.0),
                     "How far the piano roll zooms in on each pulse. 0 turns the pulse off.",
                 ));
                 if is_visible(sy(y), 52.0) {
@@ -923,7 +936,7 @@ pub fn draw_settings_overlay(
                     };
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         "Beat Bounce Amount (%)",
                         beat_bounce_amount,
                         0,
@@ -937,7 +950,7 @@ pub fn draw_settings_overlay(
                 }
 
                 let y = layout.next(52.0);
-                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "How often it pulses: 4 = every quarter note, 8 = every eighth note, and so on."));
+                tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "How often it pulses: 4 = every quarter note, 8 = every eighth note, and so on."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -958,7 +971,7 @@ pub fn draw_settings_overlay(
                     };
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         "Beat Interval (1/N Note)",
                         beat_bounce_note_value,
                         1,
@@ -973,10 +986,10 @@ pub fn draw_settings_overlay(
 
                 let y = layout.next(30.0);
                 tips.push((
-                    Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                    Rectangle::new(column_x, sy(y), column_width, 30.0),
                     "Pulse halfway between beats instead of on them.",
                 ));
-                let offbeat_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+                let offbeat_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
                 if is_visible(offbeat_rect.y, offbeat_rect.height) {
                     if draw_toggle(
                         &mut d_scissor,
@@ -996,10 +1009,10 @@ pub fn draw_settings_overlay(
             // Shaking Window Toggle
             let y = layout.next(30.0);
             tips.push((
-                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                Rectangle::new(column_x, sy(y), column_width, 30.0),
                 "Shake the keyboard window along with the notes being played.",
             ));
-            let shake_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            let shake_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(shake_rect.y, shake_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1017,8 +1030,8 @@ pub fn draw_settings_overlay(
 
             // Integrate Keyboard Toggle
             let y = layout.next(30.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Show the piano keyboard inside the piano roll window instead of as a separate window."));
-            let integrate_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Show the piano keyboard inside the piano roll window instead of as a separate window."));
+            let integrate_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(integrate_rect.y, integrate_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1037,10 +1050,10 @@ pub fn draw_settings_overlay(
             // Autoplay on Load Toggle
             let y = layout.next(30.0);
             tips.push((
-                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                Rectangle::new(column_x, sy(y), column_width, 30.0),
                 "Start playing as soon as a MIDI file finishes loading.",
             ));
-            let autoplay_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            let autoplay_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(autoplay_rect.y, autoplay_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1058,9 +1071,9 @@ pub fn draw_settings_overlay(
 
             // Audio engine selector
             let y = layout.next(52.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "What makes the sound. KDMAPI sends notes to OmniMIDI as they play. CSynth plays a piano sample set. Prerender engines render ahead into a buffer: smoother on heavy files, but changes take a moment to be heard."));
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "What makes the sound. KDMAPI sends notes to OmniMIDI as they play. CSynth plays a piano sample set. Prerender engines render ahead into a buffer: smoother on heavy files, but changes take a moment to be heard."));
             if is_visible(sy(y), 52.0) {
-                let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
+                let combo_rect = Rectangle::new(column_x, sy(y), column_width, 52.0);
                 audio_engine_combo_rect = Some(combo_rect);
                 let was_open = audio_engine_combo.open;
                 draw_combo_box(
@@ -1097,7 +1110,7 @@ pub fn draw_settings_overlay(
             // Prerender buffer length; applies immediately.
             {
                 let y = layout.next(52.0);
-                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "How far ahead a prerender engine renders, from 1 second to 10 minutes. More rides out heavy parts but uses more memory. When less than 2 seconds is left, quiet notes are skipped to keep up."));
+                tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "How far ahead a prerender engine renders, from 1 second to 10 minutes. More rides out heavy parts but uses more memory. When less than 2 seconds is left, quiet notes are skipped to keep up."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1133,7 +1146,7 @@ pub fn draw_settings_overlay(
                     };
                     wheel_consumed |= crate::ui_components::numeric_slider::draw_duration_spinner(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         "Max Audio Buffer",
                         enabled.then_some(note.as_str()),
                         audio_buffer_secs,
@@ -1158,10 +1171,10 @@ pub fn draw_settings_overlay(
             // S16 Clipping Toggle (prerender engines only)
             let y = layout.next(30.0);
             tips.push((
-                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                Rectangle::new(column_x, sy(y), column_width, 30.0),
                 "Reproduce the old 16-bit output: no limiter, so samples past full scale wrap around and heavy parts fuzz and hiss. Only prerender engines have a limiter to skip.",
             ));
-            let s16_clipping_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            let s16_clipping_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(s16_clipping_rect.y, s16_clipping_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1193,8 +1206,9 @@ pub fn draw_settings_overlay(
 
             // Unlimited Output Toggle
             let y = layout.next(30.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Send every MIDI event the moment it is due, with no per-frame limit. Most accurate timing, but very heavy files can overload the synth."));
-            let unlimited_output_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Send every MIDI event the moment it is due, with no per-frame limit. Most accurate timing, but very heavy files can overload the synth."));
+            let unlimited_output_rect =
+                Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(unlimited_output_rect.y, unlimited_output_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1210,10 +1224,16 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // MIDI and pitch-bend settings use the right column on wide panels.
+            if two_columns {
+                layout = &mut right_layout;
+                column_x = 20.0 + column_width + column_gap;
+            }
+
             // MIDI events consumed per 60 Hz output frame.
             {
                 let y = layout.next(52.0);
-                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "How many MIDI events can be sent per frame. Larger keeps up with denser files; smaller protects the synth from floods."));
+                tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "How many MIDI events can be sent per frame. Larger keeps up with denser files; smaller protects the synth from floods."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1251,7 +1271,7 @@ pub fn draw_settings_overlay(
                     };
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         label,
                         displayed_value,
                         crate::player::MIN_MIDI_EV_BUFFER_SIZE,
@@ -1266,9 +1286,9 @@ pub fn draw_settings_overlay(
             }
 
             let y = layout.next(52.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "What to do when a file has more events than one frame can send. Legacy: old behaviour, no buffer. Slowdown: playback slows down until it catches up. Catch Up: keeps real time and skips ahead after the backlog."));
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "What to do when a file has more events than one frame can send. Legacy: old behaviour, no buffer. Slowdown: playback slows down until it catches up. Catch Up: keeps real time and skips ahead after the backlog."));
             if is_visible(sy(y), 52.0) {
-                let combo_rect = Rectangle::new(20.0, sy(y), 275.0, 52.0);
+                let combo_rect = Rectangle::new(column_x, sy(y), column_width, 52.0);
                 midi_ev_mode_combo_rect = Some(combo_rect);
                 let was_open = midi_ev_mode_combo.open && !ev_bypassed;
                 draw_combo_box(
@@ -1310,10 +1330,11 @@ pub fn draw_settings_overlay(
             // Pitch Bend Window Toggle
             let y = layout.next(30.0);
             tips.push((
-                Rectangle::new(20.0, sy(y), 360.0, 30.0),
+                Rectangle::new(column_x, sy(y), column_width, 30.0),
                 "Bend the keyboard window's shape with the song's pitch bend.",
             ));
-            let pitch_bend_window_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            let pitch_bend_window_rect =
+                Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(pitch_bend_window_rect.y, pitch_bend_window_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1331,8 +1352,8 @@ pub fn draw_settings_overlay(
 
             // Pitch Bend OS Window Movement Toggle
             let y = layout.next(30.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Move the whole app window sideways with pitch bend. The three spring settings below control how it moves."));
-            let pb_move_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Move the whole app window sideways with pitch bend. The three spring settings below control how it moves."));
+            let pb_move_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(pb_move_rect.y, pb_move_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1358,7 +1379,7 @@ pub fn draw_settings_overlay(
                 .enumerate()
                 {
                     let y = layout.next(52.0);
-                    tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), tip));
+                    tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), tip));
                     if is_visible(sy(y), 52.0) {
                         let input = NumericSliderInput {
                             click_pos,
@@ -1379,7 +1400,7 @@ pub fn draw_settings_overlay(
                         };
                         wheel_consumed |= draw_u32_numeric_slider(
                             &mut d_scissor,
-                            Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                            Rectangle::new(column_x, sy(y), column_width, 52.0),
                             label,
                             &mut pitch_bend_spring_parameters[index],
                             min,
@@ -1396,8 +1417,8 @@ pub fn draw_settings_overlay(
 
             // Pitch Bend Override Toggle
             let y = layout.next(30.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Ignore the pitch bend range the file sets and use the PB Multiplier below for every channel."));
-            let pb_override_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Ignore the pitch bend range the file sets and use the PB Multiplier below for every channel."));
+            let pb_override_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(pb_override_rect.y, pb_override_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1423,8 +1444,8 @@ pub fn draw_settings_overlay(
             if *pitch_bend_override {
                 let y = layout.next(52.0);
                 tips.push((
-                    Rectangle::new(20.0, sy(y), 360.0, 52.0),
-                    "The pitch bend range, in semitones, used when PB Range Override is on.",
+                    Rectangle::new(column_x, sy(y), column_width, 52.0),
+                    "The pitch bend range, in semitones, used when PB Range Override is on",
                 ));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
@@ -1447,7 +1468,7 @@ pub fn draw_settings_overlay(
                     let mut multiplier = *pitch_bend_multiplier as u32;
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         "PB Multiplier",
                         &mut multiplier,
                         1,
@@ -1462,13 +1483,19 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // Parsing returns to the left column on wide panels.
+            if two_columns {
+                layout = &mut left_layout;
+                column_x = 20.0;
+            }
+
             // Parsing section label
             let y = layout.next(18.0);
             if is_visible(sy(y), 18.0) {
                 d_scissor.draw_text_ex(
                     &font,
                     "Parsing:",
-                    Vector2::new(20.0, sy(y)),
+                    Vector2::new(column_x, sy(y)),
                     18.0,
                     spacing,
                     text_color,
@@ -1478,7 +1505,7 @@ pub fn draw_settings_overlay(
             // Parse Threads slider: 1..=hardware threads. Applies to the next load.
             {
                 let y = layout.next(52.0);
-                tips.push((Rectangle::new(20.0, sy(y), 360.0, 52.0), "CPU threads used to load a MIDI file. More loads faster. Takes effect on the next load."));
+                tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "CPU threads used to load a MIDI file. More loads faster. Takes effect on the next load."));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
                         click_pos,
@@ -1499,7 +1526,7 @@ pub fn draw_settings_overlay(
                     };
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         "Parse Threads",
                         parse_threads,
                         1,
@@ -1513,13 +1540,19 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // Statistics shares the right column with MIDI and pitch-bend settings.
+            if two_columns {
+                layout = &mut right_layout;
+                column_x = 20.0 + column_width + column_gap;
+            }
+
             // Statistics section label
             let y = layout.next(18.0);
             if is_visible(sy(y), 18.0) {
                 d_scissor.draw_text_ex(
                     &font,
                     "Statistics:",
-                    Vector2::new(20.0, sy(y)),
+                    Vector2::new(column_x, sy(y)),
                     18.0,
                     spacing,
                     text_color,
@@ -1528,8 +1561,8 @@ pub fn draw_settings_overlay(
 
             // Show Statistics toggle
             let y = layout.next(30.0);
-            tips.push((Rectangle::new(20.0, sy(y), 360.0, 30.0), "Show the stats panel in the top-right corner: notes per second, note count, BPM, and for prerender engines polyphony and buffer."));
-            let show_stats_rect = Rectangle::new(20.0, sy(y), 200.0, 30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Show the stats panel in the top-right corner: notes per second, note count, BPM, and for prerender engines polyphony and buffer."));
+            let show_stats_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
             if is_visible(show_stats_rect.y, show_stats_rect.height) {
                 if draw_toggle(
                     &mut d_scissor,
@@ -1549,8 +1582,8 @@ pub fn draw_settings_overlay(
             {
                 let y = layout.next(52.0);
                 tips.push((
-                    Rectangle::new(20.0, sy(y), 360.0, 52.0),
-                    "Debug: slows the piano roll's note scan on purpose to test lag. Leave at 0.",
+                    Rectangle::new(column_x, sy(y), column_width, 52.0),
+                    "Debug: slows the piano roll's note scan on purpose to test lag.",
                 ));
                 if is_visible(sy(y), 52.0) {
                     let input = NumericSliderInput {
@@ -1572,7 +1605,7 @@ pub fn draw_settings_overlay(
                     };
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
-                        Rectangle::new(20.0, sy(y), 275.0, 52.0),
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
                         "Scan Delay (ms)",
                         scan_delay_ms,
                         0,
@@ -1616,7 +1649,10 @@ pub fn draw_settings_overlay(
         // Measured from what was just laid out, so the scroll range always
         // matches the controls actually drawn.
         // `layout` starts at `content_top`, so its bottom includes that offset.
-        let content_height = layout.content_height(20.0) - content_top;
+        let content_height = left_layout
+            .content_height(20.0)
+            .max(right_layout.content_height(20.0))
+            - content_top;
         let max_scroll = f32::max(content_height - viewport_height, 0.0);
         *scroll_y = (*scroll_y).clamp(0.0, max_scroll);
 
@@ -1665,7 +1701,7 @@ pub fn draw_settings_overlay(
         }
 
         // Close button (fixed coordinates, outside scroll area)
-        let btn_rect = Rectangle::new(300.0, 310.0, 80.0, 30.0);
+        let btn_rect = Rectangle::new(panel_width - 100.0, panel_height - 40.0, 80.0, 30.0);
         if draw_button(
             &mut d2d,
             btn_rect,
@@ -1692,24 +1728,14 @@ pub fn draw_settings_overlay(
             let ready = remaining == 0.0 || numeric_shift;
 
             // Dim the whole panel, then put the window above the dim layer.
-            d2d.draw_rectangle_rec(
-                panel_rect,
-                Color::new(0, 0, 0, (190.0 * eased_t) as u8),
-            );
+            d2d.draw_rectangle_rec(panel_rect, Color::new(0, 0, 0, (190.0 * eased_t) as u8));
 
             let window = Rectangle::new(30.0, 55.0, 340.0, 235.0);
-            d2d.draw_rectangle_rec(
-                window,
-                Color::new(60, 6, 6, (255.0 * eased_t) as u8),
-            );
+            d2d.draw_rectangle_rec(window, Color::new(60, 6, 6, (255.0 * eased_t) as u8));
             // Flashy: the border pulses red the whole time.
             let pulse = (0.55 + 0.45 * (frame_time * 5.0).sin().abs()) as f32;
             let border_alpha = (pulse * eased_t * 255.0) as u8;
-            d2d.draw_rectangle_lines_ex(
-                window,
-                3.0,
-                Color::new(255, 45, 45, border_alpha),
-            );
+            d2d.draw_rectangle_lines_ex(window, 3.0, Color::new(255, 45, 45, border_alpha));
 
             // Centered text via the default font, as the tooltip helper does.
             let measured = |text: &str, size: i32| -> i32 {
@@ -1765,16 +1791,10 @@ pub fn draw_settings_overlay(
             );
 
             let enable_rect = Rectangle::new(window.x + 20.0, 240.0, 148.0, 32.0);
-            let cancel_rect = Rectangle::new(
-                window.x + window.width - 168.0,
-                240.0,
-                148.0,
-                32.0,
-            );
+            let cancel_rect = Rectangle::new(window.x + window.width - 168.0, 240.0, 148.0, 32.0);
             if ready {
                 // Unlocked: hot red, pulsing like the border.
-                let is_hovered =
-                    enable_rect.check_collision_point_rec(mouse_world_pos);
+                let is_hovered = enable_rect.check_collision_point_rec(mouse_world_pos);
                 let bg = if is_hovered { 235 } else { 170 };
                 d2d.draw_rectangle_rec(
                     enable_rect,
