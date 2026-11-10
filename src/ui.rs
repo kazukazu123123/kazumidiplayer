@@ -1730,7 +1730,14 @@ pub fn draw_settings_overlay(
             // Dim the whole panel, then put the window above the dim layer.
             d2d.draw_rectangle_rec(panel_rect, Color::new(0, 0, 0, (190.0 * eased_t) as u8));
 
-            let window = Rectangle::new(30.0, 55.0, 340.0, 235.0);
+            let window_width = (panel_width - 60.0).clamp(340.0, 560.0);
+            let window_height = 235.0;
+            let window = Rectangle::new(
+                (panel_width - window_width) / 2.0,
+                (panel_height - window_height) / 2.0,
+                window_width,
+                window_height,
+            );
             d2d.draw_rectangle_rec(window, Color::new(60, 6, 6, (255.0 * eased_t) as u8));
             // Flashy: the border pulses red the whole time.
             let pulse = (0.55 + 0.45 * (frame_time * 5.0).sin().abs()) as f32;
@@ -1751,14 +1758,14 @@ pub fn draw_settings_overlay(
             d2d.draw_text(
                 title,
                 centered_x(title, 28),
-                72,
+                (window.y + 17.0) as i32,
                 28,
                 Color::new(255, 60, 50, (255.0 * eased_t) as u8),
             );
 
             const BODY: &str = "Enabling S16 Clipping skips the output limiter. Samples past full scale wrap around to the opposite end, like 16-bit overflow, so dense parts turn into harsh fuzz. It can get seriously loud: turn the volume down first.";
-            let mut line_y = 104.0;
-            for line in wrap_text(BODY, 14, 300) {
+            let mut line_y = window.y + 49.0;
+            for line in wrap_text(BODY, 14, (window.width - 40.0) as i32) {
                 d2d.draw_text(
                     line.as_str(),
                     (window.x + 20.0) as i32,
@@ -1790,8 +1797,10 @@ pub fn draw_settings_overlay(
                 Color::new(170, 140, 140, (255.0 * eased_t) as u8),
             );
 
-            let enable_rect = Rectangle::new(window.x + 20.0, 240.0, 148.0, 32.0);
-            let cancel_rect = Rectangle::new(window.x + window.width - 168.0, 240.0, 148.0, 32.0);
+            let buttons_y = window.y + window.height - 47.0;
+            let enable_rect = Rectangle::new(window.x + 20.0, buttons_y, 148.0, 32.0);
+            let cancel_rect =
+                Rectangle::new(window.x + window.width - 168.0, buttons_y, 148.0, 32.0);
             if ready {
                 // Unlocked: hot red, pulsing like the border.
                 let is_hovered = enable_rect.check_collision_point_rec(mouse_world_pos);
