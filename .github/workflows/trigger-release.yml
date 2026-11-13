@@ -1,0 +1,41 @@
+name: Trigger release build
+
+# On every push to main (except automated submodule bumps) and on
+# manual dispatch, asks kazumidiplayer-releases to build and publish a
+# release: an empty commit carrying this commit's SHA and message is
+# pushed to that repository's build-trigger branch.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trigger-release
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    if: ${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore: bump') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out kazumidiplayer-releases (build-trigger)
+        uses: actions/checkout@v4
+        with:
+          repository: kazukazu123123/kazumidiplayer-releases
+          ref: build-trigger
+          ssh-key: ${{ secrets.RELEASE_TRIGGER_KEY }}
+      - name: Push trigger commit
+        env:
+          PLAYER_SHA: ${{ github.sha }}
+          PLAYER_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -z "$PLAYER_MESSAGE" ]; then PLAYER_MESSAGE="(manual trigger)"; fi
+          { printf 'build %s\n\n' "$PLAYER_SHA"; printf '%s\n' "$PLAYER_MESSAGE"; } > trigger-message.txt
+          git commit --allow-empty -F trigger-message.txt
+          git push origin HEAD:build-trigger
