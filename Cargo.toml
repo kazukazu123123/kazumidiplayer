@@ -22,7 +22,7 @@ raylib = { version = "6.0.0", default-features = false, features = [
     "SUPPORT_TRACELOG",
 ] }
 
-kazumidiparser = { version = "0.1.0", path = "../SelfMadeLibraries/kazumidiparser" }
+kazumidiparser = { version = "0.1.0", path = "../kazumidiparser" }
 rustc-hash = "2"
 rfd = "0.17.2"
 cpal = "0.18.2"
