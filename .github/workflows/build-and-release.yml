@@ -103,7 +103,7 @@ jobs:
           lipo -create -output kazumidiplayer-macos-universal target/x86_64-apple-darwin/release/kazumidiplayer target/aarch64-apple-darwin/release/kazumidiplayer
       - name: Stage artifact
         shell: bash
-        run: cp "${{ matrix.built }}" "${{ matrix.asset }}"
+        run: if [ "${{ matrix.built }}" != "${{ matrix.asset }}" ]; then cp "${{ matrix.built }}" "${{ matrix.asset }}"; fi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
