@@ -73,29 +73,125 @@ fn decode(msg: u32) -> Option<SynthEvent> {
     }
 }
 
-fn apply(piano: &mut PianoProcessor, time: f64, event: SynthEvent) {
-    match event {
-        SynthEvent::Press {
-            channel,
-            note,
-            velocity,
-        } => {
-            let gain = csynth::velocity_gain(velocity as f32 / 127.0);
-            piano.press_on_channel(time, note, gain, 0, channel);
+/// CSynth's MPP piano shares a key across channels. Keep every outstanding
+/// press until its matching note-off, including releases held by the pedal.
+struct MidiState {
+    pressed: [[u32; 128]; 16],
+    sustained: [[u32; 128]; 16],
+    key_down: [u32; 128],
+    sustain: [bool; 16],
+}
+
+impl Default for MidiState {
+    fn default() -> Self {
+        Self {
+            pressed: [[0; 128]; 16],
+            sustained: [[0; 128]; 16],
+            key_down: [0; 128],
+            sustain: [false; 16],
         }
-        SynthEvent::Release { channel, note } => piano.release_on_channel(time, note, 0, channel),
-        SynthEvent::Control {
-            channel,
-            controller,
-            value,
-        } => piano.control(time, channel, controller, value),
-        SynthEvent::Bend { channel, value } => piano.bend(time, channel, value),
-        SynthEvent::Program { channel, program } => piano.program(time, channel, program),
-        SynthEvent::Reset => {
-            for channel in 0..16 {
-                piano.control(time, channel, 120, 0);
+    }
+}
+
+impl MidiState {
+    fn key_up(&mut self, piano: &mut PianoProcessor, time: f64, channel: u8, note: u8, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let ch = channel as usize;
+        let key = note as usize;
+        self.key_down[key] -= count;
+        let released = if piano.plays_fonts() {
+            self.pressed[ch][key] == 0 && self.sustained[ch][key] == 0
+        } else {
+            self.key_down[key] == 0
+        };
+        if released {
+            piano.release_on_channel(time, note, 0, channel);
+        }
+    }
+
+    fn lift_pedal(&mut self, piano: &mut PianoProcessor, time: f64, channel: u8) {
+        let ch = channel as usize;
+        self.sustain[ch] = false;
+        for note in 0..128u8 {
+            let count = std::mem::take(&mut self.sustained[ch][note as usize]);
+            self.key_up(piano, time, channel, note, count);
+        }
+    }
+
+    fn apply(&mut self, piano: &mut PianoProcessor, time: f64, event: SynthEvent) {
+        match event {
+            SynthEvent::Press {
+                channel,
+                note,
+                velocity,
+            } => {
+                self.pressed[channel as usize][note as usize] += 1;
+                self.key_down[note as usize] += 1;
+                let gain = csynth::velocity_gain(velocity as f32 / 127.0);
+                piano.press_on_channel(time, note, gain, 0, channel);
             }
-            piano.reset_channels();
+            SynthEvent::Release { channel, note } => {
+                let ch = channel as usize;
+                let key = note as usize;
+                if self.pressed[ch][key] == 0 {
+                    return;
+                }
+                self.pressed[ch][key] -= 1;
+                if self.sustain[ch] {
+                    self.sustained[ch][key] += 1;
+                } else {
+                    self.key_up(piano, time, channel, note, 1);
+                }
+            }
+            SynthEvent::Control {
+                channel,
+                controller,
+                value,
+            } => {
+                let ch = channel as usize;
+                match controller {
+                    64 => {
+                        if value >= 64 {
+                            self.sustain[ch] = true;
+                        } else {
+                            self.lift_pedal(piano, time, channel);
+                        }
+                    }
+                    120 | 123 => {
+                        for note in 0..128u8 {
+                            let key = note as usize;
+                            let mut count = std::mem::take(&mut self.pressed[ch][key]);
+                            if controller == 123 && self.sustain[ch] {
+                                self.sustained[ch][key] += count;
+                            } else {
+                                if controller == 120 {
+                                    count += std::mem::take(&mut self.sustained[ch][key]);
+                                }
+                                self.key_up(piano, time, channel, note, count);
+                            }
+                        }
+                        if controller == 120 {
+                            piano.control(time, channel, controller, value);
+                        }
+                    }
+                    121 => {
+                        self.lift_pedal(piano, time, channel);
+                        piano.control(time, channel, controller, value);
+                    }
+                    _ => piano.control(time, channel, controller, value),
+                }
+            }
+            SynthEvent::Bend { channel, value } => piano.bend(time, channel, value),
+            SynthEvent::Program { channel, program } => piano.program(time, channel, program),
+            SynthEvent::Reset => {
+                *self = Self::default();
+                for channel in 0..16 {
+                    piano.control(time, channel, 120, 0);
+                }
+                piano.reset_channels();
+            }
         }
     }
 }
@@ -103,6 +199,7 @@ fn apply(piano: &mut PianoProcessor, time: f64, event: SynthEvent) {
 /// Lives in the audio callback: drains the queue at each quantum and renders.
 struct Renderer {
     piano: PianoProcessor,
+    midi: MidiState,
     limiter: Limiter,
     rx: Receiver<u32>,
     left: [f32; QUANTUM],
@@ -116,7 +213,7 @@ impl Renderer {
         let now = self.piano.frame as f64;
         for msg in self.rx.try_iter() {
             if let Some(event) = decode(msg) {
-                apply(&mut self.piano, now, event);
+                self.midi.apply(&mut self.piano, now, event);
             }
         }
         self.piano.process(&mut self.left, &mut self.right);
@@ -230,6 +327,7 @@ fn open(shutdown: Sender<()>) -> Result<(cpal::Stream, CSynthStream), String> {
     let (tx, rx) = mpsc::channel();
     let renderer = Renderer {
         piano: PianoProcessor::new(samples, rate),
+        midi: MidiState::default(),
         limiter: csynth::output_limiter(rate),
         rx,
         left: [0.0; QUANTUM],
@@ -259,6 +357,7 @@ fn open(shutdown: Sender<()>) -> Result<(cpal::Stream, CSynthStream), String> {
 /// CSynth without a device, for prerendered playback.
 pub struct CSynthPrerender {
     piano: PianoProcessor,
+    midi: MidiState,
     limiter: Limiter,
     limiter_bypassed: bool,
     rate: u32,
@@ -282,6 +381,7 @@ impl CSynthPrerender {
         let samples = csynth::decode_bundle(&bundle, rate, &|_, _| {})?;
         Ok(Self {
             piano: PianoProcessor::new(samples, rate),
+            midi: MidiState::default(),
             limiter: csynth::output_limiter(rate),
             limiter_bypassed: false,
             rate,
@@ -302,7 +402,7 @@ impl CSynthPrerender {
     pub fn send(&mut self, msg: u32) {
         if let Some(event) = decode(msg) {
             let now = self.piano.frame as f64;
-            apply(&mut self.piano, now, event);
+            self.midi.apply(&mut self.piano, now, event);
         }
     }
 
@@ -310,7 +410,7 @@ impl CSynthPrerender {
     pub fn send_at(&mut self, frame: u32, msg: u32) {
         if let Some(event) = decode(msg) {
             let time = (self.piano.frame + frame as u64) as f64;
-            apply(&mut self.piano, time, event);
+            self.midi.apply(&mut self.piano, time, event);
         }
     }
 
@@ -349,6 +449,173 @@ impl CSynthPrerender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_engine() -> CSynthPrerender {
+        let sample = std::sync::Arc::new(csynth::Sample::new(vec![vec![0.25; 96_000]; 2]));
+        CSynthPrerender {
+            piano: PianoProcessor::new(vec![Some(sample); 128], 48_000),
+            midi: MidiState::default(),
+            limiter: csynth::output_limiter(48_000),
+            limiter_bypassed: false,
+            rate: 48_000,
+            interleaved: Vec::with_capacity(QUANTUM * 2),
+        }
+    }
+
+    fn render_quanta(engine: &mut CSynthPrerender, count: usize) -> f32 {
+        let mut left = [0.0; QUANTUM];
+        let mut right = [0.0; QUANTUM];
+        for _ in 0..count {
+            engine.render(&mut left, &mut right);
+        }
+        left.iter()
+            .chain(&right)
+            .map(|v| v.abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn on(channel: u32) -> u32 {
+        0x90 | channel | 60 << 8 | 100 << 16
+    }
+
+    fn off(channel: u32) -> u32 {
+        0x80 | channel | 60 << 8
+    }
+
+    fn cc(channel: u32, controller: u32, value: u32) -> u32 {
+        0xB0 | channel | controller << 8 | value << 16
+    }
+
+    #[test]
+    fn overlapping_notes_end_only_after_the_last_note_off() {
+        // The same-channel case is common in yurikago_hzchop.mid. MPP keys
+        // also stay down across channels, as in midi-blocks-rs.
+        for other_channel in [0, 1] {
+            let mut engine = test_engine();
+            engine.send(on(0));
+            render_quanta(&mut engine, 4);
+            engine.send(on(other_channel));
+            render_quanta(&mut engine, 4);
+            engine.send(off(0));
+            assert!(render_quanta(&mut engine, 120) > 0.01);
+            engine.send(off(other_channel));
+            assert_eq!(render_quanta(&mut engine, 120), 0.0);
+        }
+    }
+
+    #[test]
+    fn unmatched_note_off_does_not_end_another_channels_note() {
+        let mut engine = test_engine();
+        engine.send(on(1));
+        render_quanta(&mut engine, 4);
+        engine.send(off(0));
+        assert!(render_quanta(&mut engine, 120) > 0.01);
+    }
+
+    #[test]
+    fn pedal_holds_releases_including_repeated_presses() {
+        let mut engine = test_engine();
+        engine.send(cc(0, 64, 127));
+        engine.send(on(0));
+        render_quanta(&mut engine, 4);
+        engine.send(off(0));
+        assert!(render_quanta(&mut engine, 120) > 0.01);
+        engine.send(on(0));
+        render_quanta(&mut engine, 4);
+        engine.send(off(0));
+        assert!(render_quanta(&mut engine, 120) > 0.01);
+        engine.send(cc(0, 64, 0));
+        assert_eq!(render_quanta(&mut engine, 120), 0.0);
+    }
+
+    #[test]
+    fn lifting_one_channels_pedal_keeps_other_channels_key() {
+        let mut engine = test_engine();
+        engine.send(cc(0, 64, 127));
+        engine.send(on(0));
+        engine.send(on(1));
+        render_quanta(&mut engine, 4);
+        engine.send(off(0));
+        engine.send(cc(0, 64, 0));
+        assert!(render_quanta(&mut engine, 120) > 0.01);
+        engine.send(off(1));
+        assert_eq!(render_quanta(&mut engine, 120), 0.0);
+    }
+
+    #[test]
+    fn all_notes_off_respects_the_pedal_and_controller_reset_lifts_it() {
+        let mut engine = test_engine();
+        engine.send(cc(0, 64, 127));
+        engine.send(on(0));
+        render_quanta(&mut engine, 4);
+        engine.send(cc(0, 123, 0));
+        assert!(render_quanta(&mut engine, 120) > 0.01);
+        engine.send(cc(0, 121, 0));
+        assert_eq!(render_quanta(&mut engine, 120), 0.0);
+    }
+
+    #[test]
+    fn sound_off_and_reset_do_not_leave_stale_presses() {
+        for reset in [cc(0, 120, 0), 0xFF] {
+            let mut engine = test_engine();
+            engine.send(cc(0, 64, 127));
+            engine.send(on(0));
+            engine.send(on(0));
+            engine.send(off(0));
+            render_quanta(&mut engine, 4);
+            engine.send(reset);
+            assert_eq!(render_quanta(&mut engine, 120), 0.0);
+            engine.send(cc(0, 64, 0));
+            engine.send(on(0));
+            render_quanta(&mut engine, 4);
+            engine.send(off(0));
+            assert_eq!(render_quanta(&mut engine, 120), 0.0);
+        }
+    }
+
+    #[test]
+    fn scheduled_pedal_release_keeps_its_render_frame() {
+        let mut engine = test_engine();
+        engine.send(cc(0, 64, 127));
+        engine.send(on(0));
+        render_quanta(&mut engine, 4);
+        engine.send(off(0));
+        // Schedule into the second quantum of a prerender chunk.
+        engine.send_at(QUANTUM as u32, cc(0, 64, 0));
+        render_quanta(&mut engine, 1);
+        assert_eq!(engine.piano.stats.releasing, 0);
+        render_quanta(&mut engine, 1);
+        assert_eq!(engine.piano.stats.releasing, 1);
+    }
+
+    #[test]
+    fn realtime_callback_holds_notes_until_pedal_up() {
+        let engine = test_engine();
+        let (tx, rx) = mpsc::channel();
+        let mut renderer = Renderer {
+            piano: engine.piano,
+            midi: MidiState::default(),
+            limiter: engine.limiter,
+            rx,
+            left: [0.0; QUANTUM],
+            right: [0.0; QUANTUM],
+            interleaved: Vec::with_capacity(QUANTUM * 2),
+            pos: QUANTUM,
+        };
+        let mut out = [0.0; QUANTUM * 2];
+        for msg in [cc(0, 64, 127), on(0), on(0), off(0), off(0)] {
+            tx.send(msg).unwrap();
+        }
+        for _ in 0..120 {
+            renderer.fill(&mut out, 2);
+        }
+        assert!(out.iter().any(|v: &f32| v.abs() > 0.01));
+        tx.send(cc(0, 64, 0)).unwrap();
+        for _ in 0..120 {
+            renderer.fill(&mut out, 2);
+        }
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
 
     #[test]
     fn decodes_note_on_and_zero_velocity_release() {

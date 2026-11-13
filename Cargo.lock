@@ -143,6 +143,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "claxon"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -242,8 +248,9 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "csynth"
 version = "0.1.0"
-source = "git+https://git.c30.life/ced/csynth-v2#007f77eb82d696065fb1168021b372239999f938"
+source = "git+https://git.c30.life/ced/csynth-v2#c1d9c3653d95ea43a85e7dec945f18174237182d"
 dependencies = [
+ "claxon",
  "lewton",
  "libc",
  "log",
