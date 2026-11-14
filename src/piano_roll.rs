@@ -616,7 +616,60 @@ fn run_scan(
     // note-off that closes it consumes it, rather than closing the next note on the
     // voice and cutting that one short.
     const DROPPED: u64 = u64::MAX;
-    let mut open: FxHashMap<(u16, u8, u8), VecDeque<u64>> = FxHashMap::default();
+    // Open notes of one voice, oldest first. Most voices hold a single ringing
+    // note at a time, so the first index lives inline in the map value and the
+    // heap-allocated queue only appears once notes actually stack. A
+    // VecDeque per voice paid an allocation and a free for nearly every note
+    // in a dense file, which dwarfed the cost of the merge itself.
+    #[derive(Default)]
+    enum VoiceQueue {
+        #[default]
+        Empty,
+        Single(u64),
+        Queue(VecDeque<u64>),
+    }
+    impl VoiceQueue {
+        fn push_back(&mut self, idx: u64) {
+            match self {
+                VoiceQueue::Empty => *self = VoiceQueue::Single(idx),
+                VoiceQueue::Single(first) => {
+                    let mut q = VecDeque::with_capacity(4);
+                    q.push_back(*first);
+                    q.push_back(idx);
+                    *self = VoiceQueue::Queue(q);
+                }
+                VoiceQueue::Queue(q) => q.push_back(idx),
+            }
+        }
+        fn pop_front(&mut self) -> Option<u64> {
+            match self {
+                VoiceQueue::Empty => None,
+                VoiceQueue::Single(first) => {
+                    let idx = *first;
+                    *self = VoiceQueue::Empty;
+                    Some(idx)
+                }
+                VoiceQueue::Queue(q) => {
+                    let idx = q.pop_front();
+                    if q.is_empty() {
+                        *self = VoiceQueue::Empty;
+                    }
+                    idx
+                }
+            }
+        }
+        fn is_empty(&self) -> bool {
+            matches!(self, VoiceQueue::Empty)
+        }
+        fn iter(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+            match self {
+                VoiceQueue::Empty => Box::new(std::iter::empty()),
+                VoiceQueue::Single(first) => Box::new(std::iter::once(first)),
+                VoiceQueue::Queue(q) => Box::new(q.iter()),
+            }
+        }
+    }
+    let mut open: FxHashMap<(u16, u8, u8), VoiceQueue> = FxHashMap::default();
     // Running count of notes ever appended to each key (published + queued in the
     // current batch), i.e. the absolute index the next appended note will take.
     // Absolute, not a queue position: retiring pops notes off the front, so queue
@@ -855,7 +908,9 @@ fn run_scan(
         true
     };
 
-    while let Some(Reverse((tick, ti))) = heap.pop() {
+    while let Some(mut top) = heap.peek_mut() {
+        let (tick, ti) = (*top).0;
+        let mut remove_top = false;
         if tick > end_tick {
             break;
         }
@@ -1028,7 +1083,10 @@ fn run_scan(
             }
         }
 
-        // Advance this track to its next non-tempo event and re-queue it.
+        // Advance this track to its next non-tempo event and re-queue it. The
+        // entry never leaves the heap: its key is replaced in place and the
+        // peek guard's drop sifts it down once, instead of a pop (one sift
+        // pass) plus a push (another) for every event.
         {
             let cur = &mut cursors[ti];
             let mut advanced = false;
@@ -1043,7 +1101,9 @@ fn run_scan(
                 }
             }
             if advanced && cur.abs_tick <= end_tick {
-                heap.push(Reverse((cur.abs_tick, ti)));
+                *top = Reverse((cur.abs_tick, ti));
+            } else {
+                remove_top = true;
             }
         }
 
@@ -1076,6 +1136,10 @@ fn run_scan(
             if latest.load(Ordering::SeqCst) != generation || shutdown.load(Ordering::Relaxed) {
                 return;
             }
+        }
+
+        if remove_top {
+            std::collections::binary_heap::PeekMut::pop(top);
         }
     }
 
