@@ -1317,6 +1317,12 @@ fn rasterize_column(
     // Outline each note's visible extent, top and bottom. Per run of one owner rather
     // than per note: a note that is partly covered only shows where it won, and that
     // is the edge worth drawing.
+    //
+    // A run clipped by the column's own edge is not an edge of the note: a note
+    // longer than the view fills the whole column, and capping its run would draw
+    // a fake end at the top of the screen and a fake start at the playhead. Cap a
+    // clipped run only where the note's own end (top) or start (bottom) falls
+    // inside the view.
     let mut r = 0usize;
     while r < col.len() {
         if owner[r] == u32::MAX {
@@ -1328,9 +1334,14 @@ fn rasterize_column(
         while r < col.len() && owner[r] == who {
             r += 1;
         }
+        let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, who as usize);
         let edge = darken(col[run_start]);
-        col[run_start] = edge;
-        col[r - 1] = edge;
+        if run_start > 0 || n.end_tick <= effective_top {
+            col[run_start] = edge;
+        }
+        if r < col.len() || n.start_tick >= current_tick {
+            col[r - 1] = edge;
+        }
     }
 }
 
