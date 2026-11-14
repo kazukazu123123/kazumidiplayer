@@ -56,6 +56,7 @@ struct DrawScratch {
     row_tick: Vec<u32>,
     cols: Vec<u32>,
     owners: Vec<u32>,
+    block_max: Vec<u32>,
 }
 
 thread_local! {
@@ -1164,34 +1165,72 @@ fn note_at(
     }
 }
 
-/// How far back a row's lookup will walk before giving up on finding a note that
-/// covers it. The walk only continues while the notes it passes end *below* the row,
-/// which in a dense stretch means it stops on the first one; the cap is there for a
-/// key holding a rest, where nothing covers the row and the walk would otherwise
-/// scan the whole bucket for every row of the gap.
+/// How many still-sounding notes `retire` keeps pinned at each end of a key's
+/// queue (see `MAX_PINNED`). The rasterizer's winner search used to be capped at
+/// this many notes from each edge of a row's prefix as well, but a long note
+/// buried deeper than that in the middle was never found -- and then popped into
+/// view mid-note once the notes ahead of it retired and it drifted into range.
+/// The search is exact now (see `winner_in_prefix`); this constant only bounds
+/// the pinning.
 const MAX_LOOKBACK: usize = 64;
 
-/// Color of the topmost note sounding at `tick`, using the same bounded lookup as
-/// the roll rasterizer. A sustained note can keep millions of already-ended notes
-/// behind it in the queue, so an unbounded scan here would stall the render loop.
-fn sounding_color_at_bucket(b: &KeyBucket, tick: u32) -> Option<u16> {
-    let prefix = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, tick);
-    for k in 0..MAX_LOOKBACK.min(prefix) {
-        let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, prefix - 1 - k);
-        if n.end_tick > tick {
-            return Some(n.color);
-        }
-    }
+/// Block size of the per-column winner index (`build_block_max`). A row's winner
+/// search skips whole blocks whose notes all end below the row, so it stays cheap
+/// in a dense rest without giving up on notes buried in the middle of the prefix.
+const WINNER_BLOCK: usize = 64;
 
-    if prefix > MAX_LOOKBACK {
-        for i in (0..MAX_LOOKBACK).rev() {
-            let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, i);
-            if n.end_tick > tick {
-                return Some(n.color);
+/// Fill `out` with the maximum `end_tick` of each `WINNER_BLOCK`-sized block of
+/// the bucket's merged note sequence (pinned first, then the queue), over the
+/// first `limit` notes. Rebuilt per column per frame into scratch storage.
+fn build_block_max(b: &KeyBucket, limit: usize, out: &mut Vec<u32>) {
+    out.clear();
+    let mut i = 0;
+    while i < limit {
+        let hi = (i + WINNER_BLOCK).min(limit);
+        let mut m = 0u32;
+        for j in i..hi {
+            m = m.max(note_at(&b.pinned_old, &b.pinned_new, &b.notes, j).end_tick);
+        }
+        out.push(m);
+        i = hi;
+    }
+}
+
+/// The last note before `prefix` whose end reaches `min_end` -- the note a row
+/// shows. Exact, unlike the bounded walks it replaces: blocks whose maximum end
+/// falls short are skipped whole, and the first block from the top that can hold
+/// a winner is scanned from its end, so the note found is the same one an
+/// unbounded backward scan would find.
+fn winner_in_prefix(b: &KeyBucket, block_max: &[u32], prefix: usize, min_end: u32) -> Option<usize> {
+    if prefix == 0 {
+        return None;
+    }
+    let mut block = (prefix - 1) / WINNER_BLOCK;
+    loop {
+        if block_max[block] >= min_end {
+            let hi = prefix.min((block + 1) * WINNER_BLOCK);
+            let lo = block * WINNER_BLOCK;
+            for i in (lo..hi).rev() {
+                if note_at(&b.pinned_old, &b.pinned_new, &b.notes, i).end_tick >= min_end {
+                    return Some(i);
+                }
             }
         }
+        if block == 0 {
+            return None;
+        }
+        block -= 1;
     }
-    None
+}
+
+/// Color of the topmost note sounding at `tick`, using the same exact winner
+/// search as the roll rasterizer (see `winner_in_prefix`).
+fn sounding_color_at_bucket(b: &KeyBucket, tick: u32) -> Option<u16> {
+    let prefix = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, tick);
+    let mut block_max = Vec::new();
+    build_block_max(b, prefix, &mut block_max);
+    let i = winner_in_prefix(b, &block_max, prefix, tick.saturating_add(1))?;
+    Some(note_at(&b.pinned_old, &b.pinned_new, &b.notes, i).color)
 }
 
 impl KeyBucket {
@@ -1229,6 +1268,7 @@ fn rasterize_column(
     row_tick: &[u32],
     current_tick: u32,
     effective_top: u32,
+    block_max: &mut Vec<u32>,
 ) {
     // Clear the column before the empty-bucket fast path so a key that was active
     // in the previous frame cannot leave stale pixels behind. Doing this here also
@@ -1244,6 +1284,11 @@ fn rasterize_column(
         return;
     }
 
+    // The winner index for this column: every row's prefix ends at or below this
+    // limit, so one build serves the whole column.
+    let limit = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, effective_top);
+    build_block_max(&b, limit, block_max);
+
     for r in 0..col.len() {
         // The ticks this pixel row covers. Clamped to the window: above the frontier
         // nothing has been generated, below the playhead nothing is drawn.
@@ -1258,36 +1303,14 @@ fn rasterize_column(
             continue;
         }
 
-        // Walk back from the newest note that could reach this row. Each one passed
-        // over is a note that ended before the row starts, i.e. one that is genuinely
-        // not here -- not one being covered up.
-        for k in 0..MAX_LOOKBACK.min(prefix) {
-            let index = prefix - 1 - k;
+        // The last note of the prefix that still reaches this row wins; it paints
+        // over every earlier note. The search is exact (see `winner_in_prefix`):
+        // a long note buried in the middle of a dense prefix is found, instead of
+        // vanishing until the notes ahead of it retire.
+        if let Some(index) = winner_in_prefix(&b, block_max, prefix, t_lo) {
             let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, index);
-            if n.end_tick >= t_lo {
-                col[r] = pack(get_note_color_by_index(n.color));
-                owner[r] = index as u32;
-                break;
-            }
-        }
-
-        // A very long note can sit at the front of the queue and keep all the
-        // shorter notes after it from being retired. Once more than MAX_LOOKBACK
-        // of those later notes have ended, the bounded reverse search above no
-        // longer reaches the long note and it appears to vanish. Check the oldest
-        // edge as a bounded fallback; held notes reconstructed by a seek also live
-        // here, so this covers both normal playback and roll regeneration without
-        // turning a dense rest into an unbounded scan on every pixel.
-        if owner[r] == u32::MAX && prefix > MAX_LOOKBACK {
-            let oldest_end = prefix.min(MAX_LOOKBACK);
-            for index in (0..oldest_end).rev() {
-                let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, index);
-                if n.end_tick >= t_lo {
-                    col[r] = pack(get_note_color_by_index(n.color));
-                    owner[r] = index as u32;
-                    break;
-                }
-            }
+            col[r] = pack(get_note_color_by_index(n.color));
+            owner[r] = index as u32;
         }
     }
 
@@ -1352,6 +1375,7 @@ pub fn draw_piano_roll_chunk(
             row_tick,
             cols,
             owners,
+            block_max,
         } = &mut *scratch;
         row_tick.fill(0);
         let top_tick = if is_tick_based {
@@ -1408,6 +1432,7 @@ pub fn draw_piano_roll_chunk(
                 &row_tick,
                 current_tick,
                 effective_top,
+                block_max,
             );
         }
 
