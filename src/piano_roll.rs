@@ -66,7 +66,7 @@ struct DrawScratch {
     row_tick: Vec<u32>,
     cols: Vec<u32>,
     owners: Vec<u32>,
-    block_max: Vec<u32>,
+    winner_notes: Vec<RollNote>,
 }
 
 thread_local! {
@@ -143,6 +143,33 @@ pub struct KeyBucket {
     /// between is never reached by either bounded scan.
     pinned_old: VecDeque<PinnedNote>,
     pinned_new: VecDeque<PinnedNote>,
+    /// Total notes ever appended to this bucket in this generation. Together
+    /// with `retired` this is the scan's absolute index space: a note's queue
+    /// position is its absolute index minus `retired`.
+    appended_total: u64,
+    /// The draw's winner index, over absolute append indices: entry `j` is
+    /// the maximum `end_tick` over absolute indices `[j * WINNER_BLOCK,
+    /// (j + 1) * WINNER_BLOCK)`. Anchored to absolute indices so `retire`,
+    /// which only ever removes from the front, never shifts it. The draw
+    /// used to rebuild this over merged positions for every column of every
+    /// frame -- O(notes in view) per frame, which is what made low zoom
+    /// crawl on dense files, the resident window there being the whole song.
+    ///
+    /// Entries for notes that have since been dropped (retired dead, or
+    /// rolled off the pinned sets) go stale, but a stale entry can only
+    /// *overstate* a block's maximum: the winner search validates the real
+    /// notes it finds, so staleness costs an occasional wasted block scan,
+    /// never a wrong winner. A patch (which only ever lowers an end, from
+    /// OPEN_END to the real one) marks its block dirty instead, and the
+    /// draw recomputes dirty blocks on demand.
+    abs_block_max: Vec<u32>,
+    abs_block_dirty: Vec<bool>,
+    /// Start tick of the first note of each absolute block. Starts never
+    /// change and appends are in start order, so this stays exact for the
+    /// whole generation, dropped notes included -- which is what lets the
+    /// draw find a row's boundary block by searching this small array
+    /// instead of binary-searching the bucket for every pixel row.
+    abs_block_start: Vec<u32>,
 }
 
 /// A sliding window of piano-roll draw data, filled in by the worker as playback
@@ -205,6 +232,10 @@ impl RollChunk {
             let mut b = slot.lock().unwrap();
             b.generation = generation;
             b.retired = 0;
+            b.appended_total = 0;
+            b.abs_block_max.clear();
+            b.abs_block_dirty.clear();
+            b.abs_block_start.clear();
             let old = std::mem::take(&mut b.notes);
             let old_pinned_old = std::mem::take(&mut b.pinned_old);
             let old_pinned_new = std::mem::take(&mut b.pinned_new);
@@ -875,17 +906,41 @@ fn run_scan(
             if b.generation != generation {
                 return false;
             }
-            b.notes.extend(run.drain(..));
+            for note in run.drain(..) {
+                // Maintain the draw's absolute winner index as notes land:
+                // an append can only raise its block's maximum, so this is
+                // exact unless the block was already dirty from a patch.
+                let idx = b.appended_total;
+                b.appended_total += 1;
+                let blk = (idx / WINNER_BLOCK as u64) as usize;
+                if blk >= b.abs_block_max.len() {
+                    b.abs_block_max.push(0);
+                    b.abs_block_dirty.push(false);
+                    b.abs_block_start.push(note.start_tick);
+                }
+                if note.end_tick > b.abs_block_max[blk] {
+                    b.abs_block_max[blk] = note.end_tick;
+                }
+                b.notes.push_back(note);
+            }
             for (idx, end) in key_patches.drain(..) {
                 // A still-sounding note may have been moved out of the queue by
                 // `retire` while its note-off was in flight. Pinned notes keep their
                 // absolute index (ascending) so the patch still finds them.
                 if let Ok(pos) = b.pinned_old.binary_search_by_key(&idx, |p| p.idx) {
                     b.pinned_old[pos].note.end_tick = end;
+                    let blk = (idx / WINNER_BLOCK as u64) as usize;
+                    if blk < b.abs_block_dirty.len() {
+                        b.abs_block_dirty[blk] = true;
+                    }
                     continue;
                 }
                 if let Ok(pos) = b.pinned_new.binary_search_by_key(&idx, |p| p.idx) {
                     b.pinned_new[pos].note.end_tick = end;
+                    let blk = (idx / WINNER_BLOCK as u64) as usize;
+                    if blk < b.abs_block_dirty.len() {
+                        b.abs_block_dirty[blk] = true;
+                    }
                     continue;
                 }
                 // Absolute index -> current queue position. A note whose index is
@@ -896,6 +951,10 @@ fn run_scan(
                 };
                 if let Some(slot) = b.notes.get_mut(pos as usize) {
                     slot.end_tick = end;
+                    let blk = (idx / WINNER_BLOCK as u64) as usize;
+                    if blk < b.abs_block_dirty.len() {
+                        b.abs_block_dirty[blk] = true;
+                    }
                 }
             }
         }
@@ -1314,6 +1373,94 @@ impl KeyBucket {
     }
 }
 
+/// The note with absolute append index `idx`, wherever it currently lives:
+/// the pinned sets (which keep their absolute index, ascending, so they
+/// binary-search) or the queue (index minus the retired count). `None` if
+/// the note has been dropped or not appended yet.
+fn note_by_abs(b: &KeyBucket, idx: u64) -> Option<RollNote> {
+    if idx < b.retired {
+        if let Ok(pos) = b.pinned_old.binary_search_by_key(&idx, |p| p.idx) {
+            return Some(b.pinned_old[pos].note);
+        }
+        if let Ok(pos) = b.pinned_new.binary_search_by_key(&idx, |p| p.idx) {
+            return Some(b.pinned_new[pos].note);
+        }
+        return None;
+    }
+    let pos = (idx - b.retired) as usize;
+    b.notes.get(pos).copied()
+}
+
+/// Recompute one block of the bucket's absolute winner index from the
+/// notes that actually live in it now.
+fn refresh_abs_block(b: &mut KeyBucket, blk: usize) {
+    let lo = blk as u64 * WINNER_BLOCK as u64;
+    let hi = (lo + WINNER_BLOCK as u64).min(b.appended_total);
+    let mut m = 0u32;
+    for idx in lo..hi {
+        if let Some(n) = note_by_abs(b, idx) {
+            m = m.max(n.end_tick);
+        }
+    }
+    b.abs_block_max[blk] = m;
+    b.abs_block_dirty[blk] = false;
+}
+
+/// The note a pixel row shows: the last note (in append order) that
+/// starts at or before `t_hi` and still ends at or after `t_lo`.
+///
+/// The search starts from the row's boundary block -- the last block
+/// whose first note starts at or before `t_hi`, found by searching the
+/// small `abs_block_start` array rather than the bucket. Notes in blocks
+/// below the boundary all start at or before `t_hi`, so only the
+/// boundary block's own scan checks starts; everywhere else the block
+/// maximum prunes whole blocks and the first note found reaching `t_lo`,
+/// scanning backwards, is the winner.
+fn winner_for_row(b: &KeyBucket, t_hi: u32, t_lo: u32) -> Option<(u64, RollNote)> {
+    let le = b.abs_block_start.partition_point(|&s| s <= t_hi);
+    if le == 0 {
+        return None;
+    }
+    let boundary = le - 1;
+    let queue_lo = b.retired;
+    let queue_hi = b.retired + b.notes.len() as u64;
+    let (head, tail) = b.notes.as_slices();
+    for block in (0..=boundary).rev() {
+        if b.abs_block_max[block] < t_lo {
+            continue;
+        }
+        let hi = ((block as u64 + 1) * WINNER_BLOCK as u64).min(b.appended_total);
+        let lo = block as u64 * WINNER_BLOCK as u64;
+        let check_start = block == boundary;
+        if lo >= queue_lo && hi <= queue_hi {
+            // The whole block sits in the queue: scan its storage
+            // directly instead of resolving every index through
+            // `note_by_abs`.
+            let qhi = (hi - queue_lo) as usize;
+            let qlo = (lo - queue_lo) as usize;
+            for pos in (qlo..qhi).rev() {
+                let n = if pos < head.len() {
+                    head[pos]
+                } else {
+                    tail[pos - head.len()]
+                };
+                if n.end_tick >= t_lo && (!check_start || n.start_tick <= t_hi) {
+                    return Some((queue_lo + pos as u64, n));
+                }
+            }
+        } else {
+            for idx in (lo..hi).rev() {
+                if let Some(n) = note_by_abs(b, idx) {
+                    if n.end_tick >= t_lo && (!check_start || n.start_tick <= t_hi) {
+                        return Some((idx, n));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Fill one key's column by asking each pixel which note it shows, rather than by
 /// painting every note and letting them cover each other up.
 ///
@@ -1332,9 +1479,16 @@ impl KeyBucket {
 /// count. Measured on the frame that used to touch 4.9M notes: 35k lookups, and every
 /// single one of them found its winner on the first note it checked.
 ///
-/// `owner` records which note won each row, so the emit pass can still tell two
-/// touching notes of the same colour apart and outline them separately -- reading the
-/// colour alone would merge them into one block.
+/// `owner` records which note won each row (an index into `winner_notes`,
+/// the column's distinct winners in the order they first appear), so the
+/// emit pass can still tell two touching notes of the same colour apart
+/// and outline them separately -- reading the colour alone would merge
+/// them into one block.
+///
+/// The winner search runs on the bucket's persistent absolute index
+/// (`abs_block_max`) instead of an index rebuilt per frame: at low zoom
+/// the resident window is the whole song, and rebuilding cost a full pass
+/// over every note in it, every column, every frame.
 fn rasterize_column(
     bucket: &Mutex<KeyBucket>,
     col: &mut [u32],
@@ -1342,7 +1496,7 @@ fn rasterize_column(
     row_tick: &[u32],
     current_tick: u32,
     effective_top: u32,
-    block_max: &mut Vec<u32>,
+    winner_notes: &mut Vec<RollNote>,
 ) {
     // Clear the column before the empty-bucket fast path so a key that was active
     // in the previous frame cannot leave stale pixels behind. Doing this here also
@@ -1353,38 +1507,61 @@ fn rasterize_column(
     for slot in owner.iter_mut() {
         *slot = u32::MAX;
     }
-    let b = bucket.lock().unwrap();
+    winner_notes.clear();
+    let mut b = bucket.lock().unwrap();
     if b.notes.is_empty() && b.pinned_old.is_empty() && b.pinned_new.is_empty() {
         return;
     }
 
-    // The winner index for this column: every row's prefix ends at or below this
-    // limit, so one build serves the whole column.
+    // The bucket's winner index lives in absolute append indices (see
+    // `KeyBucket::abs_block_max`), so the merged prefix the rows count to
+    // is converted by adding back the notes that have been dropped: every
+    // one of them started before the playhead, hence before any row's top
+    // tick, so each sits inside every prefix this column computes.
+    let dropped = b.appended_total
+        - (b.pinned_old.len() + b.pinned_new.len() + b.notes.len()) as u64;
     let limit = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, effective_top);
-    build_block_max(&b, limit, block_max);
+    let limit_abs = limit as u64 + dropped;
 
+    // Recompute only the blocks a patch has dirtied since they were last
+    // exact. In steady playback nothing is dirty and this costs a flag
+    // scan; the per-frame full rebuild it replaces cost a pass over
+    // every note in the window.
+    let top_block = ((limit_abs + WINNER_BLOCK as u64 - 1) / WINNER_BLOCK as u64) as usize;
+    for blk in 0..top_block {
+        if b.abs_block_dirty[blk] {
+            refresh_abs_block(&mut b, blk);
+        }
+    }
+
+
+    let mut last_winner: Option<u64> = None;
     for r in 0..col.len() {
         // The ticks this pixel row covers. Clamped to the window: above the frontier
         // nothing has been generated, below the playhead nothing is drawn.
         let t_hi = row_tick[r].min(effective_top);
         let t_lo = row_tick[r + 1].max(current_tick);
         if t_hi < t_lo {
+            last_winner = None;
             continue;
         }
 
-        let prefix = first_note_above(&b.pinned_old, &b.pinned_new, &b.notes, t_hi);
-        if prefix == 0 {
-            continue;
-        }
-
-        // The last note of the prefix that still reaches this row wins; it paints
-        // over every earlier note. The search is exact (see `winner_in_prefix`):
-        // a long note buried in the middle of a dense prefix is found, instead of
-        // vanishing until the notes ahead of it retire.
-        if let Some(index) = winner_in_prefix(&b, block_max, prefix, t_lo) {
-            let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, index);
+        // The last note that starts at or before this row's top and still
+        // reaches its bottom wins; it paints over every earlier note. The
+        // search is exact (see `winner_for_row`): a long note buried in
+        // the middle of a dense stretch is found, instead of vanishing
+        // until the notes ahead of it retire.
+        if let Some((idx, n)) = winner_for_row(&b, t_hi, t_lo) {
             col[r] = pack(get_note_color_by_index(n.color));
-            owner[r] = index as u32;
+            if last_winner == Some(idx) {
+                owner[r] = winner_notes.len() as u32 - 1;
+            } else {
+                owner[r] = winner_notes.len() as u32;
+                winner_notes.push(n);
+                last_winner = Some(idx);
+            }
+        } else {
+            last_winner = None;
         }
     }
 
@@ -1408,7 +1585,7 @@ fn rasterize_column(
         while r < col.len() && owner[r] == who {
             r += 1;
         }
-        let n = note_at(&b.pinned_old, &b.pinned_new, &b.notes, who as usize);
+        let n = winner_notes[who as usize];
         let edge = darken(col[run_start]);
         if run_start > 0 || n.end_tick <= effective_top {
             col[run_start] = edge;
@@ -1460,7 +1637,7 @@ pub fn draw_piano_roll_chunk(
             row_tick,
             cols,
             owners,
-            block_max,
+            winner_notes,
         } = &mut *scratch;
         row_tick.fill(0);
         let top_tick = if is_tick_based {
@@ -1517,7 +1694,7 @@ pub fn draw_piano_roll_chunk(
                 &row_tick,
                 current_tick,
                 effective_top,
-                block_max,
+                winner_notes,
             );
         }
 
@@ -1560,3 +1737,4 @@ pub fn draw_piano_roll_chunk(
         }
     });
 }
+
