@@ -227,6 +227,13 @@ fn main() {
     // anywhere below it, so this is what says whether the window is holding more than
     // the current zoom needs. How far the scan actually got does not.
     let mut piano_roll_max_target = 0u32;
+    // note_speed as of the previous frame, and how many frames it has been
+    // unchanged since. The zoom rebuild below is gated on the speed having
+    // settled: during a continuous zoom gesture the target falls steadily, so
+    // any fixed tolerance is crossed mid-gesture, and rebuilding then visibly
+    // restarts the roll while the user is still zooming.
+    let mut piano_roll_last_speed = app_state.note_speed;
+    let mut piano_roll_speed_stable_frames = 0u32;
     let mut pitch_bend_window_offset = 0;
     let mut pitch_bend_window_y_offset = 0;
     let mut pitch_bend_spring_position = Vector2::zero();
@@ -1003,9 +1010,20 @@ fn main() {
                                     // only has to cover what playback eats between frames plus
                                     // the scan's latency. Every extra screenful of lookahead is
                                     // another screenful of notes resident, which on a dense MIDI
-                                    // is measured in hundreds of megabytes.
-                                    let target =
-                                        top_tick.saturating_add(span / 4).min(parser_data.max_tick);
+                                    // is measured in hundreds of megabytes. The slack is a
+                                    // quarter of the span with an absolute floor: purely
+                                    // span-relative, it shrinks with the span at high zoom
+                                    // until the scan can no longer stay ahead of the top edge
+                                    // and the roll is cut off there.
+                                    let margin_floor = kazumidiparser_cursor::ns_to_tick(
+                                        parser_data,
+                                        playback_position_ns
+                                            .saturating_add(piano_roll::MARGIN_FLOOR_NS),
+                                    )
+                                    .saturating_sub(current_tick);
+                                    let target = top_tick
+                                        .saturating_add((span / 4).max(margin_floor))
+                                        .min(parser_data.max_tick);
 
                                     // Rebuild the window on a new file, or on a seek that lands
                                     // outside it: backwards (behind what we already retired) or
@@ -1031,8 +1049,18 @@ fn main() {
                                     // the stale notes would never be freed. The margin keeps a
                                     // slider drag from rebuilding every frame: half a screenful of
                                     // stale notes is tolerated, more than that is thrown away.
-                                    let zoomed_in =
-                                        piano_roll_max_target > target.saturating_add(span / 2);
+                                    if app_state.note_speed != piano_roll_last_speed {
+                                        piano_roll_last_speed = app_state.note_speed;
+                                        piano_roll_speed_stable_frames = 0;
+                                    } else {
+                                        piano_roll_speed_stable_frames =
+                                            piano_roll_speed_stable_frames.saturating_add(1);
+                                    }
+                                    // About half a second of stillness at 60 fps before a
+                                    // zoom rebuild is allowed; see the state declarations.
+                                    let zoomed_in = piano_roll_speed_stable_frames >= 30
+                                        && piano_roll_max_target
+                                            > target.saturating_add((span / 2).max(margin_floor));
 
                                     if data_changed || seeked || zoomed_in {
                                         piano_roll_worker.regenerate(

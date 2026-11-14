@@ -37,6 +37,16 @@ pub const MIN_NOTE_SPEED: f32 = 0.0001;
 /// enough to read one note apart from the next.
 pub const MAX_NOTE_SPEED: f32 = 128.0;
 
+/// Floor for the span-relative margins the main loop derives from the visible
+/// span (the scan's lookahead past the top edge and the zoom rebuild tolerance),
+/// expressed as a duration and converted to ticks where it is used. Both margins
+/// scale with the span, so at maximum zoom they would otherwise shrink to a few
+/// milliseconds: the scan could not stay ahead of the top edge, cutting the roll
+/// off there, and any small zoom step would trip the rebuild test. Half a second
+/// of music also bounds the extra resident notes to a fixed time window instead
+/// of a number of screenfuls.
+pub const MARGIN_FLOOR_NS: u64 = 500_000_000; // 0.5 seconds
+
 /// `end_tick` sentinel for a note whose note-on has been scanned but whose
 /// note-off has not yet been seen. Such a note is drawn growing from its start up
 /// to the current reveal frontier, and its real end is patched in once the
