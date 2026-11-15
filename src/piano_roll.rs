@@ -67,6 +67,14 @@ struct DrawScratch {
     cols: Vec<u32>,
     owners: Vec<u32>,
     winner_notes: Vec<RollNote>,
+    /// The view the cached `cols`/`owners` were rasterized for:
+    /// (generation, content_seq, draw_tick, top_tick, effective_top,
+    /// height_px, is_tick_based). A frame whose key matches re-emits the
+    /// cached rasterization instead of recomputing it; only the rectangle
+    /// emit runs. Anything the key does not capture cannot change the
+    /// picture: the note set is generation+content_seq, the geometry is
+    /// the rest.
+    cache_key: Option<(u64, u64, u32, u32, u32, usize, bool)>,
 }
 
 thread_local! {
@@ -197,6 +205,11 @@ pub struct RollChunk {
     /// publish without taking 128 locks to discover it. The buckets' own copies stay
     /// authoritative for anything that writes notes.
     pub generation: AtomicU64,
+    /// Bumped when a publish or a retire changes something at or below the
+    /// revealed frontier -- i.e. something a cached frame could already
+    /// show. The draw keys its raster cache on this, so publishes that only
+    /// extend the unrevealed lookahead do not invalidate it.
+    pub content_seq: AtomicU64,
     pub scan_frontier_tick: AtomicU32,
     pub window_start_tick: AtomicU32,
     pub done: AtomicBool,
@@ -212,6 +225,7 @@ impl Default for RollChunk {
     fn default() -> Self {
         Self {
             generation: AtomicU64::new(0),
+            content_seq: AtomicU64::new(0),
             scan_frontier_tick: AtomicU32::new(0),
             window_start_tick: AtomicU32::new(0),
             done: AtomicBool::new(false),
@@ -228,6 +242,7 @@ impl RollChunk {
     /// stall this split exists to avoid.
     fn reset(&self, generation: u64, start_tick: u32) {
         self.generation.store(generation, Ordering::SeqCst);
+        self.content_seq.store(0, Ordering::SeqCst);
         for slot in self.notes_by_key.iter() {
             let mut b = slot.lock().unwrap();
             b.generation = generation;
@@ -433,8 +448,30 @@ impl PianoRollWorker {
     /// song, because the dead notes behind it could never reach the front.
     pub fn retire(&self, current_tick: u32) {
         let guard = self.acquire_live();
+        let mut dropped_pinned = false;
         for slot in guard.chunk.notes_by_key.iter() {
             let mut b = slot.lock().unwrap();
+
+            // A pinned note dropped here may be the one holding its winner
+            // block's maximum at OPEN_END, and its note-off patch will never
+            // land now (the note is gone), so the block would overstate
+            // forever and the winner search would keep scanning it. Mark
+            // the blocks of everything about to be dropped dirty, so the
+            // draw recomputes them.
+            let mut stale: [u64; 2 * MAX_PINNED] = [0; 2 * MAX_PINNED];
+            let mut stale_len = 0usize;
+            for p in b.pinned_old.iter().chain(b.pinned_new.iter()) {
+                if p.note.end_tick < current_tick {
+                    stale[stale_len] = p.idx;
+                    stale_len += 1;
+                }
+            }
+            for &idx in stale.iter().take(stale_len) {
+                mark_abs_block_dirty(&mut b, idx);
+            }
+            if stale_len > 0 {
+                dropped_pinned = true;
+            }
 
             // A pinned note whose note-off has since been patched can go.
             b.pinned_old.retain(|p| p.note.end_tick >= current_tick);
@@ -464,7 +501,12 @@ impl PianoRollWorker {
                         b.pinned_old.push_back(PinnedNote { idx, note });
                     } else {
                         if b.pinned_new.len() == MAX_PINNED {
-                            b.pinned_new.pop_front();
+                            // The rolled-off note is dropped for good, still
+                            // sounding: same stale-block hazard as above.
+                            if let Some(old) = b.pinned_new.pop_front() {
+                                mark_abs_block_dirty(&mut b, old.idx);
+                                dropped_pinned = true;
+                            }
                         }
                         b.pinned_new.push_back(PinnedNote { idx, note });
                     }
@@ -498,6 +540,12 @@ impl PianoRollWorker {
                 drop(b);
                 drop(discarded);
             }
+        }
+
+        // A dropped pinned note was on screen (it reaches the playhead), so
+        // any cached frame is stale now.
+        if dropped_pinned {
+            guard.chunk.content_seq.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -893,6 +941,15 @@ fn run_scan(
         }
         *staged = 0;
         *patch_count = 0;
+        // Only changes at or below the frontier as it stood when this
+        // publish began can alter a frame the draw has already cached:
+        // those notes are already revealed. Appends and patches above it
+        // are new reveals, which the draw keys on the frontier itself, so
+        // they must not invalidate the raster cache -- during playback the
+        // scan publishes into the lookahead margin constantly, and taking
+        // the cache down for those made the cache useless.
+        let revealed = chunk.scan_frontier_tick.load(Ordering::SeqCst);
+        let mut changed = false;
 
         for (key, (run, key_patches)) in batch.iter_mut().zip(patches.iter_mut()).enumerate() {
             if run.is_empty() && key_patches.is_empty() {
@@ -922,6 +979,9 @@ fn run_scan(
                     b.abs_block_max[blk] = note.end_tick;
                 }
                 b.notes.push_back(note);
+                if note.start_tick <= revealed {
+                    changed = true;
+                }
             }
             for (idx, end) in key_patches.drain(..) {
                 // A still-sounding note may have been moved out of the queue by
@@ -933,6 +993,9 @@ fn run_scan(
                     if blk < b.abs_block_dirty.len() {
                         b.abs_block_dirty[blk] = true;
                     }
+                    if end <= revealed {
+                        changed = true;
+                    }
                     continue;
                 }
                 if let Ok(pos) = b.pinned_new.binary_search_by_key(&idx, |p| p.idx) {
@@ -940,6 +1003,9 @@ fn run_scan(
                     let blk = (idx / WINNER_BLOCK as u64) as usize;
                     if blk < b.abs_block_dirty.len() {
                         b.abs_block_dirty[blk] = true;
+                    }
+                    if end <= revealed {
+                        changed = true;
                     }
                     continue;
                 }
@@ -955,6 +1021,9 @@ fn run_scan(
                     if blk < b.abs_block_dirty.len() {
                         b.abs_block_dirty[blk] = true;
                     }
+                    if end <= revealed {
+                        changed = true;
+                    }
                 }
             }
         }
@@ -964,6 +1033,9 @@ fn run_scan(
         // chunk that now holds no notes (so nothing is drawn) and whose new scan
         // overwrites it on its very first publish.
         chunk.scan_frontier_tick.store(frontier, Ordering::SeqCst);
+        if changed {
+            chunk.content_seq.fetch_add(1, Ordering::SeqCst);
+        }
         true
     };
 
@@ -1393,6 +1465,18 @@ fn note_by_abs(b: &KeyBucket, idx: u64) -> Option<RollNote> {
 
 /// Recompute one block of the bucket's absolute winner index from the
 /// notes that actually live in it now.
+/// Mark the winner-index block holding absolute append index `idx` dirty,
+/// so the draw recomputes it instead of trusting a maximum that a note
+/// since dropped from the bucket may have set (an OPEN_END maximum whose
+/// patch will never land would otherwise keep the block overstated -- and
+/// scanned -- forever).
+fn mark_abs_block_dirty(b: &mut KeyBucket, idx: u64) {
+    let blk = (idx / WINNER_BLOCK as u64) as usize;
+    if blk < b.abs_block_dirty.len() {
+        b.abs_block_dirty[blk] = true;
+    }
+}
+
 fn refresh_abs_block(b: &mut KeyBucket, blk: usize) {
     let lo = blk as u64 * WINNER_BLOCK as u64;
     let hi = (lo + WINNER_BLOCK as u64).min(b.appended_total);
@@ -1638,39 +1722,52 @@ pub fn draw_piano_roll_chunk(
             cols,
             owners,
             winner_notes,
+            cache_key,
         } = &mut *scratch;
         row_tick.fill(0);
-        let top_tick = if is_tick_based {
+        // Snap the playhead down to a whole pixel row. While playback moves
+        // within one row the rasterized picture cannot change, so the draw
+        // can reuse the cached columns (see `cache_key` below) instead of
+        // re-rasterizing all 128 columns every frame. The picture lags the
+        // true playhead by less than one row -- under a pixel.
+        let (draw_tick, top_tick) = if is_tick_based {
             let division = (data.header.division as u32).max(1);
             let span =
                 (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
+            let row_span = (span / height_px as u32).max(1);
+            let draw_tick = current_tick - current_tick % row_span;
             for (r, slot) in row_tick.iter_mut().enumerate() {
                 let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
                 *slot = if r == height_px {
-                    current_tick
+                    draw_tick
                 } else {
-                    current_tick.saturating_add((progress * span as f32) as u32)
+                    draw_tick.saturating_add((progress * span as f32) as u32)
                 };
             }
-            current_tick.saturating_add(span)
+            (draw_tick, draw_tick.saturating_add(span))
         } else {
             let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
+            let row_span_ns = (span_ns / height_px as u64).max(1);
+            let draw_ns = playback_position_ns - playback_position_ns % row_span_ns;
             for (r, slot) in row_tick.iter_mut().enumerate() {
                 let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
                 let ns = if r == height_px {
-                    playback_position_ns
+                    draw_ns
                 } else {
-                    playback_position_ns.saturating_add((progress * span_ns as f32) as u64)
+                    draw_ns.saturating_add((progress * span_ns as f32) as u64)
                 };
                 *slot = ns_to_tick(data, ns);
             }
-            ns_to_tick(data, playback_position_ns.saturating_add(span_ns))
+            (
+                ns_to_tick(data, draw_ns),
+                ns_to_tick(data, draw_ns.saturating_add(span_ns)),
+            )
         };
 
         // Reveal only up to the scan frontier; notes above it are not generated yet.
         let effective_top = top_tick
             .min(chunk.scan_frontier_tick.load(Ordering::SeqCst))
-            .max(current_tick);
+            .max(draw_tick);
 
         let regions = get_keyboard_note_regions(area.width);
 
@@ -1682,20 +1779,32 @@ pub fn draw_piano_roll_chunk(
         // threads every frame cost more than the rasterization itself, caused scheduler
         // spikes, and made every thread reserve a stack. Keep the hot path on the render
         // thread; the expensive MIDI scan remains on its persistent worker.
-        for (key, (col, own)) in cols
-            .chunks_mut(height_px)
-            .zip(owners.chunks_mut(height_px))
-            .enumerate()
-        {
-            rasterize_column(
-                &chunk.notes_by_key[key],
-                col,
-                own,
-                &row_tick,
-                current_tick,
-                effective_top,
-                winner_notes,
-            );
+        let frame_key = (
+            chunk.generation.load(Ordering::SeqCst),
+            chunk.content_seq.load(Ordering::SeqCst),
+            draw_tick,
+            top_tick,
+            effective_top,
+            height_px,
+            is_tick_based,
+        );
+        if *cache_key != Some(frame_key) {
+            for (key, (col, own)) in cols
+                .chunks_mut(height_px)
+                .zip(owners.chunks_mut(height_px))
+                .enumerate()
+            {
+                rasterize_column(
+                    &chunk.notes_by_key[key],
+                    col,
+                    own,
+                    &row_tick,
+                    draw_tick,
+                    effective_top,
+                    winner_notes,
+                );
+            }
+            *cache_key = Some(frame_key);
         }
 
         // Emit one rectangle per contiguous same-color run.
