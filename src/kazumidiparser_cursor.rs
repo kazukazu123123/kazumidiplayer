@@ -344,6 +344,7 @@ pub struct HeldNote {
 ///
 /// # Safety
 /// Same requirements as `seek_track_cursor`.
+#[allow(dead_code)] // reference implementation; production uses the checkpointed variant
 pub unsafe fn seek_track_cursor_with_held(
     data: &KazuMIDIParserData,
     track_idx: u16,
@@ -425,6 +426,36 @@ pub unsafe fn seek_track_cursor_with_held(
     }
 
     // Flatten, oldest note-on first, so the caller can append them in start order.
+    (cursor, flatten_held(&open))
+}
+
+/// How many stepped events apart held-note checkpoints are taken while
+/// walking a track. The interval bounds one track's replay, but a seek
+/// re-seeds every track, so the total replay is the sum over tracks:
+/// on NECROFANTASIA (6,541 tracks) a parallel seek of every track to
+/// the midpoint measured 1,290 ms uncheckpointed, 892 ms at a 1M
+/// interval (8.3 MB of checkpoints), 525 ms at 250k (37.5 MB) and
+/// 262 ms at this 100k interval (105 MB), all with the per-key cap at
+/// 128 (measured 2026-11-15). Ordinary files are far smaller: their
+/// tracks are short, so most never reach even one checkpoint.
+pub const HELD_CKPT_INTERVAL: u64 = 100_000;
+
+/// A resumable held-note state partway through a track: the cursor
+/// just after `event_count` stepped events, plus every note still
+/// sounding there, in start-tick order, the per-(channel, key) queues
+/// capped exactly as `seek_track_cursor_with_held` caps them.
+/// Restoring one and walking on reproduces the from-start walk
+/// exactly: the queues are rebuilt in start order, and note-offs
+/// close the oldest note on their (channel, key).
+#[derive(Clone)]
+pub struct HeldCheckpoint {
+    pub event_count: u64,
+    pub tick: u32,
+    pub cursor: TrackCursor,
+    pub held: Vec<HeldNote>,
+}
+
+fn flatten_held(open: &FxHashMap<(u8, u8), VecDeque<u32>>) -> Vec<HeldNote> {
     let mut held: Vec<HeldNote> = Vec::new();
     for ((channel, key), starts) in open.iter() {
         for &start_tick in starts {
@@ -435,9 +466,117 @@ pub unsafe fn seek_track_cursor_with_held(
             });
         }
     }
-    held.sort_by_key(|n| n.start_tick);
+    // Canonical order: start tick, then channel, then key. The map's
+    // iteration order depends on insertion history, which differs
+    // between a from-start walk and a checkpoint-restored one; without
+    // the tie-breakers, notes sharing a start tick would come out in
+    // different orders from the two walks.
+    held.sort_by(|a, b| {
+        (a.start_tick, a.channel, a.key).cmp(&(b.start_tick, b.channel, b.key))
+    });
+    held
+}
 
-    (cursor, held)
+/// Like `seek_track_cursor_with_held`, but starts from `base` (a
+/// checkpoint on the same track whose tick is before `target_tick`)
+/// when one is given, and pushes a fresh checkpoint into `deposited`
+/// each time the walk crosses a multiple of `HELD_CKPT_INTERVAL`
+/// stepped events. The result is identical to the from-start seek:
+/// the walk from a checkpoint processes the same events with the
+/// same voice state.
+///
+/// # Safety
+/// Same requirements as `seek_track_cursor`. `base` must come from a
+/// walk over the same track of the same data.
+pub unsafe fn seek_track_cursor_with_held_ckpt(
+    data: &KazuMIDIParserData,
+    track_idx: u16,
+    target_tick: u32,
+    max_per_key: usize,
+    base: Option<&HeldCheckpoint>,
+    deposited: &mut Vec<HeldCheckpoint>,
+) -> (TrackCursor, Vec<HeldNote>) {
+    let mut open: FxHashMap<(u8, u8), VecDeque<u32>> = FxHashMap::default();
+    let (mut cursor, mut count) = match base {
+        Some(b) => {
+            debug_assert_eq!(b.cursor.track_index, track_idx);
+            for n in &b.held {
+                open.entry((n.channel, n.key))
+                    .or_default()
+                    .push_back(n.start_tick);
+            }
+            (b.cursor.clone(), b.event_count)
+        }
+        None => match unsafe { init_track_cursor(data, track_idx) } {
+            Some(c) => (c, 0),
+            None => {
+                return (
+                    TrackCursor {
+                        track_index: track_idx,
+                        p: std::ptr::null(),
+                        end: std::ptr::null(),
+                        abs_tick: 0,
+                        running_status: 0,
+                        status: 0,
+                        param1: 0,
+                        param2: 0,
+                        is_tempo: false,
+                        tempo_val: 0,
+                        has_event: false,
+                        skip_next_delta: false,
+                    },
+                    Vec::new(),
+                );
+            }
+        },
+    };
+
+    if cursor.p.is_null() {
+        return (cursor, Vec::new());
+    }
+
+    let mut next_ckpt = (count / HELD_CKPT_INTERVAL + 1) * HELD_CKPT_INTERVAL;
+    unsafe {
+        while cursor_next(&mut cursor) {
+            count += 1;
+            if cursor.is_tempo {
+                continue;
+            }
+            if cursor.abs_tick >= target_tick {
+                break;
+            }
+            let msg_type = cursor.status & 0xF0;
+            let key = cursor.param1 as usize;
+            if key < 128 {
+                let channel = cursor.status & 0x0F;
+                if msg_type == 0x90 && cursor.param2 > 0 {
+                    let queue = open.entry((channel, key as u8)).or_default();
+                    queue.push_back(cursor.abs_tick);
+                    if queue.len() > max_per_key {
+                        queue.pop_front();
+                    }
+                } else if msg_type == 0x80 || (msg_type == 0x90 && cursor.param2 == 0) {
+                    if let Some(queue) = open.get_mut(&(channel, key as u8)) {
+                        queue.pop_front();
+                    }
+                }
+            }
+            if count >= next_ckpt {
+                deposited.push(HeldCheckpoint {
+                    event_count: count,
+                    tick: cursor.abs_tick,
+                    cursor: cursor.clone(),
+                    held: flatten_held(&open),
+                });
+                next_ckpt += HELD_CKPT_INTERVAL;
+            }
+        }
+        if cursor.abs_tick < target_tick {
+            cursor.has_event = false;
+        }
+    }
+
+    (cursor, flatten_held(&open))
 }
 
 /// The SMF default tempo, in microseconds per quarter note (120 BPM).
@@ -687,5 +826,58 @@ mod tests {
         assert!(c.p <= c.end);
         drop(midi);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Checkpointed seeks must reproduce from-start seeks exactly (same
+    /// held notes in the same order, same final cursor position), for
+    /// every file listed in `KZMP_CKPT_FILES` (semicolon-separated).
+    /// Skipped when it is unset.
+    #[test]
+    fn ckpt_seek_matches_plain_seek() {
+        let Ok(list) = std::env::var("KZMP_CKPT_FILES") else {
+            return;
+        };
+        for path in list.split(';') {
+            let Ok(midi) = MIDIPlayerData::parse(std::path::Path::new(path), 0, None, None) else {
+                continue;
+            };
+            let data = unsafe { &*midi.as_ptr() };
+            for t in 0..data.header.tracks {
+                let mut deposited = Vec::new();
+                let (end_cursor, _) = unsafe {
+                    seek_track_cursor_with_held_ckpt(data, t, u32::MAX, 128, None, &mut deposited)
+                };
+                let end_tick = end_cursor.abs_tick;
+                let mut targets = vec![
+                    0,
+                    1,
+                    end_tick / 4,
+                    end_tick / 2,
+                    (end_tick / 4) * 3,
+                    end_tick,
+                ];
+                targets.sort_unstable();
+                targets.dedup();
+                for target in targets {
+                    let (c0, h0) = unsafe { seek_track_cursor_with_held(data, t, target, 128) };
+                    let base = deposited.iter().filter(|c| c.tick < target).last();
+                    let mut scratch = Vec::new();
+                    let (c1, h1) = unsafe {
+                        seek_track_cursor_with_held_ckpt(data, t, target, 128, base, &mut scratch)
+                    };
+                    assert_eq!(h0.len(), h1.len(), "{path} track {t} target {target} held count");
+                    for (a, b) in h0.iter().zip(h1.iter()) {
+                        assert!(
+                            a.key == b.key && a.start_tick == b.start_tick && a.channel == b.channel,
+                            "{path} track {t} target {target} held note"
+                        );
+                    }
+                    assert_eq!(c0.abs_tick, c1.abs_tick, "{path} track {t} target {target} tick");
+                    assert_eq!(c0.has_event, c1.has_event, "{path} track {t} target {target} has_event");
+                    assert_eq!(c0.p as usize, c1.p as usize, "{path} track {t} target {target} pos");
+                }
+            }
+            println!("ckpt seek equivalence ok: {path}");
+        }
     }
 }

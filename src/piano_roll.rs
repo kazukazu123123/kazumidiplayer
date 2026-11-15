@@ -11,7 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::kazumidiparser_cursor::{
-    TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, seek_track_cursor_with_held,
+    HeldCheckpoint, TrackCursor, cursor_next, ns_to_tick, seek_track_cursor,
+    seek_track_cursor_with_held_ckpt,
 };
 use crate::ui_components::piano_keyboard::{get_keyboard_note_regions, is_black_key};
 use crate::utils::get_note_color_by_index;
@@ -80,6 +81,588 @@ struct DrawScratch {
 thread_local! {
     static DRAW_SCRATCH: RefCell<DrawScratch> = RefCell::new(DrawScratch::default());
 }
+
+/// ---------------------------------------------------------------------------
+/// Tile-baked roll rendering.
+///
+/// The direct path re-rasterizes the visible rows and re-emits every note
+/// rectangle on every frame, so its cost grows with the resident note count
+/// (measured on a 100M-note file at low zoom: raster ~8 ms + emit ~6 ms per
+/// frame -- over the 60 fps budget on their own). The tile path instead
+/// rasterizes a fixed range of rows into a CPU pixel buffer ONCE, uploads
+/// it as a texture, and per frame only blits the one or two tiles the view
+/// overlaps: the per-frame cost is then a function of the screen size, not
+/// of the note count.
+///
+/// Rows are anchored absolutely: absolute row A covers the tick range
+/// [A * span, (A + 1) * span), where span is the row span of the current
+/// zoom (ticks, or ns in time-based mode). Advancing the playhead moves
+/// which rows are visible, never what a baked row contains, so playback
+/// does not invalidate tiles. Content changes invalidate precisely: the
+/// chunk tracks the tick range publishes and retires touched (see
+/// `RollChunk::dirty`), and only tiles intersecting it are rebaked.
+///
+/// Baking is budgeted (a few ms per frame, columns in keyboard z-order);
+/// while a visible tile is not ready the caller falls back to the direct
+/// path, so the worst case at any moment is exactly the old behaviour.
+/// ---------------------------------------------------------------------------
+
+/// Pixel rows per tile. At the zooms where the direct path hurts (low
+/// zoom, huge row spans) a tile covers minutes of playback; at high zoom
+/// tiles are consumed quickly, but there the direct path is cheap and the
+/// fallback covers it.
+const TILE_ROWS: usize = 512;
+const TILE_SLOTS: usize = 5;
+/// Per-frame budget for baking, so a bake can never itself break 60 fps.
+const TILE_BAKE_BUDGET_MS: u64 = 3;
+
+/// Everything a baked tile depends on besides the chunk's notes: the note
+/// set generation, the row grid (span per row, in ticks or ns according
+/// to the mode), and the pixel width the key regions were computed for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TileKey {
+    generation: u64,
+    span_key: u64,
+    is_tick_based: bool,
+    width_px: u32,
+}
+
+struct RollTile {
+    key: Option<TileKey>,
+    /// Absolute row index of this tile's bottom row; the tile covers rows
+    /// [start_row, start_row + TILE_ROWS), aligned to TILE_ROWS.
+    start_row: u64,
+    /// Bake progress in key steps (keyboard z-order, whites first).
+    steps_done: usize,
+    ready: bool,
+    /// Absolute row band [lo, hi) of a ready tile that a chunk change
+    /// has touched since the bake: only these rows are rebaked. Notes
+    /// ending at the playhead dirty just its bottom row, so whole-tile
+    /// invalidation would keep that tile rebaking forever.
+    dirty_rows: Option<(u64, u64)>,
+    /// Dirties that arrived while `dirty_rows` was being rebaked. They
+    /// queue instead of merging into the in-flight band: merging reset
+    /// its progress every frame, and a wide band (a still-sounding note
+    /// rolled off the pinned set dirties everything up to the frontier)
+    /// then never finished under per-frame dirties.
+    pending_rows: Option<(u64, u64)>,
+    /// Key-step progress of an in-flight band rebake.
+    band_steps: usize,
+    texture: Option<raylib::ffi::Texture2D>,
+    /// RGBA pixels, row 0 = the tile's top row.
+    pixels: Vec<u8>,
+}
+
+impl Default for RollTile {
+    fn default() -> Self {
+        Self {
+            key: None,
+            start_row: 0,
+            steps_done: 0,
+            ready: false,
+            dirty_rows: None,
+            pending_rows: None,
+            band_steps: 0,
+            texture: None,
+            pixels: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TileScratch {
+    row_tick: Vec<u32>,
+    cols: Vec<u32>,
+    owners: Vec<u32>,
+    winner_notes: Vec<RollNote>,
+}
+
+#[derive(Default)]
+struct TileCache {
+    tiles: Vec<RollTile>,
+    scratch: TileScratch,
+}
+
+thread_local! {
+    static TILE_CACHE: RefCell<TileCache> = RefCell::new(TileCache::default());
+}
+
+/// Key indices in painting order: every white key first, then every black
+/// key on top, matching the direct emit pass (black-key regions overlap
+/// their white neighbours).
+fn bake_key_order() -> [usize; 128] {
+    let mut order = [0usize; 128];
+    let mut i = 0;
+    for black in [false, true] {
+        for n in 0..128 {
+            if is_black_key(n as u8) == black {
+                order[i] = n;
+                i += 1;
+            }
+        }
+    }
+    order
+}
+
+fn fill_rect(pixels: &mut [u8], width_px: usize, x0: i32, y0: i32, x1: i32, y1: i32, rgba: [u8; 4]) {
+    let x0 = x0.max(0);
+    let y0 = y0.max(0);
+    let x1 = x1.min(width_px as i32);
+    let y1 = y1.min(TILE_ROWS as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for y in y0..y1 {
+        let row = &mut pixels[(y as usize * width_px + x0 as usize) * 4..(y as usize * width_px + x1 as usize) * 4];
+        for px in row.chunks_exact_mut(4) {
+            px.copy_from_slice(&rgba);
+        }
+    }
+}
+
+/// Paint one rasterized column into a tile's pixel buffer, mirroring the
+/// direct emit pass exactly: one rect per contiguous same-colour run,
+/// with the run's left and right pixel columns darkened as its edges.
+fn paint_column(pixels: &mut [u8], width_px: usize, col: &[u32], rx: f32, rw: f32) {
+    let x0 = rx.round() as i32;
+    let x1 = (rx + rw).round() as i32;
+    let mut yy = 0usize;
+    while yy < col.len() {
+        let p = col[yy];
+        if p == 0 {
+            yy += 1;
+            continue;
+        }
+        let run_start = yy;
+        while yy < col.len() && col[yy] == p {
+            yy += 1;
+        }
+        let rgba = [(p >> 16) as u8, (p >> 8) as u8, p as u8, 255];
+        fill_rect(pixels, width_px, x0, run_start as i32, x1, yy as i32, rgba);
+        let e = darken(p);
+        let edge = [(e >> 16) as u8, (e >> 8) as u8, e as u8, 255];
+        fill_rect(pixels, width_px, x0, run_start as i32, x0 + 1, yy as i32, edge);
+        fill_rect(pixels, width_px, x1 - 1, run_start as i32, x1, yy as i32, edge);
+    }
+}
+
+fn tile_texture_create(width_px: u32) -> raylib::ffi::Texture2D {
+    unsafe {
+        let img = raylib::ffi::GenImageColor(
+            width_px as i32,
+            TILE_ROWS as i32,
+            raylib::ffi::Color { r: 0, g: 0, b: 0, a: 0 },
+        );
+        let tex = raylib::ffi::LoadTextureFromImage(img);
+        raylib::ffi::UnloadImage(img);
+        // Point sampling: the blit lands on whole pixels, and anything
+        // else would smear the 1px note edges.
+        raylib::ffi::SetTextureFilter(tex, 0);
+        tex
+    }
+}
+
+/// Pick the slot for (key, start): the one already holding it if any,
+/// else the most evictable (stale key first, then furthest from the
+/// playhead), never a slot holding a currently wanted tile.
+fn find_slot(tiles: &[RollTile], key: &TileKey, start: u64, row0: u64, wanted: &[u64]) -> usize {
+    if let Some(i) = tiles
+        .iter()
+        .position(|t| t.key == Some(*key) && t.start_row == start)
+    {
+        return i;
+    }
+    let mut best = 0usize;
+    let mut best_score = i64::MIN;
+    for (i, t) in tiles.iter().enumerate() {
+        if t.key == Some(*key) && wanted.contains(&t.start_row) {
+            continue;
+        }
+        let score = if t.key != Some(*key) {
+            i64::MAX
+        } else {
+            (t.start_row as i64 - row0 as i64).abs()
+        };
+        if score > best_score {
+            best_score = score;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Advance one tile's bake by as many columns as the deadline allows.
+/// Returns true when the budget ran out mid-bake.
+#[allow(clippy::too_many_arguments)]
+fn bake_tile(
+    tile: &mut RollTile,
+    scratch: &mut TileScratch,
+    key: &TileKey,
+    start: u64,
+    chunk: &RollChunk,
+    tick_at: &dyn Fn(u64) -> u32,
+    regions: &[(f32, f32); 128],
+    frontier: u32,
+    deadline: std::time::Instant,
+) -> bool {
+    if tile.key != Some(*key) || tile.start_row != start {
+        if let Some(old) = tile.texture.take() {
+            unsafe { raylib::ffi::UnloadTexture(old) };
+        }
+        tile.key = Some(*key);
+        tile.start_row = start;
+        tile.steps_done = 0;
+        tile.ready = false;
+        tile.dirty_rows = None;
+        tile.pending_rows = None;
+        tile.band_steps = 0;
+        tile.pixels.clear();
+        tile.pixels.resize(key.width_px as usize * TILE_ROWS * 4, 0);
+    }
+    if tile.ready {
+        return false;
+    }
+    if tile.steps_done == 0 {
+        // Starting a fresh bake: every column reads state from now on,
+        // so bands recorded before this point are moot. Bands recorded
+        // during the bake survive completion (see below).
+        tile.dirty_rows = None;
+        tile.pending_rows = None;
+        tile.band_steps = 0;
+    }
+    // Row ticks for the tile, top first: row_tick[j] is the top edge of
+    // tile row j, and tile row 0 is the tile's highest absolute row.
+    scratch.row_tick.resize(TILE_ROWS + 1, 0);
+    for (j, slot) in scratch.row_tick.iter_mut().enumerate() {
+        *slot = tick_at(start + (TILE_ROWS - j) as u64);
+    }
+    let bottom = tick_at(start);
+    let top = tick_at(start + TILE_ROWS as u64);
+    let effective_top = top.min(frontier).max(bottom);
+    scratch.cols.resize(128 * TILE_ROWS, 0);
+    scratch.owners.resize(128 * TILE_ROWS, u32::MAX);
+    let order = bake_key_order();
+    let width_px = key.width_px as usize;
+    while tile.steps_done < 128 {
+        let note = order[tile.steps_done];
+        {
+            let col = &mut scratch.cols[note * TILE_ROWS..(note + 1) * TILE_ROWS];
+            let own = &mut scratch.owners[note * TILE_ROWS..(note + 1) * TILE_ROWS];
+            rasterize_column(
+                &chunk.notes_by_key[note],
+                col,
+                own,
+                &scratch.row_tick,
+                bottom,
+                effective_top,
+                &mut scratch.winner_notes,
+            );
+        }
+        let (rx, rw) = regions[note];
+        let col = &scratch.cols[note * TILE_ROWS..(note + 1) * TILE_ROWS];
+        paint_column(&mut tile.pixels, width_px, col, rx, rw);
+        tile.steps_done += 1;
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+    }
+    let tex = match tile.texture {
+        Some(t) if t.width == key.width_px as i32 && t.height == TILE_ROWS as i32 => t,
+        _ => {
+            if let Some(old) = tile.texture.take() {
+                unsafe { raylib::ffi::UnloadTexture(old) };
+            }
+            tile_texture_create(key.width_px)
+        }
+    };
+    tile.texture = Some(tex);
+    unsafe {
+        raylib::ffi::UpdateTexture(tex, tile.pixels.as_ptr() as *const std::ffi::c_void);
+    }
+    // dirty_rows is deliberately kept: bands recorded during the bake
+    // refer to columns that predate their change, and the band pass
+    // fixes them before the tile may blit.
+    tile.ready = true;
+    false
+}
+
+/// The absolute row whose tick range contains `tick`, searched within
+/// the tile starting at `start` (clamped to its row range).
+fn row_containing(tick_at: &dyn Fn(u64) -> u32, start: u64, tick: u32) -> u64 {
+    let mut lo_r = start;
+    let mut hi_r = start + TILE_ROWS as u64;
+    while lo_r < hi_r {
+        let mid = (lo_r + hi_r + 1) / 2;
+        if tick_at(mid) <= tick {
+            lo_r = mid;
+        } else {
+            hi_r = mid - 1;
+        }
+    }
+    lo_r
+}
+
+/// Rebake only a ready tile's dirty row band. The band is rasterized
+/// with a one-row halo on each side (rasterized for context, never
+/// painted) so run-edge capping inside the band matches a full bake
+/// exactly, and with the tile's own bottom and top as the rasterizer's
+/// floor and ceiling for the same reason. Returns true when the budget
+/// ran out mid-band.
+#[allow(clippy::too_many_arguments)]
+fn bake_band(
+    tile: &mut RollTile,
+    scratch: &mut TileScratch,
+    key: &TileKey,
+    chunk: &RollChunk,
+    tick_at: &dyn Fn(u64) -> u32,
+    regions: &[(f32, f32); 128],
+    frontier: u32,
+    deadline: std::time::Instant,
+) -> bool {
+    let (b_lo, b_hi) = match tile.dirty_rows {
+        Some(r) => r,
+        None => return false,
+    };
+    let start = tile.start_row;
+    let h_lo = if b_lo > start { b_lo - 1 } else { b_lo };
+    let h_hi = if b_hi < start + TILE_ROWS as u64 { b_hi + 1 } else { b_hi };
+    let rows = (h_hi - h_lo) as usize;
+    scratch.row_tick.resize(rows + 1, 0);
+    for (l, slot) in scratch.row_tick.iter_mut().enumerate() {
+        *slot = tick_at(h_hi - l as u64);
+    }
+    let bottom = tick_at(start);
+    let top = tick_at(start + TILE_ROWS as u64);
+    let effective_top = top.min(frontier).max(bottom);
+    scratch.cols.resize(128 * TILE_ROWS, 0);
+    scratch.owners.resize(128 * TILE_ROWS, u32::MAX);
+    // Tile-column offset of the halo's top row, and the band's offset
+    // both within the halo raster and within the pixel buffer.
+    let h_off = (start + TILE_ROWS as u64 - h_hi) as usize;
+    let in_halo = (h_hi - b_hi) as usize;
+    let b_off = (start + TILE_ROWS as u64 - b_hi) as usize;
+    let band_rows = (b_hi - b_lo) as usize;
+    let order = bake_key_order();
+    let width_px = key.width_px as usize;
+    while tile.band_steps < 128 {
+        let note = order[tile.band_steps];
+        {
+            let col = &mut scratch.cols
+                [note * TILE_ROWS + h_off..note * TILE_ROWS + h_off + rows];
+            let own = &mut scratch.owners
+                [note * TILE_ROWS + h_off..note * TILE_ROWS + h_off + rows];
+            rasterize_column(
+                &chunk.notes_by_key[note],
+                col,
+                own,
+                &scratch.row_tick,
+                bottom,
+                effective_top,
+                &mut scratch.winner_notes,
+            );
+        }
+        let (rx, rw) = regions[note];
+        let band = &scratch.cols[note * TILE_ROWS + h_off + in_halo
+            ..note * TILE_ROWS + h_off + in_halo + band_rows];
+        paint_column(&mut tile.pixels[b_off * width_px * 4..], width_px, band, rx, rw);
+        tile.band_steps += 1;
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+    }
+    if let Some(tex) = tile.texture {
+        unsafe {
+            raylib::ffi::UpdateTexture(tex, tile.pixels.as_ptr() as *const std::ffi::c_void);
+        }
+    }
+    // Promote whatever queued behind this band; it bakes next frame.
+    tile.dirty_rows = tile.pending_rows.take();
+    tile.band_steps = 0;
+    false
+}
+
+/// Blit the part of one ready tile that overlaps the visible rows.
+fn blit_tile(tile: &RollTile, row0: u64, height_px: usize, area: &Rectangle) {
+    let tex = match tile.texture {
+        Some(t) => t,
+        None => return,
+    };
+    let ts = tile.start_row;
+    let vis_lo = row0.max(ts);
+    let vis_hi = (row0 + height_px as u64).min(ts + TILE_ROWS as u64);
+    if vis_hi <= vis_lo {
+        return;
+    }
+    // Highest visible absolute row in this tile, and where it lands both
+    // in the texture (row 0 = tile top) and on screen (row 0 = view top).
+    let a_hi = vis_hi - 1;
+    let src_y = (ts + TILE_ROWS as u64 - 1 - a_hi) as f32;
+    let src_h = (vis_hi - vis_lo) as f32;
+    let dest_y = area.y + (row0 + height_px as u64 - 1 - a_hi) as f32;
+    unsafe {
+        raylib::ffi::DrawTextureRec(
+            tex,
+            raylib::ffi::Rectangle {
+                x: 0.0,
+                y: src_y,
+                width: tile.key.map(|k| k.width_px).unwrap_or(0) as f32,
+                height: src_h,
+            },
+            raylib::ffi::Vector2 { x: area.x, y: dest_y },
+            raylib::ffi::Color { r: 255, g: 255, b: 255, a: 255 },
+        );
+    }
+}
+
+/// One frame of the tile path: invalidate from the chunk's dirty range,
+/// bake within budget, and blit if every visible tile is ready. Returns
+/// false when the caller should draw the direct path instead.
+fn tile_frame(
+    key: &TileKey,
+    row0: u64,
+    height_px: usize,
+    area: &Rectangle,
+    regions: &[(f32, f32); 128],
+    data: &KazuMIDIParserData,
+    chunk: &RollChunk,
+    frontier: u32,
+) -> bool {
+    let tick_at = |row: u64| -> u32 {
+        if key.is_tick_based {
+            row.saturating_mul(key.span_key).min(u32::MAX as u64) as u32
+        } else {
+            ns_to_tick(data, row.saturating_mul(key.span_key))
+        }
+    };
+    TILE_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.tiles.is_empty() {
+            cache.tiles = (0..TILE_SLOTS).map(|_| RollTile::default()).collect();
+        }
+        let TileCache { tiles, scratch } = &mut *cache;
+
+        // Invalidate what the dirty range touches: only the rows
+        // the change can reach are marked, which for a note ending at
+        // the playhead is a single bottom row.
+        if let Some((lo, hi)) = chunk.take_dirty() {
+            for t in tiles.iter_mut() {
+                if t.key != Some(*key) {
+                    continue;
+                }
+                let tlo = tick_at(t.start_row);
+                let thi = tick_at(t.start_row + TILE_ROWS as u64);
+                if lo >= thi || tlo >= hi {
+                    continue;
+                }
+                // A tile mid-bake is NOT restarted: at low-zoom density
+                // a bake spans many frames and dirties land every
+                // frame, so restarting would pin it at step zero
+                // forever. The band is recorded like a ready tile's
+                // and fixed by the band pass once the bake completes;
+                // columns baked after the change are just rebaked
+                // once more in their band rows, which is cheap.
+                // Clip to the visible rows: rows below the playhead
+                // cannot be seen again without a seek, and a seek
+                // regenerates under a new generation (new tiles).
+                // Without this, a retired long note dirties its whole
+                // span back to its start, and the playhead tile's band
+                // never finishes under constant new dirties.
+                let a_lo = row_containing(&tick_at, t.start_row, lo)
+                    .max(t.start_row)
+                    .max(row0);
+                let a_hi = (row_containing(&tick_at, t.start_row, hi.saturating_sub(1)) + 1)
+                    .min(t.start_row + TILE_ROWS as u64);
+                if a_lo < a_hi {
+                    if t.ready && t.dirty_rows.is_some() {
+                        t.pending_rows = Some(match t.pending_rows {
+                            Some((plo, phi)) => (plo.min(a_lo), phi.max(a_hi)),
+                            None => (a_lo, a_hi),
+                        });
+                    } else {
+                        t.dirty_rows = Some(match t.dirty_rows {
+                            Some((plo, phi)) => (plo.min(a_lo), phi.max(a_hi)),
+                            None => (a_lo, a_hi),
+                        });
+                        t.band_steps = 0;
+                    }
+                }
+            }
+        }
+
+        // Visible tile starts, bottom first, capped so the ring can hold
+        // them plus one prefetch; a taller view than that falls back.
+        let first = row0 / TILE_ROWS as u64 * TILE_ROWS as u64;
+        let last = (row0 + height_px as u64 - 1) / TILE_ROWS as u64 * TILE_ROWS as u64;
+        let mut wanted: Vec<u64> = Vec::new();
+        let mut cur = first;
+        while cur <= last && wanted.len() < TILE_SLOTS - 1 {
+            wanted.push(cur);
+            cur += TILE_ROWS as u64;
+        }
+        let covered = wanted.len() == ((last - first) / (TILE_ROWS as u64)) as usize + 1;
+        let prefetch = last + TILE_ROWS as u64;
+
+        // Bake: band fixes, then visible tiles, then the tile above
+        // the view. A tile may be baked before the scan frontier has
+        // crossed it: the bake clips at the frontier, and the rows
+        // revealed afterwards are precisely the rows the publishes
+        // dirty, so they arrive as band rebakes. (Gating bakes on full
+        // reveal could never engage during playback: the scan leads
+        // the view by only a quarter span, far less than a tile.)
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(TILE_BAKE_BUDGET_MS);
+        let mut exhausted = false;
+        // Band fixes first: rebaking a ready tile's touched rows is
+        // nearly free (usually the playhead's bottom row) and keeps the
+        // tile blit-able this very frame.
+        for &start in wanted.iter() {
+            if exhausted {
+                break;
+            }
+            let idx = match tiles.iter().position(|t| {
+                t.ready && t.key == Some(*key) && t.start_row == start && t.dirty_rows.is_some()
+            }) {
+                Some(i) => i,
+                None => continue,
+            };
+            exhausted = bake_band(
+                &mut tiles[idx], scratch, key, chunk, &tick_at, regions, frontier, deadline,
+            );
+        }
+        for &start in wanted.iter().chain(std::iter::once(&prefetch)) {
+            if exhausted {
+                break;
+            }
+            let idx = find_slot(tiles, key, start, row0, &wanted);
+            let tile = &mut tiles[idx];
+            if tile.key == Some(*key) && tile.start_row == start && tile.ready {
+                continue;
+            }
+            exhausted = bake_tile(
+                tile, scratch, key, start, chunk, &tick_at, regions, frontier, deadline,
+            );
+        }
+
+        if !covered {
+            return false;
+        }
+        for &start in wanted.iter() {
+            let tile = tiles.iter().find(|t| {
+                t.ready
+                    && t.key == Some(*key)
+                    && t.start_row == start
+                    && t.dirty_rows.is_none()
+                    && t.pending_rows.is_none()
+            });
+            match tile {
+                Some(t) => blit_tile(t, row0, height_px, area),
+                None => return false,
+            }
+        }
+        true
+    })
+}
+
 
 /// Marks a packed column pixel as already outlined, so it is not darkened a second
 /// time. Sits above the 24 color bits and the occupancy bit.
@@ -213,6 +796,12 @@ pub struct RollChunk {
     pub scan_frontier_tick: AtomicU32,
     pub window_start_tick: AtomicU32,
     pub done: AtomicBool,
+    /// Tick range touched by publishes and retires since the draw last
+    /// took it: (min, max) with (u32::MAX, 0) meaning empty. The tile
+    /// cache invalidates exactly the baked tiles this range intersects,
+    /// where the global content_seq would take every tile down for a
+    /// change anywhere in the window.
+    pub dirty: Mutex<(u32, u32)>,
     /// Draws currently reading this chunk. `commit` waits for this to fall to zero
     /// before recycling the chunk it swapped out, so a draw already in flight is
     /// never cleared out from under itself. Without it the per-key locks would let a
@@ -229,6 +818,7 @@ impl Default for RollChunk {
             scan_frontier_tick: AtomicU32::new(0),
             window_start_tick: AtomicU32::new(0),
             done: AtomicBool::new(false),
+            dirty: Mutex::new((u32::MAX, 0)),
             readers: AtomicUsize::new(0),
             notes_by_key: std::array::from_fn(|_| Mutex::new(KeyBucket::default())),
         }
@@ -262,6 +852,7 @@ impl RollChunk {
         self.scan_frontier_tick.store(start_tick, Ordering::SeqCst);
         self.window_start_tick.store(start_tick, Ordering::SeqCst);
         self.done.store(false, Ordering::SeqCst);
+        *self.dirty.lock().unwrap() = (u32::MAX, 0);
     }
 
     /// Block until no draw is reading this chunk. Only called by `commit`, on the
@@ -271,6 +862,32 @@ impl RollChunk {
             std::hint::spin_loop();
             thread::yield_now();
         }
+    }
+
+    /// Grow the dirty range by [lo, hi]. Called at most once per publish
+    /// batch and once per retire, so the lock is never contended for long.
+    pub fn mark_dirty(&self, lo: u32, hi: u32) {
+        if lo > hi {
+            return;
+        }
+        let mut d = self.dirty.lock().unwrap();
+        if lo < d.0 {
+            d.0 = lo;
+        }
+        if hi > d.1 {
+            d.1 = hi;
+        }
+    }
+
+    /// Take the accumulated dirty range, leaving it empty.
+    pub fn take_dirty(&self) -> Option<(u32, u32)> {
+        let mut d = self.dirty.lock().unwrap();
+        if d.0 > d.1 {
+            return None;
+        }
+        let out = *d;
+        *d = (u32::MAX, 0);
+        Some(out)
     }
 }
 
@@ -373,6 +990,11 @@ impl PianoRollWorker {
         let shutdown_for_thread = shutdown.clone();
 
         let handle = thread::spawn(move || {
+            // Holds the data Arc itself, not just its address: while the
+            // slot holds it, that allocation cannot be freed and reused
+            // by a different file's Arc, so the ptr_eq check below can
+            // never confuse two files.
+            let mut ckpt_slot: Option<(Arc<MIDIPlayerData>, Arc<HeldCheckpointStore>)> = None;
             // One reused worker. A running scan bails promptly when a newer
             // request bumps the generation, then we pick up the newest request.
             while let Ok(mut req) = rx.recv() {
@@ -385,8 +1007,27 @@ impl PianoRollWorker {
                 if req.generation != latest_for_thread.load(Ordering::SeqCst) {
                     continue;
                 }
+                // One checkpoint store per loaded file, keyed by the data
+                // Arc's identity. A new file cancels the old store's
+                // background build and starts a fresh one.
+                let store = match &ckpt_slot {
+                    Some((d, s)) if Arc::ptr_eq(d, &req.data) => s.clone(),
+                    _ => {
+                        if let Some((_, old)) = &ckpt_slot {
+                            old.cancelled.store(true, Ordering::SeqCst);
+                        }
+                        let n = unsafe { (&*req.data.as_ptr()).header.tracks } as usize;
+                        let s = Arc::new(HeldCheckpointStore::new(n));
+                        let bdata = req.data.clone();
+                        let bstore = s.clone();
+                        thread::spawn(move || build_held_checkpoints(bdata, bstore));
+                        ckpt_slot = Some((req.data.clone(), s.clone()));
+                        s
+                    }
+                };
                 run_scan(
                     &req.data,
+                    &store,
                     req.start_tick,
                     req.priority_tick,
                     req.generation,
@@ -449,6 +1090,9 @@ impl PianoRollWorker {
     pub fn retire(&self, current_tick: u32) {
         let guard = self.acquire_live();
         let mut dropped_pinned = false;
+        let mut d_lo = u32::MAX;
+        let mut d_hi = 0u32;
+        let frontier_cap = guard.chunk.scan_frontier_tick.load(Ordering::SeqCst);
         for slot in guard.chunk.notes_by_key.iter() {
             let mut b = slot.lock().unwrap();
 
@@ -464,6 +1108,8 @@ impl PianoRollWorker {
                 if p.note.end_tick < current_tick {
                     stale[stale_len] = p.idx;
                     stale_len += 1;
+                    d_lo = d_lo.min(p.note.start_tick);
+                    d_hi = d_hi.max(p.note.end_tick);
                 }
             }
             for &idx in stale.iter().take(stale_len) {
@@ -484,6 +1130,8 @@ impl PianoRollWorker {
                 if end < current_tick {
                     b.notes.pop_front();
                     b.retired += 1;
+                    d_lo = d_lo.min(start);
+                    d_hi = d_hi.max(end);
                 } else if start >= current_tick {
                     // Nothing at or before the playhead can follow: every remaining
                     // note starts now or later, so none can be dead yet.
@@ -506,6 +1154,10 @@ impl PianoRollWorker {
                             if let Some(old) = b.pinned_new.pop_front() {
                                 mark_abs_block_dirty(&mut b, old.idx);
                                 dropped_pinned = true;
+                                // A still-sounding note reaches the frontier;
+                                // cap there like the publish side does.
+                                d_lo = d_lo.min(old.note.start_tick);
+                                d_hi = d_hi.max(old.note.end_tick.min(frontier_cap));
                             }
                         }
                         b.pinned_new.push_back(PinnedNote { idx, note });
@@ -546,6 +1198,9 @@ impl PianoRollWorker {
         // any cached frame is stale now.
         if dropped_pinned {
             guard.chunk.content_seq.fetch_add(1, Ordering::SeqCst);
+        }
+        if d_lo <= d_hi {
+            guard.chunk.mark_dirty(d_lo, d_hi);
         }
     }
 
@@ -623,8 +1278,95 @@ impl PianoRollWorker {
 /// with `PianoRollWorker::retire` draining from behind, that makes the resident
 /// note set a sliding window rather than the whole MIDI.
 #[allow(clippy::too_many_arguments)]
+/// How many of the newest sounding notes on each (channel, key) a seek
+/// keeps. Shared by the scan's seed and the checkpoint builder, so a
+/// checkpoint's stored state is capped exactly as a live seek's is.
+const MAX_SOUNDING_PER_KEY: usize = 128;
+
+/// Held-note checkpoints for one loaded file: one Vec per track, kept
+/// sorted by event count (ticks are non-decreasing along it). Built in
+/// the background when a file is loaded and topped up by every seed
+/// seek that walks past a boundary, so a seek to anywhere replays at
+/// most HELD_CKPT_INTERVAL events per track instead of walking from
+/// the track start. Measured cost on the densest real files is
+/// single-digit megabytes per file (NECROFANTASIA 8.9 MB).
+pub struct HeldCheckpointStore {
+    per_track: Vec<Mutex<Vec<HeldCheckpoint>>>,
+    cancelled: AtomicBool,
+}
+
+impl HeldCheckpointStore {
+    fn new(num_tracks: usize) -> Self {
+        Self {
+            per_track: (0..num_tracks).map(|_| Mutex::new(Vec::new())).collect(),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    /// The newest checkpoint on `track` starting before `target_tick`.
+    fn base_for(&self, track: usize, target_tick: u32) -> Option<HeldCheckpoint> {
+        let v = self.per_track.get(track)?.lock().unwrap();
+        let idx = v.partition_point(|c| c.tick < target_tick);
+        if idx == 0 {
+            None
+        } else {
+            Some(v[idx - 1].clone())
+        }
+    }
+
+    fn merge(&self, track: usize, new: Vec<HeldCheckpoint>) {
+        if new.is_empty() {
+            return;
+        }
+        let mut v = self.per_track[track].lock().unwrap();
+        for c in new {
+            if let Err(pos) = v.binary_search_by_key(&c.event_count, |x| x.event_count) {
+                v.insert(pos, c);
+            }
+        }
+    }
+}
+
+/// Walk every track of a freshly loaded file once, depositing held-note
+/// checkpoints. Runs on its own thread; `cancelled` is set when the
+/// file is replaced, and the walk bails at the next track boundary.
+fn build_held_checkpoints(data: Arc<MIDIPlayerData>, store: Arc<HeldCheckpointStore>) {
+    let num_tracks = unsafe { (&*data.as_ptr()).header.tracks } as usize;
+    let worker_count = (crate::app_state::cpu_threads().max(1) as usize).min(num_tracks.max(1));
+    thread::scope(|scope| {
+        for w in 0..worker_count {
+            let data = &data;
+            let store = &store;
+            scope.spawn(move || {
+                // Safety: the Arc keeps the C MIDI struct alive for this call.
+                let parser = unsafe { &*data.as_ptr() };
+                let mut ti = w;
+                while ti < num_tracks {
+                    if store.cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut deposited = Vec::new();
+                    let _ = unsafe {
+                        seek_track_cursor_with_held_ckpt(
+                            parser,
+                            ti as u16,
+                            u32::MAX,
+                            MAX_SOUNDING_PER_KEY,
+                            None,
+                            &mut deposited,
+                        )
+                    };
+                    store.merge(ti, deposited);
+                    ti += worker_count;
+                }
+            });
+        }
+    });
+}
+
 fn run_scan(
     data: &Arc<MIDIPlayerData>,
+    ckpts: &HeldCheckpointStore,
     start_tick: u32,
     priority_tick: u32,
     generation: u64,
@@ -780,7 +1522,6 @@ fn run_scan(
     // would mean building a hundred-megabyte list on every seek, so each key holds a
     // min-heap on start tick instead and the oldest falls out as newer ones arrive.
     // What survives is what is drawn on top.
-    const MAX_SOUNDING_PER_KEY: usize = 128;
     let mut sounding: [BinaryHeap<Reverse<(u32, u16, u8)>>; 128] =
         std::array::from_fn(|_| BinaryHeap::new());
     // Notes evicted above, counted per voice. They still have note-offs coming, and a
@@ -827,14 +1568,23 @@ fn run_scan(
                     let mut ti = w;
                     while ti < num_tracks {
                         // Safety: ti < num_tracks; parser valid for this call.
+                        // Start from the newest held-note checkpoint
+                        // before the target when one exists, so the walk
+                        // replays at most HELD_CKPT_INTERVAL events, and
+                        // deposit any checkpoints this walk crosses.
+                        let base = ckpts.base_for(ti, start_tick);
+                        let mut deposited = Vec::new();
                         let (cur, held) = unsafe {
-                            seek_track_cursor_with_held(
+                            seek_track_cursor_with_held_ckpt(
                                 parser,
                                 ti as u16,
                                 start_tick,
                                 MAX_SOUNDING_PER_KEY,
+                                base.as_ref(),
+                                &mut deposited,
                             )
                         };
+                        ckpts.merge(ti, deposited);
                         if tx.send((ti, cur, held)).is_err() {
                             break;
                         }
@@ -950,6 +1700,8 @@ fn run_scan(
         // the cache down for those made the cache useless.
         let revealed = chunk.scan_frontier_tick.load(Ordering::SeqCst);
         let mut changed = false;
+        let mut d_lo = u32::MAX;
+        let mut d_hi = 0u32;
 
         for (key, (run, key_patches)) in batch.iter_mut().zip(patches.iter_mut()).enumerate() {
             if run.is_empty() && key_patches.is_empty() {
@@ -982,6 +1734,11 @@ fn run_scan(
                 if note.start_tick <= revealed {
                     changed = true;
                 }
+                // An appended note is only drawable up to the frontier
+                // this publish reveals, so cap the dirty range there; its
+                // note-off patch dirties the rest when it lands.
+                d_lo = d_lo.min(note.start_tick);
+                d_hi = d_hi.max(note.end_tick.min(frontier));
             }
             for (idx, end) in key_patches.drain(..) {
                 // A still-sounding note may have been moved out of the queue by
@@ -989,6 +1746,12 @@ fn run_scan(
                 // absolute index (ascending) so the patch still finds them.
                 if let Ok(pos) = b.pinned_old.binary_search_by_key(&idx, |p| p.idx) {
                     b.pinned_old[pos].note.end_tick = end;
+                    // A patch changes nothing below the new end (the
+                    // note's body there is the same); it retracts the
+                    // open-ended extent the note was drawn with, from
+                    // the new end up to the frontier it reached.
+                    d_lo = d_lo.min(end);
+                    d_hi = d_hi.max(frontier);
                     let blk = (idx / WINNER_BLOCK as u64) as usize;
                     if blk < b.abs_block_dirty.len() {
                         b.abs_block_dirty[blk] = true;
@@ -1000,6 +1763,8 @@ fn run_scan(
                 }
                 if let Ok(pos) = b.pinned_new.binary_search_by_key(&idx, |p| p.idx) {
                     b.pinned_new[pos].note.end_tick = end;
+                    d_lo = d_lo.min(end);
+                    d_hi = d_hi.max(frontier);
                     let blk = (idx / WINNER_BLOCK as u64) as usize;
                     if blk < b.abs_block_dirty.len() {
                         b.abs_block_dirty[blk] = true;
@@ -1017,6 +1782,8 @@ fn run_scan(
                 };
                 if let Some(slot) = b.notes.get_mut(pos as usize) {
                     slot.end_tick = end;
+                    d_lo = d_lo.min(end);
+                    d_hi = d_hi.max(frontier);
                     let blk = (idx / WINNER_BLOCK as u64) as usize;
                     if blk < b.abs_block_dirty.len() {
                         b.abs_block_dirty[blk] = true;
@@ -1035,6 +1802,9 @@ fn run_scan(
         chunk.scan_frontier_tick.store(frontier, Ordering::SeqCst);
         if changed {
             chunk.content_seq.fetch_add(1, Ordering::SeqCst);
+        }
+        if d_lo <= d_hi {
+            chunk.mark_dirty(d_lo, d_hi);
         }
         true
     };
@@ -1703,6 +2473,54 @@ pub fn draw_piano_roll_chunk(
     let height_px = (area.height.ceil() as usize).max(1);
     let top_y = area.y;
 
+    // Geometry shared by the tile path and the direct path. The row grid
+    // is anchored absolutely -- row A starts at A * row_span -- so a
+    // baked tile stays valid as the playhead advances; only its blit
+    // offset changes. (The direct path used to interpolate each row's
+    // tick with a float over the screen height; the grid below agrees
+    // with it to well under a pixel row and, unlike it, can be
+    // reproduced for any sub-range of rows.)
+    let (draw_tick, top_tick, span_key, draw_ns, row0) = if is_tick_based {
+        let division = (data.header.division as u32).max(1);
+        let span =
+            (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
+        let row_span = (span / height_px as u32).max(1);
+        let draw_tick = current_tick - current_tick % row_span;
+        (
+            draw_tick,
+            draw_tick.saturating_add(row_span.saturating_mul(height_px as u32)),
+            row_span as u64,
+            0u64,
+            (draw_tick / row_span) as u64,
+        )
+    } else {
+        let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
+        let row_span_ns = (span_ns / height_px as u64).max(1);
+        let draw_ns = playback_position_ns - playback_position_ns % row_span_ns;
+        (
+            ns_to_tick(data, draw_ns),
+            ns_to_tick(data, draw_ns.saturating_add(span_ns)),
+            row_span_ns,
+            draw_ns,
+            draw_ns / row_span_ns,
+        )
+    };
+    let regions = get_keyboard_note_regions(area.width);
+
+    // Tile path: blit pre-rasterized tiles when they cover the view.
+    // Falls through to the direct path while any visible tile is still
+    // baking, or when the view spans more tiles than the cache holds.
+    let frontier = chunk.scan_frontier_tick.load(Ordering::SeqCst);
+    let tile_key = TileKey {
+        generation: chunk.generation.load(Ordering::SeqCst),
+        span_key,
+        is_tick_based,
+        width_px: area.width.ceil().max(1.0) as u32,
+    };
+    if tile_frame(&tile_key, row0, height_px, &area, &regions, data, chunk, frontier) {
+        return;
+    }
+
     // The tick at each pixel row's top edge; row 0 is the top of the view (furthest
     // future) and row `height_px` is the playhead, so this is non-increasing. Row r
     // therefore covers ticks [row_tick[r + 1], row_tick[r]].
@@ -1730,46 +2548,26 @@ pub fn draw_piano_roll_chunk(
         // can reuse the cached columns (see `cache_key` below) instead of
         // re-rasterizing all 128 columns every frame. The picture lags the
         // true playhead by less than one row -- under a pixel.
-        let (draw_tick, top_tick) = if is_tick_based {
-            let division = (data.header.division as u32).max(1);
-            let span =
-                (((division * VISIBLE_SPAN_QUARTERS) as f32 / speed * height_scale) as u32).max(1);
-            let row_span = (span / height_px as u32).max(1);
-            let draw_tick = current_tick - current_tick % row_span;
+        // Row boundaries on the same absolute grid the tiles use: row
+        // r's top edge is (height_px - r) rows above the snapped
+        // playhead, so this path and the tile path agree pixel for pixel.
+        if is_tick_based {
+            let row_span = span_key as u32;
             for (r, slot) in row_tick.iter_mut().enumerate() {
-                let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
-                *slot = if r == height_px {
-                    draw_tick
-                } else {
-                    draw_tick.saturating_add((progress * span as f32) as u32)
-                };
+                *slot = draw_tick.saturating_add(((height_px - r) as u32).saturating_mul(row_span));
             }
-            (draw_tick, draw_tick.saturating_add(span))
         } else {
-            let span_ns = (VISIBLE_SPAN_NS as f32 / speed * height_scale).max(1.0) as u64;
-            let row_span_ns = (span_ns / height_px as u64).max(1);
-            let draw_ns = playback_position_ns - playback_position_ns % row_span_ns;
             for (r, slot) in row_tick.iter_mut().enumerate() {
-                let progress = (1.0 - r as f32 / height_px as f32).clamp(0.0, 1.0);
-                let ns = if r == height_px {
-                    draw_ns
-                } else {
-                    draw_ns.saturating_add((progress * span_ns as f32) as u64)
-                };
+                let ns = draw_ns.saturating_add(((height_px - r) as u64).saturating_mul(span_key));
                 *slot = ns_to_tick(data, ns);
             }
-            (
-                ns_to_tick(data, draw_ns),
-                ns_to_tick(data, draw_ns.saturating_add(span_ns)),
-            )
-        };
+        }
 
         // Reveal only up to the scan frontier; notes above it are not generated yet.
         let effective_top = top_tick
             .min(chunk.scan_frontier_tick.load(Ordering::SeqCst))
             .max(draw_tick);
 
-        let regions = get_keyboard_note_regions(area.width);
 
         // All 128 columns, back to back. Packed color per pixel: 0 = empty, else
         // (1<<24) | rgb. `owners` runs alongside so the emit pass can separate two
