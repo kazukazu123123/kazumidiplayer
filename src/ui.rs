@@ -698,8 +698,6 @@ pub fn draw_settings_overlay(
     midi_ev_mode_combo: &mut ComboBoxState,
     parse_threads: &mut u32,
     parse_threads_slider: &mut NumericSliderState,
-    scan_delay_ms: &mut u32,
-    scan_delay_slider: &mut NumericSliderState,
     show_stats: &mut bool,
     show_stats_animation: f32,
 ) -> bool {
@@ -1580,47 +1578,6 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *show_stats = !*show_stats;
-                }
-            }
-
-            // Scan Delay slider (debug): artificially slow the piano-roll scan.
-            {
-                let y = layout.next(52.0);
-                tips.push((
-                    Rectangle::new(column_x, sy(y), column_width, 52.0),
-                    "Debug: slows the piano roll's note scan on purpose to test lag.",
-                ));
-                if is_visible(sy(y), 52.0) {
-                    let input = NumericSliderInput {
-                        click_pos,
-                        mouse_pos: mouse_world_pos,
-                        mouse_down: is_mouse_down,
-                        wheel: mouse_wheel,
-                        shift: numeric_shift,
-                        control: numeric_control,
-                        typed: numeric_typed.clone(),
-                        backspace: numeric_backspace,
-                        delete: numeric_delete,
-                        left: numeric_left,
-                        right: numeric_right,
-                        home: numeric_home,
-                        end: numeric_end,
-                        enter: numeric_enter,
-                        escape: numeric_escape,
-                    };
-                    wheel_consumed |= draw_u32_numeric_slider(
-                        &mut d_scissor,
-                        Rectangle::new(column_x, sy(y), column_width, 52.0),
-                        "Scan Delay (ms)",
-                        scan_delay_ms,
-                        0,
-                        1000,
-                        scan_delay_slider,
-                        &input,
-                        eased_t,
-                        true,
-                        None,
-                    );
                 }
             }
 

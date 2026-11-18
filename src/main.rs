@@ -650,9 +650,6 @@ fn main() {
 
         let wheel = rl.get_mouse_wheel_move();
 
-        // Push the debug scan-delay knob to the worker.
-        piano_roll_worker.set_scan_delay_ms(app_state.scan_delay_ms);
-
         // Refresh the keyboard hit texture from the notes sounding at the current
         // playback tick (position-based, derived from the piano-roll chunk). This
         // behaves identically during play, pause and stop, and handles overlapping
@@ -1609,8 +1606,6 @@ fn main() {
                             &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,
                             &mut app_state.settings_parse_threads_slider,
-                            &mut app_state.scan_delay_ms,
-                            &mut app_state.settings_scan_delay_slider,
                             &mut app_state.show_stats,
                             app_state.show_stats_animation,
                         ) {

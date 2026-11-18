@@ -91,8 +91,6 @@ pub struct AppState {
     /// Piano-roll scroll speed multiplier (higher = notes move faster, shorter
     /// visible window). Adjusted with the mouse wheel over the piano roll.
     pub note_speed: f32,
-    /// Debug: artificial piano-roll scan delay in milliseconds (slider-controlled).
-    pub scan_delay_ms: u32,
     /// Playback speed multiplier (0.05 to 4.0, slider-controlled; 1.0 = normal).
     pub playback_speed: f32,
     /// Worker threads kazumidiparser uses to parse a file (1..=cpu_threads()).
@@ -170,7 +168,6 @@ pub struct AppState {
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
-    pub settings_scan_delay_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_parse_threads_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub speed_slider_dragging: bool,
 
@@ -234,7 +231,6 @@ impl AppState {
             parse_toast: None,
             is_tick_based: false,
             note_speed: 1.0,
-            scan_delay_ms: 0,
             playback_speed: 1.0,
             parse_threads: cpu_threads(),
             show_stats: true,
@@ -298,7 +294,6 @@ impl AppState {
             settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_buffer_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
-            settings_scan_delay_slider: Default::default(),
             settings_parse_threads_slider: Default::default(),
             speed_slider_dragging: false,
 

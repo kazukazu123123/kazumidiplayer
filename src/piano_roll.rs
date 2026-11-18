@@ -946,9 +946,6 @@ pub struct PianoRollWorker {
     /// Bumped on every `regenerate`; the running scan compares against it and
     /// bails when superseded.
     latest_generation: Arc<AtomicU64>,
-    /// Debug knob: per-tick scan delay in milliseconds. The scan pauses this long
-    /// each time it crosses to a new tick, so a slow scan is observable.
-    scan_delay_ms: Arc<AtomicU32>,
     /// How far ahead of playback the scan is allowed to run. The scan idles once
     /// its frontier reaches this and resumes when the main loop raises it, which is
     /// what keeps the resident window (and thus memory) bounded.
@@ -978,14 +975,12 @@ impl PianoRollWorker {
         ];
         let live = Arc::new(AtomicUsize::new(0));
         let latest_generation = Arc::new(AtomicU64::new(0));
-        let scan_delay_ms = Arc::new(AtomicU32::new(0));
         let target_tick = Arc::new(AtomicU32::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let chunks_for_thread = chunks.clone();
         let live_for_thread = live.clone();
         let latest_for_thread = latest_generation.clone();
-        let scan_delay_for_thread = scan_delay_ms.clone();
         let target_for_thread = target_tick.clone();
         let shutdown_for_thread = shutdown.clone();
 
@@ -1035,7 +1030,6 @@ impl PianoRollWorker {
                     &chunks_for_thread,
                     req.build_slot,
                     &live_for_thread,
-                    &scan_delay_for_thread,
                     &target_for_thread,
                     &shutdown_for_thread,
                 );
@@ -1048,7 +1042,6 @@ impl PianoRollWorker {
             chunks,
             live,
             latest_generation,
-            scan_delay_ms,
             target_tick,
             shutdown,
         }
@@ -1068,10 +1061,6 @@ impl PianoRollWorker {
             }
             chunk.readers.fetch_sub(1, Ordering::SeqCst);
         }
-    }
-
-    pub fn set_scan_delay_ms(&self, ms: u32) {
-        self.scan_delay_ms.store(ms, Ordering::Relaxed);
     }
 
     /// Set the lookahead ceiling. Call every frame with the topmost visible tick
@@ -1374,7 +1363,6 @@ fn run_scan(
     chunks: &[Arc<RollChunk>; 2],
     build_slot: usize,
     live: &AtomicUsize,
-    scan_delay: &AtomicU32,
     target: &AtomicU32,
     shutdown: &AtomicBool,
 ) {
@@ -1887,51 +1875,26 @@ fn run_scan(
                 }
                 last_tick = tick;
             } else {
-                // Above the visible window: stream the rest. The debug scan delay
-                // (per-tick crawl) only applies here, off-screen.
-                let delay = scan_delay.load(Ordering::Relaxed);
-                if delay > 0 {
-                    let sleep = Duration::from_millis(delay as u64);
-                    while last_tick < tick {
-                        last_tick += 1;
-                        if !publish(
-                            &mut batch,
-                            &mut staged,
-                            &mut patches,
-                            &mut patch_count,
-                            last_tick,
-                        ) {
-                            return;
-                        }
-                        if latest.load(Ordering::SeqCst) != generation
-                            || shutdown.load(Ordering::Relaxed)
-                        {
-                            return;
-                        }
-                        thread::sleep(sleep);
+                // Above the visible window: stream the rest. Publish only at tick
+                // boundaries, throttled by accumulated events.
+                if events_since_publish >= 2048 {
+                    events_since_publish = 0;
+                    if !publish(
+                        &mut batch,
+                        &mut staged,
+                        &mut patches,
+                        &mut patch_count,
+                        last_tick,
+                    ) {
+                        return;
                     }
-                } else {
-                    // Publish only at tick boundaries, throttled by accumulated
-                    // events.
-                    if events_since_publish >= 2048 {
-                        events_since_publish = 0;
-                        if !publish(
-                            &mut batch,
-                            &mut staged,
-                            &mut patches,
-                            &mut patch_count,
-                            last_tick,
-                        ) {
-                            return;
-                        }
-                        if latest.load(Ordering::SeqCst) != generation
-                            || shutdown.load(Ordering::Relaxed)
-                        {
-                            return;
-                        }
+                    if latest.load(Ordering::SeqCst) != generation
+                        || shutdown.load(Ordering::Relaxed)
+                    {
+                        return;
                     }
-                    last_tick = tick;
                 }
+                last_tick = tick;
             }
         }
 
