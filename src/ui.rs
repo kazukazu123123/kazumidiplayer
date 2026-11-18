@@ -483,6 +483,7 @@ pub fn draw_parse_toast(
     progress: &Option<crate::midi_parser_worker::ParseProgress>,
     parse_bps: f64,
     parse_eps: f64,
+    parse_duration: std::time::Duration,
 ) {
     const MARGIN: f32 = 16.0;
 
@@ -514,7 +515,11 @@ pub fn draw_parse_toast(
         zoom: 1.0,
     };
 
-    draw_loading_panel(d, camera, alpha, "Loaded!", progress, parse_bps, parse_eps);
+    let title = format!(
+        "Loaded! ({})",
+        crate::utils::format_parse_duration(parse_duration)
+    );
+    draw_loading_panel(d, camera, alpha, &title, progress, parse_bps, parse_eps);
 }
 
 /// Seconds the mouse rests on a settings row before its tooltip shows.

@@ -1712,6 +1712,7 @@ fn main() {
                 &toast.progress,
                 toast.parse_bps,
                 toast.parse_eps,
+                toast.parse_duration,
             );
         }
 

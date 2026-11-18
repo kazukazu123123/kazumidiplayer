@@ -25,6 +25,8 @@ pub fn cpu_threads() -> u32 {
 /// numbers, swings out to the bottom-right corner, lingers, then fades away.
 pub struct ParseToast {
     pub elapsed: f32,
+    /// How long the finished parse took, measured around the parser call itself.
+    pub parse_duration: std::time::Duration,
     /// The last progress snapshot of the finished parse, so the toast keeps showing the
     /// file's real totals after `current_progress` has been cleared.
     pub progress: Option<ParseProgress>,
@@ -344,12 +346,13 @@ impl AppState {
                 self.is_loading = false;
                 self.reset_parse_progress();
             }
-            PlayerFeedback::Loaded(path) => {
+            PlayerFeedback::Loaded(path, parse_duration) => {
                 self.is_loading = false;
                 // Snapshot the final numbers before they are cleared: the toast carries the
                 // panel out of the screen still showing them.
                 self.parse_toast = Some(ParseToast {
                     elapsed: 0.0,
+                    parse_duration,
                     progress: self.current_progress,
                     parse_bps: self.parse_bps,
                     parse_eps: self.parse_eps,

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// A parse-progress snapshot: tracks done and a live per-event count, which is
 /// approximate while tracks are in flight and exact once parsing ends.
@@ -13,7 +14,7 @@ pub enum ParserCommand {
 }
 
 pub enum ParserFeedbackCommand {
-    ParseComplete(Arc<MIDIPlayerData>, String, kazumidiparser::CancelToken),
+    ParseComplete(Arc<MIDIPlayerData>, String, kazumidiparser::CancelToken, Duration),
     ParseCancelled(kazumidiparser::CancelToken),
     ParseFailed(String, kazumidiparser::CancelToken),
     Progress(ParseProgress),
@@ -55,18 +56,21 @@ impl MIDIParserWorker {
                                 let _ = tx_for_progress.send(ParserFeedbackCommand::Progress(p));
                             };
 
+                            let parse_started = Instant::now();
                             let parse_result = MIDIPlayerData::parse(
                                 &path,
                                 threads,
                                 Some(&mut on_progress),
                                 Some(&token_clone),
                             );
+                            let parse_duration = parse_started.elapsed();
                             match parse_result {
                                 Ok(data) => {
                                     let _ = tx_feedback.send(ParserFeedbackCommand::ParseComplete(
                                         Arc::new(data),
                                         path,
                                         token_clone,
+                                        parse_duration,
                                     ));
                                 }
                                 Err(kazumidiparser::Error::Cancelled) => {

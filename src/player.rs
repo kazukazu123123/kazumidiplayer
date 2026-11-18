@@ -55,7 +55,7 @@ pub enum PlayerCommand {
 }
 
 pub enum PlayerFeedback {
-    Loaded(String),
+    Loaded(String, std::time::Duration),
     Progress(crate::midi_parser_worker::ParseProgress),
 
     ParseFailed(String),
@@ -544,7 +544,7 @@ impl PlayerHandle {
 
                 while let Ok(feedback_cmd) = rx_parser_feedback.try_recv() {
                     match feedback_cmd {
-                        ParserFeedbackCommand::ParseComplete(data, path, token) => {
+                        ParserFeedbackCommand::ParseComplete(data, path, token, parse_duration) => {
                             let is_current = {
                                 let mut current_token_guard =
                                     lock_mutex(&current_parse_cancellation_token_clone);
@@ -582,7 +582,7 @@ impl PlayerHandle {
                             position_clone.store(player.seek_position_ns, Ordering::SeqCst);
                             state_clone.store(player.state as u32, Ordering::SeqCst);
 
-                            let _ = tx_main_feedback_for_thread.send(PlayerFeedback::Loaded(path));
+                            let _ = tx_main_feedback_for_thread.send(PlayerFeedback::Loaded(path, parse_duration));
                         }
                         ParserFeedbackCommand::ParseCancelled(token) => {
                             let is_current = {

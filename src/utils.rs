@@ -135,6 +135,21 @@ pub fn format_time(ns: u64) -> String {
     }
 }
 
+/// `1m 05.250s`, or `5.250s` under a minute: a parse duration split into minutes,
+/// seconds and milliseconds, so a long black-MIDI parse does not surface as one
+/// bare millisecond count.
+pub fn format_parse_duration(duration: std::time::Duration) -> String {
+    let total_ms = duration.as_millis() as u64;
+    let minutes = total_ms / 60_000;
+    let seconds = (total_ms % 60_000) / 1_000;
+    let millis = total_ms % 1_000;
+    if minutes > 0 {
+        format!("{}m {:02}.{:03}s", minutes, seconds, millis)
+    } else {
+        format!("{}.{:03}s", seconds, millis)
+    }
+}
+
 /// Group a count into thousands, e.g. `1234567` -> `1,234,567`.
 pub fn format_count(n: u64) -> String {
     let digits = n.to_string();
