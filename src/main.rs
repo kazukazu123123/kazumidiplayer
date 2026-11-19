@@ -1269,13 +1269,13 @@ fn main() {
                             format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
                         };
                         let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
-                        lines.push(format!("BUF   {} / {}", mss(buffered_ns), mss(max_ns)));
+                        lines.push(format!("AUDIO BUF {} / {}", mss(buffered_ns), mss(max_ns)));
                     }
                     if let Some((used, _, compressed)) = engine.buffer_memory() {
                         if compressed {
-                            lines.push(format!("BUF MEM {}", utils::format_bytes(used)));
+                            lines.push(format!("AUDIO BUF {}", utils::format_bytes(used)));
                         } else {
-                            lines.push(format!("BUF MEM {} (PCM)", utils::format_bytes(used)));
+                            lines.push(format!("AUDIO BUF {} (PCM)", utils::format_bytes(used)));
                         }
                     }
                     let font_size = 18;
