@@ -1,10 +1,11 @@
+[Reading 139 lines from start (total: 139 lines, 0 remaining)]
+
 name: Build and publish release
 
 # On every push to main (except automated submodule bumps) and on manual
 # dispatch: builds Windows, Linux and macOS (universal) binaries and
-# publishes them to kazukazu123123/kazumidiplayer-releases, which keeps
-# only the newest release. Publishing uses a fine-grained PAT scoped to
-# that repository only (secret RELEASES_PAT).
+# publishes them as a release of this repository, which keeps only the
+# newest release. Publishing uses the workflow's own GITHUB_TOKEN.
 
 on:
   push:
@@ -115,6 +116,8 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Check out kazumidiplayer (for the commit message)
         uses: actions/checkout@v4
@@ -125,15 +128,15 @@ jobs:
           merge-multiple: true
       - name: Create release and prune old ones
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
         run: |
           SHORT="$(printf '%s' "$SHA" | cut -c1-7)"
           git log -1 --format=%B > notes.txt
-          gh release delete "$SHORT" --repo kazukazu123123/kazumidiplayer-releases --cleanup-tag --yes || true
-          gh release create "$SHORT" --repo kazukazu123123/kazumidiplayer-releases --title "KazuMIDIPlayer $SHORT" --notes-file notes.txt dist/kazumidiplayer-windows-x64.exe dist/kazumidiplayer-linux-x64 dist/kazumidiplayer-macos-universal
-          gh release list --repo kazukazu123123/kazumidiplayer-releases --json tagName --jq '.[].tagName' | while read -r tag; do
+          gh release delete "$SHORT" --repo kazukazu123123/kazumidiplayer --cleanup-tag --yes || true
+          gh release create "$SHORT" --repo kazukazu123123/kazumidiplayer --title "KazuMIDIPlayer $SHORT" --notes-file notes.txt dist/kazumidiplayer-windows-x64.exe dist/kazumidiplayer-linux-x64 dist/kazumidiplayer-macos-universal
+          gh release list --repo kazukazu123123/kazumidiplayer --json tagName --jq '.[].tagName' | while read -r tag; do
             if [ "$tag" != "$SHORT" ]; then
-              gh release delete "$tag" --repo kazukazu123123/kazumidiplayer-releases --cleanup-tag --yes
+              gh release delete "$tag" --repo kazukazu123123/kazumidiplayer --cleanup-tag --yes
             fi
           done
