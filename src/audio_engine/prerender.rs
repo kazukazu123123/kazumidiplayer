@@ -15,6 +15,10 @@
 //! Anything that changes what lies ahead (seek, speed, new file, shrinking
 //! the buffer) bumps a generation: buffered audio is dropped and
 //! rendering restarts from the current position.
+//!
+//! The buffered audio itself is stored Opus-compressed at the rates Opus
+//! supports (see [`AudioQueue`]), which cuts its memory by an order of
+//! magnitude; other rates keep raw PCM.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -22,6 +26,7 @@ use std::thread;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 
 use crate::kazumidiparser_cursor::{
     TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, tick_to_ns,
@@ -133,8 +138,8 @@ struct State {
     base_ns: u64,
     speed: f32,
     max_frames: usize,
-    /// Rendered, not yet played (left, right).
-    ring: VecDeque<(f32, f32)>,
+    /// Rendered, not yet played.
+    ring: AudioQueue,
     /// Frames of this generation the device has played, including silence
     /// output on underrun (playback does not wait for rendering).
     played: u64,
@@ -199,10 +204,10 @@ impl State {
         let Some(ahead) = target.checked_sub(self.played) else {
             return false;
         };
-        if ahead as usize >= self.ring.len() {
+        if ahead as usize >= self.ring.frames() {
             return false;
         }
-        self.ring.drain(..ahead as usize);
+        self.ring.skip_frames(ahead as usize);
         self.played = target;
         self.epoch += 1;
         self.stash_frames = 0;
@@ -210,16 +215,368 @@ impl State {
     }
 }
 
-/// Size the ring's allocation to the maximum buffer, so growing never
-/// overshoots it (a `VecDeque` doubles) and a smaller one gives memory back.
-/// It may exceed the maximum by up to one chunk.
-fn fit_ring(s: &mut State) {
-    let frames = s.max_frames + CHUNK_FRAMES;
-    if s.ring.capacity() > frames {
-        s.ring.shrink_to(frames);
-    } else {
-        let extra = frames - s.ring.len();
-        s.ring.reserve_exact(extra);
+/// Delay of the Opus round trip, in frames, at each rate Opus supports.
+/// Measured by encoding an impulse after a second of silence and locating
+/// it in the decoded stream; the values were identical at 128 and
+/// 256 kbit/s. The decoded stream is the input shifted by this many
+/// frames, so the queue discards that many frames at the start of a
+/// stream and decoded frames line up with the frames that were pushed.
+/// (The last frames of a stream stay inside the codec until that much
+/// more audio is pushed, which rendering ahead always does.)
+/// `opus_roundtrip_is_aligned` in the tests re-measures this.
+fn codec_delay(rate: u32) -> usize {
+    match rate {
+        8_000 => 52,
+        12_000 => 78,
+        16_000 => 104,
+        24_000 => 60,
+        _ => 120, // 48_000
+    }
+}
+
+/// Bit rate the buffered audio is encoded at.
+const OPUS_BITRATE_BPS: i32 = 256_000;
+
+/// One encoded packet and the PCM frames it decodes to.
+struct Packet {
+    data: Vec<u8>,
+    frames: usize,
+}
+
+/// Opus-backed storage: encoded packets plus one decoded packet.
+struct OpusStore {
+    rate: u32,
+    encoder: OpusEncoder,
+    decoder: OpusDecoder,
+    /// Frames per packet (20 ms).
+    packet_frames: usize,
+    /// Pushed PCM not yet filling a whole packet.
+    pending: Vec<(f32, f32)>,
+    packets: VecDeque<Packet>,
+    /// Total frames and bytes held in `packets`.
+    packet_frames_total: usize,
+    packet_bytes: usize,
+    /// Decoded frames not yet consumed, oldest first.
+    window: VecDeque<(f32, f32)>,
+    /// Stream-start frames still to discard (the codec delay).
+    delay_left: usize,
+    /// Scratch buffers, reused so decoding allocates nothing.
+    encode_in: Vec<f32>,
+    packet_out: Vec<u8>,
+    decode_out: Vec<f32>,
+}
+
+impl OpusStore {
+    fn new(rate: u32) -> Option<Self> {
+        let mut encoder = OpusEncoder::new(rate as i32, 2, Application::Audio).ok()?;
+        encoder.bitrate_bps = OPUS_BITRATE_BPS;
+        let decoder = OpusDecoder::new(rate as i32, 2).ok()?;
+        let packet_frames = (rate / 50) as usize;
+        Some(Self {
+            rate,
+            encoder,
+            decoder,
+            packet_frames,
+            pending: Vec::with_capacity(packet_frames * 2),
+            packets: VecDeque::new(),
+            packet_frames_total: 0,
+            packet_bytes: 0,
+            window: VecDeque::new(),
+            delay_left: codec_delay(rate),
+            encode_in: vec![0.0; packet_frames * 2],
+            packet_out: vec![0u8; 16_384],
+            decode_out: vec![0.0; packet_frames * 2],
+        })
+    }
+
+    /// Drop everything and restart the codec stream.
+    fn reset(&mut self) {
+        if let Ok(mut encoder) = OpusEncoder::new(self.rate as i32, 2, Application::Audio) {
+            encoder.bitrate_bps = OPUS_BITRATE_BPS;
+            self.encoder = encoder;
+        }
+        if let Ok(decoder) = OpusDecoder::new(self.rate as i32, 2) {
+            self.decoder = decoder;
+        }
+        self.pending.clear();
+        self.packets.clear();
+        self.packet_frames_total = 0;
+        self.packet_bytes = 0;
+        self.window.clear();
+        self.delay_left = codec_delay(self.rate);
+    }
+
+    fn push_interleaved(&mut self, samples: &[f32]) {
+        self.pending
+            .extend(samples.chunks_exact(2).map(|lr| (lr[0], lr[1])));
+        while self.pending.len() >= self.packet_frames {
+            for (i, (l, r)) in self.pending.drain(..self.packet_frames).enumerate() {
+                self.encode_in[i * 2] = l;
+                self.encode_in[i * 2 + 1] = r;
+            }
+            let frames = self.packet_frames;
+            match self.encoder.encode(&self.encode_in, frames, &mut self.packet_out) {
+                Ok(len) => {
+                    let data = self.packet_out[..len].to_vec();
+                    self.packet_bytes += data.len();
+                    self.packet_frames_total += frames;
+                    self.packets.push_back(Packet { data, frames });
+                }
+                Err(e) => {
+                    // Not expected (the arguments are fixed and the
+                    // output buffer is generous): put the frames back
+                    // and retry on the next push, so counts stay exact.
+                    eprintln!("[WARN] Opus encode failed: {e}");
+                    let back: Vec<(f32, f32)> = self.encode_in
+                        .chunks_exact(2)
+                        .map(|lr| (lr[0], lr[1]))
+                        .collect();
+                    self.pending.splice(0..0, back);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Decode the oldest packet into the window (unless it already holds
+    /// frames or no packet is left), discarding the codec delay at the
+    /// start of a stream.
+    fn fill_window(&mut self) {
+        if !self.window.is_empty() {
+            return;
+        }
+        let Some(packet) = self.packets.pop_front() else {
+            return;
+        };
+        self.packet_bytes -= packet.data.len();
+        self.packet_frames_total -= packet.frames;
+        let got = self
+            .decoder
+            .decode(&packet.data, packet.frames, &mut self.decode_out)
+            .unwrap_or(0)
+            .min(packet.frames);
+        let skip = self.delay_left.min(got);
+        self.delay_left -= skip;
+        self.window.extend(
+            self.decode_out[skip * 2..got * 2]
+                .chunks_exact(2)
+                .map(|lr| (lr[0], lr[1])),
+        );
+        // A short decode (a corrupt packet, which self-encoded data
+        // never is) pads with silence so frame counts stay exact.
+        for _ in got..packet.frames {
+            self.window.push_back((0.0, 0.0));
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<(f32, f32)> {
+        self.fill_window();
+        self.window.pop_front()
+    }
+
+    fn ready_frames(&self) -> usize {
+        self.window.len() + self.packet_frames_total
+    }
+
+    /// Drop `n` frames from the front (a seek inside the buffer).
+    fn skip_frames(&mut self, mut n: usize) {
+        let from_window = n.min(self.window.len());
+        self.window.drain(..from_window);
+        n -= from_window;
+        // Whole packets go without decoding; the last one dropped warms
+        // the decoder for whatever is decoded next, so its first frames
+        // are not decoded cold.
+        let mut last_dropped: Option<Packet> = None;
+        while n > 0 {
+            let Some(front) = self.packets.front() else {
+                break;
+            };
+            if front.frames > n {
+                break;
+            }
+            let packet = self.packets.pop_front().unwrap();
+            self.packet_bytes -= packet.data.len();
+            self.packet_frames_total -= packet.frames;
+            n -= packet.frames;
+            last_dropped = Some(packet);
+        }
+        if let Some(warm) = last_dropped {
+            // Mid-stream now: the stream-start delay no longer applies.
+            self.delay_left = 0;
+            let _ = self
+                .decoder
+                .decode(&warm.data, warm.frames, &mut self.decode_out);
+        }
+        if n > 0 && !self.packets.is_empty() {
+            self.fill_window();
+            let from_window = n.min(self.window.len());
+            self.window.drain(..from_window);
+            n -= from_window;
+        }
+        if n > 0 {
+            // The skip lands in the not-yet-encoded tail; dropping raw
+            // PCM is exact.
+            let from_pending = n.min(self.pending.len());
+            self.pending.drain(..from_pending);
+            n -= from_pending;
+        }
+        debug_assert_eq!(n, 0);
+    }
+
+    fn memory_bytes(&self) -> u64 {
+        self.packet_bytes as u64
+            + (self.window.len() + self.pending.len()) as u64 * BYTES_PER_FRAME
+    }
+}
+
+/// The prerender buffer's audio storage. At rates Opus supports the
+/// audio is kept as Opus packets (see [`OpusStore`]) and decoded a
+/// packet at a time as the callback consumes it; at other rates it is
+/// raw PCM. Either way it behaves as a frame queue: the render thread
+/// pushes rendered chunks, the callback pops frames, and seeks skip
+/// forward inside it.
+struct AudioQueue {
+    store: Store,
+    /// Buffered frames (pushed, not yet popped or skipped).
+    frames: usize,
+    /// Generation frame index of the oldest buffered frame, and of the
+    /// frame one past the newest. Playback can run ahead of both over
+    /// silence (see `drop_before`).
+    head: u64,
+    tail: u64,
+}
+
+enum Store {
+    Pcm(VecDeque<(f32, f32)>),
+    Opus(Box<OpusStore>),
+}
+
+impl AudioQueue {
+    fn new(rate: u32) -> Self {
+        let store = match OpusStore::new(rate) {
+            Some(store) => Store::Opus(Box::new(store)),
+            None => Store::Pcm(VecDeque::new()),
+        };
+        Self {
+            store,
+            frames: 0,
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_pcm(frames: &[(f32, f32)]) -> Self {
+        let mut queue = Self {
+            store: Store::Pcm(VecDeque::new()),
+            frames: 0,
+            head: 0,
+            tail: 0,
+        };
+        let interleaved: Vec<f32> = frames.iter().flat_map(|&(l, r)| [l, r]).collect();
+        queue.push_interleaved(&interleaved);
+        queue
+    }
+
+    fn frames(&self) -> usize {
+        self.frames
+    }
+
+    /// Frames the callback can take right now (everything except the
+    /// not-yet-encoded tail of an Opus stream).
+    fn ready_frames(&self) -> usize {
+        match &self.store {
+            Store::Pcm(_) => self.frames,
+            Store::Opus(store) => store.ready_frames(),
+        }
+    }
+
+    fn push_interleaved(&mut self, samples: &[f32]) {
+        let pushed = samples.len() / 2;
+        match &mut self.store {
+            Store::Pcm(deque) => {
+                deque.extend(samples.chunks_exact(2).map(|lr| (lr[0], lr[1])))
+            }
+            Store::Opus(store) => store.push_interleaved(samples),
+        }
+        self.frames += pushed;
+        self.tail += pushed as u64;
+    }
+
+    fn pop_front(&mut self) -> Option<(f32, f32)> {
+        let frame = match &mut self.store {
+            Store::Pcm(deque) => deque.pop_front(),
+            Store::Opus(store) => store.pop_front(),
+        };
+        if frame.is_some() {
+            self.frames -= 1;
+            self.head += 1;
+        }
+        frame
+    }
+
+    /// Drop `n` frames from the front (a seek inside the buffer).
+    fn skip_frames(&mut self, n: usize) {
+        debug_assert!(n <= self.frames);
+        match &mut self.store {
+            Store::Pcm(deque) => {
+                deque.drain(..n);
+            }
+            Store::Opus(store) => store.skip_frames(n),
+        }
+        self.frames -= n;
+        self.head += n as u64;
+    }
+
+    /// Playback advanced to `played` (over silence, on underrun) while
+    /// the render thread was busy: drop the buffered frames it passed.
+    /// With raw PCM the callback has always drained the queue before
+    /// counting silence, so this is a no-op there; the not-yet-encoded
+    /// tail of an Opus stream is what makes it necessary.
+    fn drop_before(&mut self, played: u64) {
+        if played <= self.head {
+            return;
+        }
+        if played >= self.tail {
+            self.clear();
+            self.head = played;
+            self.tail = played;
+            return;
+        }
+        self.skip_frames((played - self.head) as usize);
+    }
+
+    fn clear(&mut self) {
+        match &mut self.store {
+            Store::Pcm(deque) => deque.clear(),
+            Store::Opus(store) => store.reset(),
+        }
+        self.frames = 0;
+        self.head = 0;
+        self.tail = 0;
+    }
+
+    fn memory_bytes(&self) -> u64 {
+        match &self.store {
+            Store::Pcm(_) => self.frames as u64 * BYTES_PER_FRAME,
+            Store::Opus(store) => store.memory_bytes(),
+        }
+    }
+
+    fn is_compressed(&self) -> bool {
+        matches!(self.store, Store::Opus(_))
+    }
+
+    /// Oldest buffered frame, decoding the head packet if needed.
+    #[cfg(test)]
+    fn front(&mut self) -> Option<(f32, f32)> {
+        match &mut self.store {
+            Store::Pcm(deque) => deque.front().copied(),
+            Store::Opus(store) => {
+                store.fill_window();
+                store.window.front().copied()
+            }
+        }
     }
 }
 
@@ -253,7 +610,7 @@ impl Session {
                 base_ns: 0,
                 speed: 1.0,
                 max_frames: frames_for_secs(DEFAULT_MAX_BUFFER_SECS, rate),
-                ring: VecDeque::new(),
+                ring: AudioQueue::new(rate),
                 played: 0,
                 started: false,
                 latency_frames: 0,
@@ -270,8 +627,6 @@ impl Session {
             wake: Condvar::new(),
             rate,
         });
-        fit_ring(&mut shared.lock());
-
         let (tx_shutdown, rx_shutdown) = std::sync::mpsc::channel::<()>();
         let (tx_ready, rx_ready) = std::sync::mpsc::channel();
         let device_shared = shared.clone();
@@ -400,11 +755,10 @@ impl Session {
         let secs = secs.clamp(MIN_MAX_BUFFER_SECS, MAX_MAX_BUFFER_SECS);
         self.update(|s| {
             s.max_frames = frames_for_secs(secs, rate);
-            if s.ring.len() > s.max_frames {
+            if s.ring.frames() > s.max_frames {
                 s.base_ns = heard_ns(s, rate);
                 restart(s);
             }
-            fit_ring(s);
         });
     }
 
@@ -426,12 +780,18 @@ impl Session {
 
     /// Memory the buffered audio takes, in bytes.
     pub fn memory_bytes(&self) -> u64 {
-        self.shared.lock().ring.len() as u64 * BYTES_PER_FRAME
+        self.shared.lock().ring.memory_bytes()
+    }
+
+    /// Whether the buffered audio is Opus-compressed (`false`: raw PCM,
+    /// at a rate Opus does not support).
+    pub fn compressed(&self) -> bool {
+        self.shared.lock().ring.is_compressed()
     }
 
     /// Rendered audio waiting to be played, in wall-clock nanoseconds.
     pub fn buffered_ns(&self) -> u64 {
-        let frames = self.shared.lock().ring.len() as u64;
+        let frames = self.shared.lock().ring.frames() as u64;
         frames * 1_000_000_000 / self.shared.rate as u64
     }
 }
@@ -745,7 +1105,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                         .collect();
                 }
                 // Also prefill while paused, so play starts from a full buffer.
-                if tracks.is_some() && s.ring.len() < s.max_frames {
+                if tracks.is_some() && s.ring.frames() < s.max_frames {
                     break;
                 }
                 s = shared.wake.wait(s).unwrap_or_else(|e| e.into_inner());
@@ -753,7 +1113,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
             // Thinning arms once this generation has built up its buffer, so
             // the refill after a seek or start keeps every note, or once
             // playback outruns rendering (the buffer may never fill).
-            let buffered = s.ring.len();
+            let buffered = s.ring.frames();
             let arm_frames = s.max_frames.min((THIN_START_SECS * rate as f64) as usize);
             if buffered >= arm_frames {
                 thin_armed = true;
@@ -838,14 +1198,14 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
 
         let mut s = shared.lock();
         if s.generation == generation {
-            // Frames playback already passed while this chunk rendered.
-            let late = (s.played.saturating_sub(chunk_start) as usize).min(CHUNK_FRAMES);
-            s.ring.extend(
-                interleaved[late * 2..]
-                    .chunks_exact(2)
-                    .map(|lr| (lr[0], lr[1])),
-            );
-            s.started = true;
+            // Frames playback already passed while this chunk rendered
+            // (it advances over silence on underrun): drop what it passed
+            // inside the queue too, then append the rest of the chunk.
+            let played = s.played;
+            s.ring.drop_before(played);
+            let late = (played.saturating_sub(chunk_start) as usize).min(CHUNK_FRAMES);
+            s.ring.push_interleaved(&interleaved[late * 2..]);
+            s.started |= s.ring.ready_frames() > 0;
             let start = chunk_start.max(s.played);
             s.voice_marks.push_back((start, voices));
         }
@@ -954,7 +1314,7 @@ fn fill<T: SizedSample + FromSample<f32>>(
         stash.playing = s.playing;
         if s.playing {
             let want = STASH_FRAMES.max(frames).saturating_sub(stash.frames.len());
-            let moved = want.min(s.ring.len());
+            let moved = want.min(s.ring.ready_frames());
             // Frame by frame: no allocation on the audio thread.
             for _ in 0..moved {
                 if let Some(frame) = s.ring.pop_front() {
@@ -1037,7 +1397,7 @@ mod tests {
             base_ns: 0,
             speed: 1.0,
             max_frames: 10,
-            ring: VecDeque::from([(0.0, 0.0); 4]),
+            ring: AudioQueue::from_pcm(&[(0.0, 0.0); 4]),
             played: 7,
             started: true,
             latency_frames: 0,
@@ -1053,7 +1413,7 @@ mod tests {
         };
         restart(&mut state);
         assert_eq!(state.generation, 4);
-        assert!(state.ring.is_empty());
+        assert_eq!(state.ring.frames(), 0);
         assert_eq!(state.played, 0);
     }
 
@@ -1066,9 +1426,11 @@ mod tests {
             base_ns: 0,
             speed: 1.0,
             max_frames: 100,
-            ring: (played..played + ring as u64)
-                .map(|n| (n as f32, n as f32))
-                .collect(),
+            ring: AudioQueue::from_pcm(
+                &(played..played + ring as u64)
+                    .map(|n| (n as f32, n as f32))
+                    .collect::<Vec<_>>(),
+            ),
             played,
             started: true,
             latency_frames: 0,
@@ -1224,7 +1586,7 @@ mod tests {
     fn forward_seek_skips_inside_buffer() {
         let mut s = numbered(50, 40);
         assert!(s.skip_to(70));
-        assert_eq!(s.ring.front(), Some(&(70.0, 70.0)));
+        assert_eq!(s.ring.front(), Some((70.0, 70.0)));
         assert_eq!(s.played, 70);
     }
 
@@ -1233,7 +1595,120 @@ mod tests {
         let mut s = numbered(50, 40);
         assert!(!s.skip_to(49));
         assert!(!s.skip_to(90));
-        assert_eq!((s.played, s.ring.len()), (50, 40));
+        assert_eq!((s.played, s.ring.frames()), (50, 40));
+    }
+
+    #[test]
+    fn opus_roundtrip_is_aligned() {
+        // Impulses over a quiet sine bed, pushed in render-sized chunks:
+        // each impulse must come back within a few frames of where it
+        // was pushed, which pins the codec delay table end to end.
+        for rate in [8_000u32, 12_000, 16_000, 24_000, 48_000] {
+            let mut queue = AudioQueue::new(rate);
+            let total = (rate * 2) as usize;
+            let mut pcm = Vec::with_capacity(total * 2);
+            for i in 0..total {
+                let bed =
+                    (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.05;
+                let impulse = if i > 0 && i % 4096 == 0 { 0.8 } else { 0.0 };
+                pcm.extend([bed + impulse, bed + impulse]);
+            }
+            for chunk in pcm.chunks(256 * 2) {
+                queue.push_interleaved(chunk);
+            }
+            assert_eq!(queue.frames(), total);
+            // One more packet of silence flushes the codec delay, so
+            // every pushed frame can be popped.
+            queue.push_interleaved(&vec![0.0; (rate as usize / 50) * 2]);
+            let mut out = Vec::with_capacity(total);
+            for _ in 0..total {
+                out.push(queue.pop_front().unwrap().0);
+            }
+            for i in (4096..total).step_by(4096) {
+                let (mut best, mut best_at) = (0.0f32, i);
+                for (j, &v) in out.iter().enumerate().take(i + 64).skip(i - 64) {
+                    if v.abs() > best {
+                        best = v.abs();
+                        best_at = j;
+                    }
+                }
+                assert!(
+                    best > 0.15 && best_at.abs_diff(i) <= 6,
+                    "rate {rate}: impulse at {i}, peak {best} at {best_at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opus_skip_lands_on_the_right_segment() {
+        let mut queue = AudioQueue::new(48_000);
+        let mut pcm = Vec::new();
+        for i in 0..9_600 {
+            let freq = if i < 4_800 { 440.0 } else { 880.0 };
+            let v = (i as f32 * freq * std::f32::consts::TAU / 48_000.0).sin() * 0.3;
+            pcm.extend([v, v]);
+        }
+        for chunk in pcm.chunks(256 * 2) {
+            queue.push_interleaved(chunk);
+        }
+        assert_eq!(queue.frames(), 9_600);
+        queue.skip_frames(4_800);
+        assert_eq!(queue.frames(), 4_800);
+        // Skip the landing transient, then count zero crossings of what
+        // follows: 20 ms of the 880 Hz segment crosses about twice as
+        // often as the 440 Hz one would.
+        for _ in 0..480 {
+            queue.pop_front();
+        }
+        let mut prev = queue.pop_front().unwrap().0;
+        let mut crossings = 0;
+        for _ in 0..960 {
+            let v = queue.pop_front().unwrap().0;
+            if (prev < 0.0) != (v < 0.0) {
+                crossings += 1;
+            }
+            prev = v;
+        }
+        assert!(
+            crossings >= 26,
+            "expected the 880 Hz segment, {crossings} crossings"
+        );
+    }
+
+    #[test]
+    fn opus_buffer_uses_far_less_memory() {
+        let mut queue = AudioQueue::new(48_000);
+        let total = 480_000; // 10 s
+        let mut pcm = Vec::with_capacity(total * 2);
+        for i in 0..total {
+            let t = i as f32 / 48_000.0;
+            let v = ((t * 220.0 * std::f32::consts::TAU).sin()
+                + (t * 331.0 * std::f32::consts::TAU).sin() * 0.6)
+                * 0.2;
+            pcm.extend([v, v]);
+        }
+        for chunk in pcm.chunks(256 * 2) {
+            queue.push_interleaved(chunk);
+        }
+        assert_eq!(queue.frames(), total);
+        let pcm_bytes = total as u64 * BYTES_PER_FRAME;
+        assert!(
+            queue.memory_bytes() < pcm_bytes / 6,
+            "{} bytes vs {pcm_bytes} raw",
+            queue.memory_bytes()
+        );
+    }
+
+    #[test]
+    fn pcm_fallback_at_unsupported_rate_is_exact() {
+        let mut queue = AudioQueue::new(44_100);
+        queue.push_interleaved(&[0.5, -0.5, 0.25, -0.25]);
+        assert_eq!(queue.frames(), 2);
+        assert_eq!(queue.ready_frames(), 2);
+        assert_eq!(queue.pop_front(), Some((0.5, -0.5)));
+        assert_eq!(queue.pop_front(), Some((0.25, -0.25)));
+        assert_eq!(queue.pop_front(), None);
     }
 }
 

@@ -176,9 +176,11 @@ pub struct PlayerHandle {
     // Note-on velocity a prerender engine drops up to; 0 when not skipping.
     drop_velocity: Arc<AtomicU32>,
     // Prerender buffer allocation in bytes and output rate; `u64::MAX` / 0
-    // for realtime outputs.
+    // for realtime outputs. `buffer_compressed` is false when the buffer
+    // is raw PCM (a rate Opus does not support).
     buffer_memory: Arc<AtomicU64>,
     output_rate: Arc<AtomicU32>,
+    buffer_compressed: Arc<AtomicBool>,
 }
 
 impl Clone for PlayerHandle {
@@ -203,6 +205,7 @@ impl Clone for PlayerHandle {
             drop_velocity: self.drop_velocity.clone(),
             buffer_memory: self.buffer_memory.clone(),
             output_rate: self.output_rate.clone(),
+            buffer_compressed: self.buffer_compressed.clone(),
         }
     }
 }
@@ -238,6 +241,8 @@ impl PlayerHandle {
         let buffer_memory_for_thread = buffer_memory.clone();
         let output_rate = Arc::new(AtomicU32::new(0));
         let output_rate_for_thread = output_rate.clone();
+        let buffer_compressed = Arc::new(AtomicBool::new(false));
+        let buffer_compressed_for_thread = buffer_compressed.clone();
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -973,6 +978,10 @@ impl PlayerHandle {
                     prerender!(player).map_or(0, |p| p.rate()),
                     Ordering::Relaxed,
                 );
+                buffer_compressed_for_thread.store(
+                    prerender!(player).map_or(false, |p| p.compressed()),
+                    Ordering::Relaxed,
+                );
                 *lock_mutex(&pitch_bend_range_clone) = player.channel_pitch_bend_range;
 
                 if player.state != PlayerState::Playing {
@@ -1025,6 +1034,7 @@ impl PlayerHandle {
             drop_velocity,
             buffer_memory,
             output_rate,
+            buffer_compressed,
         }
     }
 
@@ -1111,11 +1121,17 @@ impl PlayerHandle {
         Some(self.drop_velocity.load(Ordering::Relaxed)).filter(|&v| v > 0)
     }
 
-    /// Prerender buffer allocation in bytes and output rate, or `None` for a
-    /// realtime output.
-    pub fn buffer_memory(&self) -> Option<(u64, u32)> {
+    /// Prerender buffer allocation in bytes, output rate and whether the
+    /// buffer is Opus-compressed, or `None` for a realtime output.
+    pub fn buffer_memory(&self) -> Option<(u64, u32, bool)> {
         let bytes = self.buffer_memory.load(Ordering::Relaxed);
-        (bytes != u64::MAX).then(|| (bytes, self.output_rate.load(Ordering::Relaxed)))
+        (bytes != u64::MAX).then(|| {
+            (
+                bytes,
+                self.output_rate.load(Ordering::Relaxed),
+                self.buffer_compressed.load(Ordering::Relaxed),
+            )
+        })
     }
 
     pub fn set_output(&self, stream: Option<OutputStream>) {
