@@ -1,5 +1,3 @@
-[Reading 139 lines from start (total: 139 lines, 0 remaining)]
-
 name: Build and publish release
 
 # On every push to main (except automated submodule bumps) and on manual
