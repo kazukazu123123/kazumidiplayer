@@ -88,7 +88,8 @@ pub fn draw_seek_bar(
         // f64 throughout: an f32 only carries ~7 significant digits, so on a MIDI
         // hours long the nanosecond counts round to millisecond-sized steps and the
         // bar moves in visible jumps.
-        let fill = ((current_position_ns as f64 / duration_ns as f64) * w as f64) as i32;
+        let fill =
+            ((current_position_ns.min(duration_ns) as f64 / duration_ns as f64) * w as f64) as i32;
         d.draw_rectangle(x as i32, y as i32, fill, h as i32, Color::GREEN);
 
         // Check for seek initiation
