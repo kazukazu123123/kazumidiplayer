@@ -369,6 +369,16 @@ impl Session {
         });
     }
 
+    /// Throw away what is buffered and render it again from what is being
+    /// heard, so a change to the synth's own settings is heard right away.
+    pub fn rerender(&self) {
+        let rate = self.shared.rate;
+        self.update(|s| {
+            s.base_ns = heard_ns(s, rate);
+            restart(s);
+        });
+    }
+
     /// Force every channel's pitch bend range to `semitones` (Pitch Bend
     /// Override), or `None` to follow the file. Re-renders what is buffered.
     pub fn set_bend_override(&self, semitones: Option<u8>) {

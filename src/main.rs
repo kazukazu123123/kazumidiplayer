@@ -213,27 +213,10 @@ fn main() {
     let mut current_layout_height = 80;
     let mut last_integrate_keyboard = app_state.integrate_keyboard;
 
-    // Background generator for piano-roll draw data. It streams a sliding window
-    // around the playhead: we raise its lookahead target and retire what playback
-    // has passed every frame, and only regenerate when the window no longer holds
-    // the playhead (new file, or a seek that lands outside it).
-    let mut piano_roll_worker = piano_roll::PianoRollWorker::new();
-    let mut piano_roll_req_data: Option<std::sync::Arc<kazumidiparser::MIDIPlayerData>> = None;
-    // Playhead tick as of the previous frame, used to spot a seek: normal playback
-    // advances by well under a screenful, so a jump backwards or a large jump
-    // forwards means the resident window is stale and must be rebuilt.
-    let mut piano_roll_last_tick = 0u32;
-    // The highest lookahead ceiling this window has ever been given. Notes may exist
-    // anywhere below it, so this is what says whether the window is holding more than
-    // the current zoom needs. How far the scan actually got does not.
-    let mut piano_roll_max_target = 0u32;
-    // note_speed as of the previous frame, and how many frames it has been
-    // unchanged since. The zoom rebuild below is gated on the speed having
-    // settled: during a continuous zoom gesture the target falls steadily, so
-    // any fixed tolerance is crossed mid-gesture, and rebuilding then visibly
-    // restarts the roll while the user is still zooming.
-    let mut piano_roll_last_speed = app_state.note_speed;
-    let mut piano_roll_speed_stable_frames = 0u32;
+    // Piano roll: scans ahead of the playhead on its own threads and hands the
+    // render thread finished windows lock-free (see piano_roll.rs). Seeks, new
+    // files and lookahead are handled inside `update`.
+    let mut piano_roll_worker = piano_roll::PianoRoll::new();
     let mut pitch_bend_window_offset = 0;
     let mut pitch_bend_window_y_offset = 0;
     let mut pitch_bend_spring_position = Vector2::zero();
@@ -431,6 +414,12 @@ fn main() {
         animate_toggle(
             app_state.show_stats,
             &mut app_state.show_stats_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.vsync_enabled,
+            &mut app_state.vsync_animation,
             dt,
             anim_speed,
         );
@@ -661,30 +650,19 @@ fn main() {
                 let parser_data = unsafe { &*data.as_ptr() };
                 let current_tick =
                     kazumidiparser_cursor::ns_to_tick(parser_data, playback_position_ns);
-                piano_roll_worker.with_chunk(|chunk| {
-                    for note in 0..128usize {
-                        let bucket = chunk.notes_by_key[note].lock().unwrap();
-                        // Among notes covering `now` (start <= now < end), pick the
-                        // one with the latest start: that is the note drawn on top in
-                        // the piano roll (later notes overwrite earlier ones), so the
-                        // key shows the same color as the topmost overlapping note.
-                        // The queue front is already the earliest still-live note,
-                        // since passed notes are retired, so no cursor is needed.
-                        // Later notes paint over earlier ones. This lookup is bounded:
-                        // the old forward scan visited every past note on every frame
-                        // and became a major stutter on dense files with sustained notes.
-                        let chosen = bucket.sounding_color_at(current_tick);
-                        drop(bucket);
-                        if let Some(color) = chosen {
-                            let (r, g, b) = utils::get_note_color_by_index(color);
-                            let o = note * 4;
-                            hit_pixels[o] = r;
-                            hit_pixels[o + 1] = g;
-                            hit_pixels[o + 2] = b;
-                            hit_pixels[o + 3] = 255;
-                        }
+                // The note the roll shows at the playhead on each key (the
+                // newest one sounding), so key and roll always agree.
+                let colors = piano_roll_worker.sounding_colors(current_tick);
+                for (note, chosen) in colors.iter().enumerate() {
+                    if let Some(color) = *chosen {
+                        let (r, g, b) = utils::get_note_color_by_index(color);
+                        let o = note * 4;
+                        hit_pixels[o] = r;
+                        hit_pixels[o + 1] = g;
+                        hit_pixels[o + 2] = b;
+                        hit_pixels[o + 3] = 255;
                     }
-                });
+                }
             }
             let _ = keyboard_hit_texture.update_texture(&hit_pixels);
         }
@@ -1022,88 +1000,34 @@ fn main() {
                                         .saturating_add((span / 4).max(margin_floor))
                                         .min(parser_data.max_tick);
 
-                                    // Rebuild the window on a new file, or on a seek that lands
-                                    // outside it: backwards (behind what we already retired) or
-                                    // a forward jump the streaming scan can't just walk into.
-                                    let data_changed = match &piano_roll_req_data {
-                                        Some(d) => !std::sync::Arc::ptr_eq(d, &data),
-                                        None => true,
-                                    };
-                                    let seeked = current_tick < piano_roll_last_tick
-                                        || current_tick > piano_roll_last_tick.saturating_add(span);
-                                    piano_roll_last_tick = current_tick;
-
-                                    // Zooming in shrinks the visible span, leaving notes generated
-                                    // for the old, wider view sitting far above the screen. They
-                                    // can't be trimmed off the back of the queues (the scan
-                                    // addresses notes by absolute index, and dropping the tail
-                                    // would desync it), so rebuild the window instead. That is
-                                    // cheap now that seeking is a binary search.
-                                    //
-                                    // Compare against the ceiling we authorized, not the frontier
-                                    // the scan reached: on a dense MIDI the scan lags well behind
-                                    // its target, so a frontier test would almost never fire and
-                                    // the stale notes would never be freed. The margin keeps a
-                                    // slider drag from rebuilding every frame: half a screenful of
-                                    // stale notes is tolerated, more than that is thrown away.
-                                    if app_state.note_speed != piano_roll_last_speed {
-                                        piano_roll_last_speed = app_state.note_speed;
-                                        piano_roll_speed_stable_frames = 0;
-                                    } else {
-                                        piano_roll_speed_stable_frames =
-                                            piano_roll_speed_stable_frames.saturating_add(1);
-                                    }
-                                    // About half a second of stillness at 60 fps before a
-                                    // zoom rebuild is allowed; see the state declarations.
-                                    let zoomed_in = piano_roll_speed_stable_frames >= 30
-                                        && piano_roll_max_target
-                                            > target.saturating_add((span / 2).max(margin_floor));
-
-                                    if data_changed || seeked || zoomed_in {
-                                        piano_roll_worker.regenerate(
-                                            data.clone(),
-                                            current_tick,
-                                            top_tick,
-                                            // A new file: whatever is on screen belongs to the
-                                            // old one and must go, even though that leaves the
-                                            // roll blank until the scan reaches the first notes.
-                                            data_changed,
-                                        );
-                                        piano_roll_req_data = Some(data.clone());
-                                        // Fresh window: nothing above the new ceiling exists.
-                                        piano_roll_max_target = target;
-                                    }
-                                    piano_roll_max_target = piano_roll_max_target.max(target);
-
-                                    // Let the scan run up to `target`, and drop everything
-                                    // playback has already passed. Together these keep only a
-                                    // sliding window of notes in memory.
-                                    piano_roll_worker.set_target_tick(target);
-                                    piano_roll_worker.retire(current_tick);
+                                    // New file, seek, lookahead and window handoff are
+                                    // all handled here; nothing in it blocks.
+                                    piano_roll_worker.update(
+                                        &data,
+                                        parser_data,
+                                        current_tick,
+                                        top_tick,
+                                        target,
+                                    );
 
                                     let roll_area = Rectangle::new(cx, cy, cw, roll_h);
-                                    // Render every frame from the (possibly still
-                                    // generating) chunk.
-                                    piano_roll_worker.with_chunk(|chunk| {
-                                        piano_roll::draw_piano_roll_chunk(
-                                            &mut d_scissor,
-                                            parser_data,
-                                            playback_position_ns,
-                                            roll_area,
-                                            app_state.is_tick_based,
-                                            app_state.note_speed
-                                                * beat_bounce_multiplier(
-                                                    parser_data,
-                                                    playback_position_ns,
-                                                    st == PlayerState::Playing,
-                                                    app_state.beat_bounce_amount,
-                                                    app_state.beat_bounce_note_value,
-                                                    app_state.beat_bounce_offbeat,
-                                                    app_state.beat_bounce_animation,
-                                                ),
-                                            chunk,
-                                        );
-                                    });
+                                    let _draw_stats = piano_roll_worker.draw(
+                                        &mut d_scissor,
+                                        parser_data,
+                                        playback_position_ns,
+                                        roll_area,
+                                        app_state.is_tick_based,
+                                        app_state.note_speed
+                                            * beat_bounce_multiplier(
+                                                parser_data,
+                                                playback_position_ns,
+                                                st == PlayerState::Playing,
+                                                app_state.beat_bounce_amount,
+                                                app_state.beat_bounce_note_value,
+                                                app_state.beat_bounce_offbeat,
+                                                app_state.beat_bounce_animation,
+                                            ),
+                                    );
                                 }
                             }
 
@@ -1533,6 +1457,7 @@ fn main() {
             screen_width,
             screen_height,
         );
+
         let mut close_requested = false;
         app_state
             .overlay_manager
@@ -1543,6 +1468,7 @@ fn main() {
                 |d, fade_t, kind| match kind {
                     app_state::AppOverlay::Settings => {
                         let prev_pb_override = app_state.pitch_bend_override_enabled;
+                        let prev_vsync = app_state.vsync_enabled;
                         let prev_pb_multiplier = app_state.pitch_bend_multiplier;
                         let prev_unlimited_output = app_state.unlimited_output_enabled;
                         let prev_s16_clipping = app_state.s16_clipping_enabled;
@@ -1551,6 +1477,7 @@ fn main() {
                         let prev_parse_threads = app_state.parse_threads;
                         let prev_audio_engine = app_state.audio_engine;
                         let prev_audio_buffer_secs = app_state.audio_buffer_secs;
+                        let prev_voice_limit = app_state.voice_limit;
                         if ui::draw_settings_overlay(
                             d,
                             screen_width,
@@ -1608,8 +1535,24 @@ fn main() {
                             &mut app_state.settings_parse_threads_slider,
                             &mut app_state.show_stats,
                             app_state.show_stats_animation,
+                            &mut app_state.vsync_enabled,
+                            app_state.vsync_animation,
+                            &mut app_state.voice_limit,
+                            &mut app_state.settings_voice_limit_slider,
                         ) {
                             close_requested = true;
+                        }
+                        if app_state.vsync_enabled != prev_vsync {
+                            // raylib switches GLFW's swap interval at runtime
+                            // through the window state flag.
+                            const FLAG_VSYNC_HINT: u32 = 0x0000_0040;
+                            unsafe {
+                                if app_state.vsync_enabled {
+                                    raylib::ffi::SetWindowState(FLAG_VSYNC_HINT);
+                                } else {
+                                    raylib::ffi::ClearWindowState(FLAG_VSYNC_HINT);
+                                }
+                            }
                         }
                         if app_state.pitch_bend_override_enabled != prev_pb_override {
                             engine.set_pitch_bend_override(app_state.pitch_bend_override_enabled);
@@ -1632,6 +1575,9 @@ fn main() {
                         }
                         if app_state.audio_buffer_secs != prev_audio_buffer_secs {
                             engine.set_audio_buffer_secs(app_state.audio_buffer_secs);
+                        }
+                        if app_state.voice_limit != prev_voice_limit {
+                            engine.set_voice_limit(app_state.voice_limit);
                         }
                         if app_state.parse_threads != prev_parse_threads {
                             engine.set_parse_threads(app_state.parse_threads);

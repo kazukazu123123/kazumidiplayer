@@ -700,6 +700,10 @@ pub fn draw_settings_overlay(
     parse_threads_slider: &mut NumericSliderState,
     show_stats: &mut bool,
     show_stats_animation: f32,
+    vsync: &mut bool,
+    vsync_animation: f32,
+    voice_limit: &mut u32,
+    voice_limit_slider: &mut NumericSliderState,
 ) -> bool {
     // Capture text-entry input before entering drawing modes.
     let mut numeric_typed = Vec::new();
@@ -1164,6 +1168,47 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // Voice limit of the built-in piano synth; applies immediately.
+            {
+                let y = layout.next(52.0);
+                tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "Most notes the Piano engine plays at once (0 = unlimited). Over the limit, the quietest notes are faded out first, not the oldest, so loud and long-ringing notes stay. Lower uses less CPU on dense MIDIs."));
+                if is_visible(sy(y), 52.0) {
+                    let input = NumericSliderInput {
+                        click_pos,
+                        mouse_pos: mouse_world_pos,
+                        mouse_down: is_mouse_down,
+                        wheel: mouse_wheel,
+                        shift: numeric_shift,
+                        control: numeric_control,
+                        typed: numeric_typed.clone(),
+                        backspace: numeric_backspace,
+                        delete: numeric_delete,
+                        left: numeric_left,
+                        right: numeric_right,
+                        home: numeric_home,
+                        end: numeric_end,
+                        enter: numeric_enter,
+                        escape: numeric_escape,
+                    };
+                    let enabled = crate::audio_engine::EngineSelection::LABELS
+                        .get(*audio_engine)
+                        .is_some_and(|l| *l == "Piano (Prerender)");
+                    wheel_consumed |= draw_u32_numeric_slider(
+                        &mut d_scissor,
+                        Rectangle::new(column_x, sy(y), column_width, 52.0),
+                        "Voice Limit (0 = unlimited)",
+                        voice_limit,
+                        0,
+                        100_000,
+                        voice_limit_slider,
+                        &input,
+                        eased_t,
+                        enabled,
+                        Some("Piano engine only"),
+                    );
+                }
+            }
+
             // Prerender engines render the file themselves, so the MIDI output
             // pacing settings below have nothing to act on.
             let prerender_engine = crate::audio_engine::EngineSelection::from_index(*audio_engine)
@@ -1578,6 +1623,38 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *show_stats = !*show_stats;
+                }
+            }
+
+            // Display section label
+            let y = layout.next(18.0);
+            if is_visible(sy(y), 18.0) {
+                d_scissor.draw_text_ex(
+                    &font,
+                    "Display:",
+                    Vector2::new(column_x, sy(y)),
+                    18.0,
+                    spacing,
+                    text_color,
+                );
+            }
+
+            // VSync toggle
+            let y = layout.next(30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Wait for the monitor's refresh before showing each frame. On: smooth and capped at the refresh rate. Off: frames as fast as the PC can draw them, using more CPU and GPU, with possible tearing."));
+            let vsync_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
+            if is_visible(vsync_rect.y, vsync_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    vsync_rect,
+                    "VSync",
+                    vsync_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *vsync = !*vsync;
                 }
             }
 

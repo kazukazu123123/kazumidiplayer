@@ -100,6 +100,9 @@ pub struct AppState {
     pub show_stats: bool,
     pub show_stats_animation: f32,
     pub stats_clock: f32,
+    // Display: wait for the monitor's refresh (on), or render as fast as possible (off).
+    pub vsync_enabled: bool,
+    pub vsync_animation: f32,
     pub nps_samples: VecDeque<(f32, u64)>,
     pub nps_value: f32,
     pub tempo_us_value: u32,
@@ -168,6 +171,9 @@ pub struct AppState {
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
+    /// Built-in piano synth voice limit; 0 = unlimited.
+    pub voice_limit: u32,
+    pub settings_voice_limit_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_parse_threads_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub speed_slider_dragging: bool,
 
@@ -236,6 +242,9 @@ impl AppState {
             show_stats: true,
             show_stats_animation: 0.0,
             stats_clock: 0.0,
+            // Matches the window, which is created with vsync on.
+            vsync_enabled: true,
+            vsync_animation: 0.0,
             nps_samples: VecDeque::new(),
             nps_value: 0.0,
             tempo_us_value: 500_000,
@@ -294,6 +303,8 @@ impl AppState {
             settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_buffer_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
+            voice_limit: 0,
+            settings_voice_limit_slider: Default::default(),
             settings_parse_threads_slider: Default::default(),
             speed_slider_dragging: false,
 

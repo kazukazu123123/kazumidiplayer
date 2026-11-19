@@ -83,6 +83,12 @@ pub trait AudioEngine: Send + 'static {
     fn set_limiter_bypassed(&mut self, bypassed: bool) {
         let _ = bypassed;
     }
+
+    /// Most voices sounding at once (0 = unlimited). Only the built-in piano
+    /// synth has a voice limit; other engines ignore this.
+    fn set_voice_limit(&mut self, limit: u32) {
+        let _ = limit;
+    }
 }
 
 /// Type-erased registration record; build with [`register`].
@@ -111,6 +117,7 @@ trait ErasedEngine: Send {
     fn render(&mut self, left: &mut [f32], right: &mut [f32]);
     fn polyphony(&self) -> u32;
     fn set_limiter_bypassed(&mut self, bypassed: bool);
+    fn set_voice_limit(&mut self, limit: u32);
 }
 
 impl<E: AudioEngine> ErasedEngine for E {
@@ -140,6 +147,10 @@ impl<E: AudioEngine> ErasedEngine for E {
 
     fn set_limiter_bypassed(&mut self, bypassed: bool) {
         AudioEngine::set_limiter_bypassed(self, bypassed)
+    }
+
+    fn set_voice_limit(&mut self, limit: u32) {
+        AudioEngine::set_voice_limit(self, limit)
     }
 }
 
@@ -319,6 +330,15 @@ impl OutputStream {
     /// Engines without one ignore it.
     pub fn set_limiter_bypassed(&self, bypassed: bool) {
         lock(&self.engine).set_limiter_bypassed(bypassed);
+    }
+
+    /// Most voices sounding at once (0 = unlimited). For a prerender engine
+    /// the buffered audio is re-rendered, so the change is heard right away.
+    pub fn set_voice_limit(&self, limit: u32) {
+        lock(&self.engine).set_voice_limit(limit);
+        if let Some(p) = &self.prerender {
+            p.rerender();
+        }
     }
 
     /// Make output already queued for the previous file obsolete.

@@ -47,6 +47,12 @@ const DEFAULT_BEND_RANGE: f32 = 2.0;
 /// A voice whose lanes have all decayed below this is dropped.
 const SILENT: f32 = 1e-4;
 
+/// Frames per entry of a cached note's loudness table (see `CachedNote::loud`).
+const LOUD_BLOCK: usize = 256;
+/// A voice cut by the voice limit fades out over this long instead of
+/// stopping dead, which would click.
+const KILL_FADE_SECS: f64 = 0.002;
+
 /// Voices grouped into each reusable layer.
 const VOICES_PER_LAYER: usize = 128;
 
@@ -88,6 +94,9 @@ struct NoteSpec {
     f0: f32,
     /// Extra per-frame multiplier once the damper is down (1 = no damper).
     damper: f32,
+    /// Per-frame multiplier of a voice being cut by the voice limit: down
+    /// 60 dB over `KILL_FADE_SECS`.
+    kill_fade: f32,
     /// Knock: one-pole low-pass coefficient, per-frame decay, length.
     knock_lp: f32,
     knock_decay: f32,
@@ -111,6 +120,7 @@ impl NoteSpec {
             count: 0,
             f0: f0 as f32,
             damper: 1.0,
+            kill_fade: (-6.9 / (KILL_FADE_SECS * sr)).exp() as f32,
             knock_lp: 0.0,
             knock_decay: 0.0,
             knock_frames: (KNOCK_SECS * sr) as u32,
@@ -277,6 +287,11 @@ struct CachedNote {
     samples: Vec<i16>,
     /// Value of i16 full scale.
     scale: f32,
+    /// Peak |sample| (in i16 units) of each `LOUD_BLOCK` frames: how loud the
+    /// strike is at any point of its life. Every voice plays this same
+    /// recording, so a voice's current amplitude is one lookup here times its
+    /// own gains -- which is what makes the amplitude-based voice limit cheap.
+    loud: Vec<f32>,
 }
 
 /// All 128 keys at one sample rate.
@@ -346,9 +361,15 @@ fn render_note(note: usize, rate: u32) -> CachedNote {
         .fold(0.0f32, |m, s| m.max(s.abs()))
         .max(f32::EPSILON);
     let to_i16 = i16::MAX as f32 / peak;
+    let samples: Vec<i16> = out.iter().map(|s| (s * to_i16).round() as i16).collect();
+    let loud = samples
+        .chunks(LOUD_BLOCK)
+        .map(|block| block.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0) as f32)
+        .collect();
     CachedNote {
-        samples: out.iter().map(|s| (s * to_i16).round() as i16).collect(),
+        samples,
         scale: peak / i16::MAX as f32,
+        loud,
     }
 }
 
@@ -370,6 +391,8 @@ struct Voice {
     damped: bool,
     /// Key released while the sustain pedal was down.
     pedal_held: bool,
+    /// Cut by the voice limit: fading out over `KILL_FADE_SECS`.
+    fading: bool,
     dead: bool,
     // Within the current render, set while applying its events. Recording
     // them up front lets every voice render the whole chunk on its own.
@@ -423,23 +446,36 @@ impl Voice {
         let (mut pos, mut y, mut env) = (self.pos, self.lp_y, self.env);
         let lp = self.lp;
         let mut ended = false;
+        // A voice cut by the voice limit fades on top of whatever else it does.
+        let fade = if self.fading { spec.kill_fade } else { 1.0 };
         if bends.len() == 1 && bends[0].1 == 1.0 && pos.fract() == 0.0 {
             let mut index = pos as usize;
             let available = s.len().saturating_sub(index.saturating_add(1));
             let frames = (end - start).min(available);
             let sample_end = start + frames;
             let damp_start = damp_from.clamp(start, sample_end);
-            for i in start..damp_start {
-                y += lp * (s[index] as f32 - y);
-                left[i] += y * gl * env;
-                right[i] += y * gr * env;
-                index += 1;
+            if self.fading {
+                for i in start..damp_start {
+                    y += lp * (s[index] as f32 - y);
+                    left[i] += y * gl * env;
+                    right[i] += y * gr * env;
+                    env *= fade;
+                    index += 1;
+                }
+            } else {
+                for i in start..damp_start {
+                    y += lp * (s[index] as f32 - y);
+                    left[i] += y * gl * env;
+                    right[i] += y * gr * env;
+                    index += 1;
+                }
             }
+            let damp = spec.damper * fade;
             for i in damp_start..sample_end {
                 y += lp * (s[index] as f32 - y);
                 left[i] += y * gl * env;
                 right[i] += y * gr * env;
-                env *= spec.damper;
+                env *= damp;
                 index += 1;
             }
             ended = sample_end < end;
@@ -452,7 +488,7 @@ impl Voice {
                     continue;
                 }
                 let mid = damp_from.clamp(lo, hi);
-                for (range, damp) in [(lo..mid, 1.0), (mid..hi, spec.damper)] {
+                for (range, damp) in [(lo..mid, fade), (mid..hi, spec.damper * fade)] {
                     for i in range {
                         let idx = pos as usize;
                         if idx + 1 >= s.len() {
@@ -473,7 +509,9 @@ impl Voice {
         (self.pos, self.lp_y, self.env) = (pos, y, env);
         self.damped |= self.release_at.is_some();
         let silent = env * self.gain * (i16::MAX as f32) < SILENT;
-        self.dead = self.kill_at.is_some() || ended || silent;
+        // A faded voice is gone once it is 60 dB down, quiet strike or not.
+        let faded = self.fading && env < 1e-3;
+        self.dead = self.kill_at.is_some() || ended || silent || faded;
         self.start = 0;
         self.release_at = None;
         self.kill_at = None;
@@ -551,7 +589,20 @@ pub struct PianoPrerender {
     /// Per channel, `(start frame, pitch ratio)` segments of this render.
     bends: [Vec<(usize, f32)>; 16],
     layers: Vec<MixLayer>,
+    /// Most voices sounding at once; 0 = unlimited. Over it, the quietest go.
+    voice_limit: u32,
+    /// The voices counted against the limit, quietest on top: (amplitude as
+    /// f32 bits -- order-preserving for non-negative floats -- voice index).
+    /// Rebuilt each render from the voices left by the last one; indices stay
+    /// valid within a render because voices are only appended until its end.
+    limit_heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>,
+    /// Voices in `limit_heap`, i.e. sounding and not being cut.
+    limit_active: usize,
 }
+
+/// Marks a `held` entry whose note-on the voice limit turned away: its
+/// note-off consumes the entry and releases nothing.
+const TURNED_AWAY: u64 = 1 << 63;
 
 impl PianoPrerender {
     fn new(rate: u32) -> Self {
@@ -566,6 +617,70 @@ impl PianoPrerender {
             next_seq: 0,
             bends: std::array::from_fn(|_| Vec::new()),
             layers: Vec::new(),
+            voice_limit: 0,
+            limit_heap: std::collections::BinaryHeap::new(),
+            limit_active: 0,
+        }
+    }
+
+    /// Most voices sounding at once; 0 = unlimited.
+    pub fn set_voice_limit(&mut self, limit: u32) {
+        self.voice_limit = limit;
+    }
+
+    /// A voice's current amplitude. No analysis needed: every voice plays its
+    /// key's cached strike, whose loudness over time is tabulated (`loud`), so
+    /// it is that table at the voice's position times its velocity gain,
+    /// damper envelope, channel volume/expression and stereo spread.
+    fn amplitude(&self, note: u8, channel: u8, pos: f64, gain: f32, env: f32) -> f32 {
+        let n = note as usize;
+        let level = self.cache.notes[n]
+            .loud
+            .get(pos as usize / LOUD_BLOCK)
+            .copied()
+            .unwrap_or(0.0);
+        let ch = &self.channels[channel as usize];
+        let spec = &self.notes[n];
+        level * gain * env * ch.volume * ch.expression * spec.left.max(spec.right)
+    }
+
+    /// Voice limit, amplitude based: the *quietest* voice goes first, not the
+    /// oldest, so a loud long-ringing note outlasts a fresh pianissimo one.
+    ///
+    /// Every event of a render is known before any of it is rendered, so the
+    /// limit is enforced at each note-on rather than after the fact: a new
+    /// note quieter than the quietest sounding voice never becomes a voice at
+    /// all, and a louder one takes that voice's place (cut with a fade of
+    /// `KILL_FADE_SECS`). The quietest is the top of a min-heap, so a note-on
+    /// costs O(log limit), and the synth never holds more than `limit` voices
+    /// -- cutting after rendering them, as at first, let a dense chunk create
+    /// tens of thousands of voices only to fade them out again.
+    ///
+    /// This sets up the heap for a render from the voices the last one left.
+    fn prepare_limit(&mut self) {
+        self.limit_heap.clear();
+        self.limit_active = 0;
+        let limit = self.voice_limit as usize;
+        if limit == 0 {
+            return;
+        }
+        let mut entries = Vec::with_capacity(self.voices.len());
+        for (i, v) in self.voices.iter().enumerate() {
+            // Already being cut: it dies within this render.
+            if v.fading || !v.alive() {
+                continue;
+            }
+            let amp = self.amplitude(v.note, v.channel, v.pos, v.gain, v.env);
+            entries.push(std::cmp::Reverse((amp.to_bits(), i as u32)));
+        }
+        self.limit_active = entries.len();
+        self.limit_heap = std::collections::BinaryHeap::from(entries);
+        // The limit was lowered: cut back to it now.
+        while self.limit_active > limit {
+            if let Some(std::cmp::Reverse((_, i))) = self.limit_heap.pop() {
+                self.voices[i as usize].fading = true;
+            }
+            self.limit_active -= 1;
         }
     }
 
@@ -644,24 +759,61 @@ impl PianoPrerender {
                     let corner = (500.0 + 5_500.0 * v * v).max(2.0 * spec.f0);
                     1.0 - (-std::f32::consts::TAU * corner / self.rate as f32).exp()
                 };
-                self.held[channel as usize * 128 + p1 as usize].push_back(seq);
+                let gain = v.powf(1.5)
+                    * self.cache.notes[p1 as usize].scale
+                    * if self.channels[channel as usize].soft {
+                        0.7
+                    } else {
+                        1.0
+                    };
+                let held = channel as usize * 128 + p1 as usize;
+                let limit = self.voice_limit as usize;
+                if limit > 0 {
+                    let amp = self.amplitude(p1, channel, 0.0, gain, 1.0);
+                    if self.limit_active >= limit {
+                        match self.limit_heap.peek() {
+                            // Strictly louder than the quietest voice: it takes
+                            // its place. (Strictly, so a stack of equal notes
+                            // in one chunk does not keep replacing itself.)
+                            Some(&std::cmp::Reverse((bits, i))) if f32::from_bits(bits) < amp => {
+                                self.limit_heap.pop();
+                                let victim = &mut self.voices[i as usize];
+                                if victim.pos == 0.0 {
+                                    // Started in this very render, so it has not
+                                    // made a sound yet: drop it unheard rather
+                                    // than render a fade of it. On a dense chunk
+                                    // most replaced voices are of this kind.
+                                    victim.kill_at = Some(victim.start);
+                                } else {
+                                    victim.fading = true;
+                                }
+                                self.limit_active -= 1;
+                            }
+                            // Quieter than everything sounding: never starts.
+                            // Its note-off still has to find its own entry.
+                            _ => {
+                                self.held[held].push_back(seq | TURNED_AWAY);
+                                return;
+                            }
+                        }
+                    }
+                    self.limit_heap
+                        .push(std::cmp::Reverse((amp.to_bits(), self.voices.len() as u32)));
+                    self.limit_active += 1;
+                }
+                self.held[held].push_back(seq);
                 self.voices.push(Voice {
                     seq,
                     channel,
                     note: p1,
                     pos: 0.0,
-                    gain: v.powf(1.5)
-                        * self.cache.notes[p1 as usize].scale
-                        * if self.channels[channel as usize].soft {
-                            0.7
-                        } else {
-                            1.0
-                        },
+                    gain,
                     lp,
                     lp_y: 0.0,
                     env: 1.0,
                     damped: false,
                     pedal_held: false,
+                    fading: false,
                     dead: false,
                     start: frame,
                     release_at: None,
@@ -673,17 +825,27 @@ impl PianoPrerender {
                 let sustain = self.channels[channel as usize].sustain;
                 let queue = &mut self.held[channel as usize * 128 + p1 as usize];
                 while let Some(seq) = queue.pop_front() {
-                    if let Ok(i) = self.voices.binary_search_by_key(&seq, |v| v.seq) {
-                        let v = &mut self.voices[i];
-                        if v.alive() && !v.releasing() && !v.pedal_held {
-                            if sustain {
-                                v.pedal_held = true;
-                            } else {
-                                v.release_at = Some(frame);
-                            }
-                            break;
+                    // The oldest press on this key is the one this note-off
+                    // ends. If the voice limit turned it away, or cut it, or
+                    // it died out, there is nothing left to release -- and
+                    // releasing the next press instead would end a note that
+                    // is still held, early.
+                    if seq & TURNED_AWAY != 0 {
+                        break;
+                    }
+                    let Ok(i) = self.voices.binary_search_by_key(&seq, |v| v.seq) else {
+                        break;
+                    };
+                    let v = &mut self.voices[i];
+                    // Its own press either way: release it if it still can be.
+                    if !v.fading && v.alive() && !v.releasing() && !v.pedal_held {
+                        if sustain {
+                            v.pedal_held = true;
+                        } else {
+                            v.release_at = Some(frame);
                         }
                     }
+                    break;
                 }
             }
             0xE0 => {
@@ -745,6 +907,9 @@ impl PianoPrerender {
                 for v in self.voices.iter_mut().filter(|v| v.alive()) {
                     v.kill_at = Some(frame);
                 }
+                // Every voice is gone: the whole limit is free again.
+                self.limit_heap.clear();
+                self.limit_active = 0;
                 self.channels = [Channel::RESET; 16];
                 self.held.iter_mut().for_each(|q| q.clear());
                 for ch in 0..16 {
@@ -764,6 +929,8 @@ impl PianoPrerender {
         let mut scheduled = std::mem::take(&mut self.scheduled);
         scheduled.sort_by_key(|&(frame, _)| frame);
         self.begin_render();
+        // The voice limit decides each note-on as it is applied.
+        self.prepare_limit();
         for &(frame, msg) in &scheduled {
             // Offsets past the chunk (shouldn't happen) apply at its end.
             self.apply((frame as usize).min(len), msg);

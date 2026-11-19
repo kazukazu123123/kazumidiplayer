@@ -31,4 +31,8 @@ impl AudioEngine for PianoPrerender {
     fn polyphony(&self) -> u32 {
         PianoPrerender::polyphony(self)
     }
+
+    fn set_voice_limit(&mut self, limit: u32) {
+        PianoPrerender::set_voice_limit(self, limit)
+    }
 }
