@@ -30,7 +30,34 @@ csynth = { git = "https://git.c30.life/ced/csynth-v2", version = "0.1.0" }
 rayon = "1.12.0"
 rusty-opus = "1.2.0"
 
+# Only referenced from debug builds (the ViSQOL graph window scores
+# the prerender Opus round trip). Release builds compile them but never
+# link them; the cfg dependency table cannot express that (Cargo does
+# not support cfg(debug_assertions) there).
+audio_samples_qoe = "0.1.3"
+audio_samples = "2.0.1"
+ndarray = "0.17.2"
+
+# The ViSQOL crates are used only from cfg(debug_assertions) code, so
+# the release profile would warn about them as unused dependencies forever.
+[lints.cargo]
+unused_dependencies = "allow"
+
 # Rust's debug binaries use the release MSVC runtime. Compile native build scripts
 # without debug assertions so raylib's CMake build selects the matching runtime.
 [profile.dev.build-override]
 debug-assertions = false
+
+# ViSQOL is far too slow to score with in an unoptimized build, so the
+# dev profile optimizes audio_samples_qoe and its heavy DSP dependencies.
+[profile.dev.package.audio_samples_qoe]
+opt-level = 3
+
+[profile.dev.package.audio_samples]
+opt-level = 3
+
+[profile.dev.package.spectrograms]
+opt-level = 3
+
+[profile.dev.package.ndarray]
+opt-level = 3

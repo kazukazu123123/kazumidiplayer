@@ -112,6 +112,14 @@ fn main() {
         window_manager.new_window("Piano Keyboard Channel", 50, 470, 800, 320);
     window_manager.set_window_min_size(piano_keyboard_channel_window_handle, Some(300), Some(160));
 
+    // Debug builds: ViSQOL graph of the prerender Opus stream.
+    #[cfg(debug_assertions)]
+    let visqol_window_handle = window_manager.new_window("Audio ViSQOL (debug)", 50, 810, 800, 220);
+    #[cfg(debug_assertions)]
+    window_manager.set_window_min_size(visqol_window_handle, Some(300), Some(120));
+    #[cfg(debug_assertions)]
+    window_manager.set_window_visible(visqol_window_handle, false);
+
     let (mut rl, thread) = raylib::init()
         .size(800, 400)
         .resizable()
@@ -423,6 +431,13 @@ fn main() {
             dt,
             anim_speed,
         );
+        #[cfg(debug_assertions)]
+        animate_toggle(
+            app_state.visqol_window_enabled,
+            &mut app_state.visqol_window_animation,
+            dt,
+            anim_speed,
+        );
 
         app_state.stats_clock += dt;
         {
@@ -676,10 +691,29 @@ fn main() {
                 .clamp(piano_roll::MIN_NOTE_SPEED, piano_roll::MAX_NOTE_SPEED);
         }
 
+        // Debug builds: track whether the ViSQOL window owns keyboard focus.
+        #[cfg(debug_assertions)]
+        let visqol_is_active = !app_state.overlay_manager.blocks_input()
+            && !flip_3d.is_active()
+            && window_manager
+                .get_window(visqol_window_handle)
+                .is_some_and(|w| w.visible && w.is_active);
+        #[cfg(debug_assertions)]
+        if !visqol_is_active {
+            app_state.visqol_bitrate_field.editing = false;
+            app_state.visqol_bitrate_field.select_all = false;
+            app_state.visqol_slider_dragging = false;
+        }
+        #[cfg(debug_assertions)]
+        let visqol_blocks_keys = visqol_is_active && app_state.visqol_bitrate_field.editing;
+        #[cfg(not(debug_assertions))]
+        let visqol_blocks_keys = false;
+
         // Handle keyboard shortcuts only when overlay is completely closed
         if !app_state.overlay_manager.blocks_input()
             && app_state.overlay_manager.get_fade_t() == 0.0
             && !flip_3d.is_active()
+            && !visqol_blocks_keys
         {
             if is_midi_loaded && !is_loading {
                 if rl.is_key_pressed(KeyboardKey::KEY_SPACE) {
@@ -720,7 +754,7 @@ fn main() {
             }
         }
 
-        if rl.is_key_pressed(KeyboardKey::KEY_S) && !flip_3d.is_active() {
+        if rl.is_key_pressed(KeyboardKey::KEY_S) && !flip_3d.is_active() && !visqol_blocks_keys {
             if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::Settings) {
                 app_state.overlay_manager.close();
             } else if !app_state.overlay_manager.blocks_input() {
@@ -731,6 +765,12 @@ fn main() {
                     app_state.settings_scroll_y = 0.0;
                     app_state.settings_scrollbar_dragging = false;
                     app_state.s16_warning_opened_at = None;
+                    #[cfg(debug_assertions)]
+                    {
+                        app_state.settings_opus_bitrate_slider.editing = false;
+                        app_state.settings_opus_bitrate_slider.dragging = false;
+                        app_state.settings_opus_bitrate_slider.select_all = false;
+                    }
                     app_state
                         .overlay_manager
                         .open(app_state::AppOverlay::Settings);
@@ -739,7 +779,7 @@ fn main() {
             }
         }
 
-        if rl.is_key_pressed(KeyboardKey::KEY_P) && !flip_3d.is_active() {
+        if rl.is_key_pressed(KeyboardKey::KEY_P) && !flip_3d.is_active() && !visqol_blocks_keys {
             if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
                 if !app_state.text_editor.focused {
                     app_state.overlay_manager.close();
@@ -789,6 +829,60 @@ fn main() {
                 _ => rl.set_mouse_cursor(MouseCursor::MOUSE_CURSOR_DEFAULT),
             }
         }
+
+        // Capture ViSQOL bitrate text-entry keys before entering drawing modes.
+        #[cfg(debug_assertions)]
+        let (
+            visqol_typed,
+            visqol_backspace,
+            visqol_delete,
+            visqol_left,
+            visqol_right,
+            visqol_home,
+            visqol_end,
+            visqol_enter,
+            visqol_escape,
+            visqol_shift,
+            visqol_control,
+        ) = if visqol_is_active {
+            let mut typed = Vec::new();
+            while let Some(ch) = rl.get_char_pressed() {
+                typed.push(ch);
+            }
+            let pressed = |rl: &RaylibHandle, key| {
+                rl.is_key_pressed(key) || rl.is_key_pressed_repeat(key)
+            };
+            (
+                typed,
+                pressed(&rl, KeyboardKey::KEY_BACKSPACE),
+                pressed(&rl, KeyboardKey::KEY_DELETE),
+                pressed(&rl, KeyboardKey::KEY_LEFT),
+                pressed(&rl, KeyboardKey::KEY_RIGHT),
+                rl.is_key_pressed(KeyboardKey::KEY_HOME),
+                rl.is_key_pressed(KeyboardKey::KEY_END),
+                rl.is_key_pressed(KeyboardKey::KEY_ENTER)
+                    || rl.is_key_pressed(KeyboardKey::KEY_KP_ENTER),
+                rl.is_key_pressed(KeyboardKey::KEY_ESCAPE),
+                rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT)
+                    || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT),
+                rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+                    || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL),
+            )
+        } else {
+            (
+                Vec::new(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+        };
 
         let is_mouse_down = rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
         let window_ids = window_manager.get_window_ids_sorted();
@@ -1206,6 +1300,120 @@ fn main() {
                                 cy,
                             );
                         }
+                        #[cfg(debug_assertions)]
+                        id if id == visqol_window_handle => {
+                            let local_mouse = Vector2::new(
+                                mouse_pos.x - (window.rectangle.left() - bt) as f32,
+                                mouse_pos.y - (window.rectangle.top() - bt) as f32,
+                            );
+
+                            let is_inside_content = local_mouse.x >= cx
+                                && local_mouse.x < cx + cw
+                                && local_mouse.y >= cy
+                                && local_mouse.y < cy + ch;
+
+                            let is_input_blocked =
+                                app_state.overlay_manager.blocks_input() || flip_3d.is_active();
+                            let allow_input = active_window_id == Some(visqol_window_handle)
+                                && is_inside_content
+                                && !is_input_blocked;
+
+                            if !is_mouse_down || is_input_blocked || !window.is_active {
+                                app_state.visqol_slider_dragging = false;
+                            }
+
+                            // Keep forwarding local mouse coordinates while dragging the vertical
+                            // slider so dragging past the window edge clamps cleanly to 6..=510
+                            // instead of freezing mid-drag.
+                            let forward_mouse = allow_input || app_state.visqol_slider_dragging;
+                            let current_event = if forward_mouse {
+                                app_state.last_input_event.map(|e| match e {
+                                    window_manager::InputEvent::MouseDown(p) => {
+                                        window_manager::InputEvent::MouseDown(
+                                            window_manager::Point {
+                                                x: p.x - (window.rectangle.left() - bt),
+                                                y: p.y - (window.rectangle.top() - bt),
+                                            },
+                                        )
+                                    }
+                                    window_manager::InputEvent::MouseMove(p) => {
+                                        window_manager::InputEvent::MouseMove(
+                                            window_manager::Point {
+                                                x: p.x - (window.rectangle.left() - bt),
+                                                y: p.y - (window.rectangle.top() - bt),
+                                            },
+                                        )
+                                    }
+                                    window_manager::InputEvent::MouseUp(p) => {
+                                        window_manager::InputEvent::MouseUp(window_manager::Point {
+                                            x: p.x - (window.rectangle.left() - bt),
+                                            y: p.y - (window.rectangle.top() - bt),
+                                        })
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+
+                            let ui_mouse_pos = if forward_mouse {
+                                Some(local_mouse)
+                            } else {
+                                None
+                            };
+
+                            let click_pos = if allow_input {
+                                match current_event {
+                                    Some(window_manager::InputEvent::MouseDown(p)) => {
+                                        Some(Vector2::new(p.x as f32, p.y as f32))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                            let field_input = ui_components::numeric_slider::NumericSliderInput {
+                                click_pos,
+                                mouse_pos: local_mouse,
+                                mouse_down: is_mouse_down && !is_input_blocked,
+                                wheel: 0.0,
+                                shift: visqol_shift,
+                                control: visqol_control,
+                                typed: visqol_typed.clone(),
+                                backspace: visqol_backspace,
+                                delete: visqol_delete,
+                                left: visqol_left,
+                                right: visqol_right,
+                                home: visqol_home,
+                                end: visqol_end,
+                                enter: visqol_enter,
+                                escape: visqol_escape,
+                            };
+
+                            let is_pcm = matches!(engine.buffer_memory(), Some((_, _, false)));
+
+                            let prev_opus_bitrate_kbps = app_state.opus_bitrate_kbps;
+                            let series = engine.visqol_series();
+                            ui::draw_visqol_window(
+                                &mut d_scissor,
+                                cx,
+                                cy,
+                                cw,
+                                ch,
+                                &series,
+                                is_pcm,
+                                &mut app_state.opus_bitrate_kbps,
+                                current_event,
+                                ui_mouse_pos,
+                                is_mouse_down && !is_input_blocked,
+                                &mut app_state.visqol_slider_dragging,
+                                &mut app_state.visqol_bitrate_field,
+                                &field_input,
+                            );
+                            if app_state.opus_bitrate_kbps != prev_opus_bitrate_kbps {
+                                engine.set_opus_bitrate(app_state.opus_bitrate_kbps);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1485,6 +1693,8 @@ fn main() {
                         let prev_audio_engine = app_state.audio_engine;
                         let prev_audio_buffer_secs = app_state.audio_buffer_secs;
                         let prev_voice_limit = app_state.voice_limit;
+                        #[cfg(debug_assertions)]
+                        let prev_opus_bitrate_kbps = app_state.opus_bitrate_kbps;
                         if ui::draw_settings_overlay(
                             d,
                             screen_width,
@@ -1536,6 +1746,14 @@ fn main() {
                             &mut app_state.audio_buffer_secs,
                             &mut app_state.settings_audio_buffer_slider,
                             engine.buffer_memory(),
+                            #[cfg(debug_assertions)]
+                            &mut app_state.opus_bitrate_kbps,
+                            #[cfg(debug_assertions)]
+                            &mut app_state.settings_opus_bitrate_slider,
+                            #[cfg(debug_assertions)]
+                            &mut app_state.visqol_window_enabled,
+                            #[cfg(debug_assertions)]
+                            app_state.visqol_window_animation,
                             &mut app_state.midi_ev_mode,
                             &mut app_state.settings_midi_ev_mode_combo,
                             &mut app_state.parse_threads,
@@ -1586,6 +1804,10 @@ fn main() {
                         if app_state.voice_limit != prev_voice_limit {
                             engine.set_voice_limit(app_state.voice_limit);
                         }
+                        #[cfg(debug_assertions)]
+                        if app_state.opus_bitrate_kbps != prev_opus_bitrate_kbps {
+                            engine.set_opus_bitrate(app_state.opus_bitrate_kbps);
+                        }
                         if app_state.parse_threads != prev_parse_threads {
                             engine.set_parse_threads(app_state.parse_threads);
                         }
@@ -1603,6 +1825,11 @@ fn main() {
                         window_manager.set_window_visible(
                             piano_keyboard_window_handle,
                             !app_state.integrate_keyboard,
+                        );
+                        #[cfg(debug_assertions)]
+                        window_manager.set_window_visible(
+                            visqol_window_handle,
+                            app_state.visqol_window_enabled,
                         );
                     }
                     app_state::AppOverlay::PlayerCrashed => {

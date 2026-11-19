@@ -54,6 +54,9 @@ pub enum PlayerCommand {
     SetS16Clipping(bool),
     /// Built-in piano synth: most voices at once, 0 = unlimited.
     SetVoiceLimit(u32),
+    /// Debug builds: Opus bitrate for the prerender buffer, in kbps.
+    #[cfg(debug_assertions)]
+    SetOpusBitrate(u32),
 }
 
 pub enum PlayerFeedback {
@@ -181,6 +184,11 @@ pub struct PlayerHandle {
     buffer_memory: Arc<AtomicU64>,
     output_rate: Arc<AtomicU32>,
     buffer_compressed: Arc<AtomicBool>,
+    // Debug builds: cumulative ViSQOL series of the prerender Opus stream
+    // ((MOS-LQO, bitrate_kbps) per 1-second window scored every half second),
+    // mirrored for the debug window.
+    #[cfg(debug_assertions)]
+    visqol_series: Arc<std::sync::Mutex<Vec<(f32, u32)>>>,
 }
 
 impl Clone for PlayerHandle {
@@ -206,6 +214,8 @@ impl Clone for PlayerHandle {
             buffer_memory: self.buffer_memory.clone(),
             output_rate: self.output_rate.clone(),
             buffer_compressed: self.buffer_compressed.clone(),
+            #[cfg(debug_assertions)]
+            visqol_series: self.visqol_series.clone(),
         }
     }
 }
@@ -243,6 +253,10 @@ impl PlayerHandle {
         let output_rate_for_thread = output_rate.clone();
         let buffer_compressed = Arc::new(AtomicBool::new(false));
         let buffer_compressed_for_thread = buffer_compressed.clone();
+        #[cfg(debug_assertions)]
+        let visqol_series = Arc::new(std::sync::Mutex::new(Vec::<(f32, u32)>::new()));
+        #[cfg(debug_assertions)]
+        let visqol_series_for_thread = visqol_series.clone();
 
         let (tx_command_to_thread, rx_thread_commands) = mpsc::channel::<PlayerCommand>();
         let tx_forward_main_channel = tx_command_to_thread.clone();
@@ -319,6 +333,10 @@ impl PlayerHandle {
             let mut audio_buffer_secs = crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS;
             let mut s16_clipping = false;
             let mut voice_limit = 0u32;
+            #[cfg(debug_assertions)]
+            let mut opus_bitrate_kbps = 256u32;
+            #[cfg(debug_assertions)]
+            let mut visqol_consumed: usize = 0;
             // The prerender session of the current output, if any.
             macro_rules! prerender {
                 ($player:ident) => {
@@ -484,6 +502,13 @@ impl PlayerHandle {
                                 stream.set_voice_limit(limit);
                             }
                         }
+                        #[cfg(debug_assertions)]
+                        PlayerCommand::SetOpusBitrate(kbps) => {
+                            opus_bitrate_kbps = kbps;
+                            if let Some(p) = prerender!(player) {
+                                p.set_opus_bitrate(kbps);
+                            }
+                        }
                         PlayerCommand::SetMidiEvBufferSize(size) => {
                             midi_ev_buffer_size = size
                                 .clamp(MIN_MIDI_EV_BUFFER_SIZE, MAX_MIDI_EV_BUFFER_SIZE)
@@ -534,6 +559,8 @@ impl PlayerHandle {
                             if let Some(p) = prerender!(player) {
                                 p.set_bend_override(player.bend_override());
                                 p.set_max_buffer_secs(audio_buffer_secs);
+                                #[cfg(debug_assertions)]
+                                p.set_opus_bitrate(opus_bitrate_kbps);
                                 p.set_limiter_bypassed(s16_clipping);
                                 p.set_data(player.data.clone());
                                 if player.state == PlayerState::Playing {
@@ -982,6 +1009,18 @@ impl PlayerHandle {
                     prerender!(player).map_or(false, |p| p.compressed()),
                     Ordering::Relaxed,
                 );
+                #[cfg(debug_assertions)]
+                {
+                    let series = prerender!(player).map_or_else(Vec::new, |p| p.visqol_series());
+                    if series.len() < visqol_consumed {
+                        visqol_consumed = 0;
+                    }
+                    if series.len() > visqol_consumed {
+                        let mut slot = lock_mutex(&visqol_series_for_thread);
+                        slot.extend_from_slice(&series[visqol_consumed..]);
+                        visqol_consumed = series.len();
+                    }
+                }
                 *lock_mutex(&pitch_bend_range_clone) = player.channel_pitch_bend_range;
 
                 if player.state != PlayerState::Playing {
@@ -1035,6 +1074,8 @@ impl PlayerHandle {
             buffer_memory,
             output_rate,
             buffer_compressed,
+            #[cfg(debug_assertions)]
+            visqol_series,
         }
     }
 
@@ -1076,6 +1117,18 @@ impl PlayerHandle {
     /// first; 0 = unlimited.
     pub fn set_voice_limit(&self, limit: u32) {
         let _ = self.tx_command.send(PlayerCommand::SetVoiceLimit(limit));
+    }
+
+    /// Debug builds: set the Opus bitrate of the prerender buffer.
+    #[cfg(debug_assertions)]
+    pub fn set_opus_bitrate(&self, kbps: u32) {
+        let _ = self.tx_command.send(PlayerCommand::SetOpusBitrate(kbps));
+    }
+
+    /// Debug builds: snapshot of the prerender Opus ViSQOL series.
+    #[cfg(debug_assertions)]
+    pub fn visqol_series(&self) -> Vec<(f32, u32)> {
+        lock_mutex(&self.visqol_series).clone()
     }
 
     pub fn set_midi_ev_buffer_size(&self, size: u32) {

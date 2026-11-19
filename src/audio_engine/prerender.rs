@@ -237,6 +237,173 @@ fn codec_delay(rate: u32) -> usize {
 /// Bit rate the buffered audio is encoded at.
 const OPUS_BITRATE_BPS: i32 = 256_000;
 
+/// Debug builds: scores the Opus round-trip quality of the stream
+/// being encoded with ViSQOL (audio mode, resampled to 48 kHz
+/// internally), producing one MOS-LQO score (1.0 to 5.0) per
+/// 1-second window scored every half second. A shadow decoder decodes
+/// every packet as it is encoded; the decoded samples are downmixed
+/// to mono alongside the encoder input, discarding the codec delay
+/// like the playback path, and completed windows wait in a small
+/// queue for the scoring worker (see `visqol_worker`).
+#[cfg(debug_assertions)]
+struct VisqolTracker {
+    rate: u32,
+    decoder: OpusDecoder,
+    delay_left: usize,
+    orig: Vec<f32>,
+    decoded: Vec<f32>,
+    scratch: Vec<f32>,
+    /// Mono samples of the sliding window being filled (original, decoded).
+    ref_seg: Vec<f64>,
+    deg_seg: Vec<f64>,
+    /// Completed windows waiting to be scored (ref, deg, bitrate_kbps), oldest first.
+    pending: std::collections::VecDeque<(Vec<f64>, Vec<f64>, u32)>,
+    series: Vec<(f32, u32)>,
+    window_frames: usize,
+    hop_frames: usize,
+}
+
+#[cfg(debug_assertions)]
+impl VisqolTracker {
+    fn new(rate: u32) -> Option<Self> {
+        let decoder = OpusDecoder::new(rate as i32, 2).ok()?;
+        let window_frames = rate as usize;
+        let hop_frames = (rate / 2) as usize;
+        Some(Self {
+            rate,
+            decoder,
+            delay_left: codec_delay(rate),
+            orig: Vec::new(),
+            decoded: Vec::new(),
+            scratch: vec![0.0; (rate / 50) as usize * 2],
+            ref_seg: Vec::with_capacity(window_frames),
+            deg_seg: Vec::with_capacity(window_frames),
+            pending: std::collections::VecDeque::new(),
+            series: Vec::new(),
+            window_frames,
+            hop_frames,
+        })
+    }
+
+    fn record(&mut self, orig: &[f32], packet: &[u8], frames: usize, bitrate_kbps: u32) {
+        self.orig.extend_from_slice(&orig[..frames * 2]);
+        let got = self
+            .decoder
+            .decode(packet, frames, &mut self.scratch)
+            .unwrap_or(0)
+            .min(frames);
+        self.decoded.extend_from_slice(&self.scratch[..got * 2]);
+        // A short decode pads with silence so counts stay exact.
+        for _ in got..frames {
+            self.decoded.extend_from_slice(&[0.0, 0.0]);
+        }
+        if self.delay_left > 0 {
+            let drop = (self.delay_left * 2).min(self.decoded.len());
+            self.decoded.drain(..drop);
+            self.delay_left -= drop / 2;
+        }
+        // Append the aligned samples as mono downmixes; whenever a
+        // full window is ready, queue it and advance by one hop.
+        let avail = (self.orig.len() / 2).min(self.decoded.len() / 2);
+        for i in 0..avail {
+            let j = i * 2;
+            self.ref_seg
+                .push((self.orig[j] + self.orig[j + 1]) as f64 * 0.5);
+            self.deg_seg
+                .push((self.decoded[j] + self.decoded[j + 1]) as f64 * 0.5);
+        }
+        self.orig.drain(..avail * 2);
+        self.decoded.drain(..avail * 2);
+        while self.ref_seg.len() >= self.window_frames {
+            let ref_win = self.ref_seg[..self.window_frames].to_vec();
+            let deg_win = self.deg_seg[..self.window_frames].to_vec();
+            if self.pending.len() >= 4 {
+                self.pending.pop_front();
+            }
+            self.pending.push_back((ref_win, deg_win, bitrate_kbps));
+            self.ref_seg.drain(..self.hop_frames);
+            self.deg_seg.drain(..self.hop_frames);
+        }
+    }
+
+    /// Take the oldest unscored window, if any.
+    fn take_work(&mut self) -> Option<VisqolWork> {
+        let (ref_seg, deg_seg, bitrate_kbps) = self.pending.pop_front()?;
+        Some(VisqolWork {
+            rate: self.rate,
+            ref_seg,
+            deg_seg,
+            bitrate_kbps,
+        })
+    }
+
+    /// Store a score computed by the scoring worker, with the
+    /// bitrate the scored window was encoded at.
+    fn push_score(&mut self, score: f32, bitrate_kbps: u32) {
+        self.series.push((score, bitrate_kbps));
+    }
+
+    fn snapshot(&self) -> Vec<(f32, u32)> {
+        self.series.clone()
+    }
+}
+
+/// Debug builds: one window of original/decoded mono audio waiting
+/// to be scored at the stream's sample rate.
+#[cfg(debug_assertions)]
+struct VisqolWork {
+    rate: u32,
+    ref_seg: Vec<f64>,
+    deg_seg: Vec<f64>,
+    bitrate_kbps: u32,
+}
+
+#[cfg(debug_assertions)]
+impl VisqolWork {
+    fn score(&self) -> Option<f32> {
+        use audio_samples_qoe::AudioSamplesQoE;
+
+        let rate = std::num::NonZeroU32::new(self.rate)?;
+        let reference = audio_samples::AudioSamples::new_mono(
+            ndarray::Array1::from_vec(self.ref_seg.clone()),
+            rate,
+        )
+        .ok()?;
+        let degraded = audio_samples::AudioSamples::new_mono(
+            ndarray::Array1::from_vec(self.deg_seg.clone()),
+            rate,
+        )
+        .ok()?;
+        reference.visqol(&degraded).ok().map(|score| score as f32)
+    }
+}
+
+/// Debug builds: the process-wide ViSQOL scoring worker. Scoring a
+/// segment takes a noticeable fraction of a second, so it must not
+/// run on the player loop or behind the session lock (the audio
+/// callback needs that lock every period); segments arrive here
+/// with the session they belong to, and scores are pushed back
+/// under a brief lock. If the session is gone by then, the score
+/// lands in an orphaned state and is simply never read.
+#[cfg(debug_assertions)]
+fn visqol_worker(
+) -> &'static std::sync::Mutex<std::sync::mpsc::Sender<(Arc<Shared>, VisqolWork)>> {
+    static WORKER: std::sync::OnceLock<
+        std::sync::Mutex<std::sync::mpsc::Sender<(Arc<Shared>, VisqolWork)>>,
+    > = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(Arc<Shared>, VisqolWork)>();
+        std::thread::spawn(move || {
+            while let Ok((shared, work)) = rx.recv() {
+                if let Some(score) = work.score() {
+                    shared.lock().ring.push_visqol_score(score, work.bitrate_kbps);
+                }
+            }
+        });
+        std::sync::Mutex::new(tx)
+    })
+}
+
 /// One encoded packet and the PCM frames it decodes to.
 struct Packet {
     data: Vec<u8>,
@@ -260,10 +427,18 @@ struct OpusStore {
     window: VecDeque<(f32, f32)>,
     /// Stream-start frames still to discard (the codec delay).
     delay_left: usize,
+    /// Frames a skip already accounted for that have not emerged from
+    /// the codec delay yet; dropped in `fill_window` as they emerge.
+    drop_ahead: usize,
     /// Scratch buffers, reused so decoding allocates nothing.
     encode_in: Vec<f32>,
     packet_out: Vec<u8>,
     decode_out: Vec<f32>,
+    /// Current encoder bit rate; kept so `reset` re-applies it.
+    bitrate_bps: i32,
+    /// Debug builds: round-trip quality measurement.
+    #[cfg(debug_assertions)]
+    visqol: Option<VisqolTracker>,
 }
 
 impl OpusStore {
@@ -283,16 +458,20 @@ impl OpusStore {
             packet_bytes: 0,
             window: VecDeque::new(),
             delay_left: codec_delay(rate),
+            drop_ahead: 0,
             encode_in: vec![0.0; packet_frames * 2],
             packet_out: vec![0u8; 16_384],
             decode_out: vec![0.0; packet_frames * 2],
+            bitrate_bps: OPUS_BITRATE_BPS,
+            #[cfg(debug_assertions)]
+            visqol: VisqolTracker::new(rate),
         })
     }
 
     /// Drop everything and restart the codec stream.
     fn reset(&mut self) {
         if let Ok(mut encoder) = OpusEncoder::new(self.rate as i32, 2, Application::Audio) {
-            encoder.bitrate_bps = OPUS_BITRATE_BPS;
+            encoder.bitrate_bps = self.bitrate_bps;
             self.encoder = encoder;
         }
         if let Ok(decoder) = OpusDecoder::new(self.rate as i32, 2) {
@@ -304,6 +483,49 @@ impl OpusStore {
         self.packet_bytes = 0;
         self.window.clear();
         self.delay_left = codec_delay(self.rate);
+        self.drop_ahead = 0;
+        #[cfg(debug_assertions)]
+        {
+            let prev_series = self
+                .visqol
+                .take()
+                .map(|t| t.series)
+                .unwrap_or_default();
+            self.visqol = VisqolTracker::new(self.rate).map(|mut t| {
+                t.series = prev_series;
+                t
+            });
+        }
+    }
+
+    /// Debug builds: set the encoder bit rate (kbps, clamped to the
+    /// selectable range) for the rest of this stream.
+    #[cfg(debug_assertions)]
+    fn set_bitrate(&mut self, kbps: u32) {
+        self.bitrate_bps = (kbps.clamp(6, 510) * 1_000) as i32;
+        self.encoder.bitrate_bps = self.bitrate_bps;
+    }
+
+    /// Debug builds: take the oldest unscored ViSQOL window.
+    #[cfg(debug_assertions)]
+    fn take_visqol_work(&mut self) -> Option<VisqolWork> {
+        self.visqol.as_mut().and_then(|tracker| tracker.take_work())
+    }
+
+    /// Debug builds: store a score computed by the scoring worker.
+    #[cfg(debug_assertions)]
+    fn push_visqol_score(&mut self, score: f32, bitrate_kbps: u32) {
+        if let Some(tracker) = &mut self.visqol {
+            tracker.push_score(score, bitrate_kbps);
+        }
+    }
+
+    /// Debug builds: the ViSQOL series so far ((MOS-LQO, bitrate_kbps) per window).
+    #[cfg(debug_assertions)]
+    fn visqol_snapshot(&self) -> Vec<(f32, u32)> {
+        self.visqol
+            .as_ref()
+            .map_or_else(Vec::new, |tracker| tracker.snapshot())
     }
 
     fn push_interleaved(&mut self, samples: &[f32]) {
@@ -320,6 +542,15 @@ impl OpusStore {
                     let data = self.packet_out[..len].to_vec();
                     self.packet_bytes += data.len();
                     self.packet_frames_total += frames;
+                    #[cfg(debug_assertions)]
+                    if let Some(tracker) = &mut self.visqol {
+                        tracker.record(
+                            &self.encode_in,
+                            &data,
+                            frames,
+                            (self.bitrate_bps / 1_000) as u32,
+                        );
+                    }
                     self.packets.push_back(Packet { data, frames });
                 }
                 Err(e) => {
@@ -367,6 +598,14 @@ impl OpusStore {
         for _ in got..packet.frames {
             self.window.push_back((0.0, 0.0));
         }
+        // Frames an earlier skip already accounted for can still be
+        // inside this packet (they emerge late, out of the codec
+        // delay); drop them here so they are never played.
+        if self.drop_ahead > 0 {
+            let drop = self.drop_ahead.min(self.window.len());
+            self.window.drain(..drop);
+            self.drop_ahead -= drop;
+        }
     }
 
     fn pop_front(&mut self) -> Option<(f32, f32)> {
@@ -387,7 +626,10 @@ impl OpusStore {
         // the decoder for whatever is decoded next, so its first frames
         // are not decoded cold.
         let mut last_dropped: Option<Packet> = None;
-        while n > 0 {
+        // While an earlier skip still owes frames, packets must go
+        // through the decoder so the owed frames are dropped inside
+        // fill_window instead of being counted twice here.
+        while n > 0 && self.drop_ahead == 0 {
             let Some(front) = self.packets.front() else {
                 break;
             };
@@ -407,11 +649,18 @@ impl OpusStore {
                 .decoder
                 .decode(&warm.data, warm.frames, &mut self.decode_out);
         }
-        if n > 0 && !self.packets.is_empty() {
+        // Decode packets until the skip is covered. One fill is not
+        // always enough: at the start of a stream the first fill loses
+        // the codec delay, so it can yield fewer frames than the skip
+        // still needs.
+        while n > 0 && !self.packets.is_empty() {
             self.fill_window();
             let from_window = n.min(self.window.len());
             self.window.drain(..from_window);
             n -= from_window;
+            if from_window == 0 {
+                break;
+            }
         }
         if n > 0 {
             // The skip lands in the not-yet-encoded tail; dropping raw
@@ -420,7 +669,13 @@ impl OpusStore {
             self.pending.drain(..from_pending);
             n -= from_pending;
         }
-        debug_assert_eq!(n, 0);
+        if n > 0 {
+            // The skip ran past everything decoded so far. The
+            // remaining frames are still inside the codec delay (the
+            // store delivers only pushed - delay frames until more
+            // audio is encoded), so drop them as they emerge.
+            self.drop_ahead += n;
+        }
     }
 
     fn memory_bytes(&self) -> u64 {
@@ -565,6 +820,40 @@ impl AudioQueue {
 
     fn is_compressed(&self) -> bool {
         matches!(self.store, Store::Opus(_))
+    }
+
+    /// Debug builds: take the oldest unscored ViSQOL segment.
+    #[cfg(debug_assertions)]
+    fn take_visqol_work(&mut self) -> Option<VisqolWork> {
+        match &mut self.store {
+            Store::Opus(store) => store.take_visqol_work(),
+            Store::Pcm(_) => None,
+        }
+    }
+
+    /// Debug builds: store a score computed by the scoring worker.
+    #[cfg(debug_assertions)]
+    fn push_visqol_score(&mut self, score: f32, bitrate_kbps: u32) {
+        if let Store::Opus(store) = &mut self.store {
+            store.push_visqol_score(score, bitrate_kbps);
+        }
+    }
+
+    /// Debug builds: the ViSQOL series so far.
+    #[cfg(debug_assertions)]
+    fn visqol_snapshot(&self) -> Vec<(f32, u32)> {
+        match &self.store {
+            Store::Opus(store) => store.visqol_snapshot(),
+            Store::Pcm(_) => Vec::new(),
+        }
+    }
+
+    /// Debug builds: set the Opus encoder bit rate (kbps).
+    #[cfg(debug_assertions)]
+    fn set_opus_bitrate(&mut self, kbps: u32) {
+        if let Store::Opus(store) = &mut self.store {
+            store.set_bitrate(kbps);
+        }
     }
 
     /// Oldest buffered frame, decoding the head packet if needed.
@@ -787,6 +1076,31 @@ impl Session {
     /// at a rate Opus does not support).
     pub fn compressed(&self) -> bool {
         self.shared.lock().ring.is_compressed()
+    }
+
+    /// Debug builds: ViSQOL MOS-LQO and bitrate (kbps) of the Opus
+    /// round trip, one value per 1-second window scored every half
+    /// second, for the debug graph window. Empty for PCM sessions.
+    #[cfg(debug_assertions)]
+    pub fn visqol_series(&self) -> Vec<(f32, u32)> {
+        // Hand unscored segments to the scoring worker instead of
+        // scoring here: the caller is the player loop, and a ViSQOL
+        // run would stall it (and, through this lock, the audio
+        // callback) for a noticeable fraction of a second per
+        // segment, every segment.
+        if let Some(work) = self.shared.lock().ring.take_visqol_work() {
+            let tx = visqol_worker()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = tx.send((self.shared.clone(), work));
+        }
+        self.shared.lock().ring.visqol_snapshot()
+    }
+
+    /// Debug builds: set the Opus encoder bit rate (kbps, 6 to 510).
+    #[cfg(debug_assertions)]
+    pub fn set_opus_bitrate(&self, kbps: u32) {
+        self.shared.lock().ring.set_opus_bitrate(kbps);
     }
 
     /// Rendered audio waiting to be played, in wall-clock nanoseconds.
@@ -1697,6 +2011,100 @@ mod tests {
             queue.memory_bytes() < pcm_bytes / 6,
             "{} bytes vs {pcm_bytes} raw",
             queue.memory_bytes()
+        );
+    }
+
+    #[test]
+    fn opus_skip_before_first_decode_consumes_exactly() {
+        // Regression: skipping into the first packet of a fresh stream,
+        // before anything was decoded, used to fall short by up to the
+        // codec delay (the first fill yields packet_frames - delay),
+        // tripping the debug assertion at the end of skip_frames.
+        let mut queue = AudioQueue::new(48_000);
+        let total = 1_920; // two packets
+        let mut pcm = Vec::with_capacity(total * 2);
+        for i in 0..total {
+            let t = i as f32 / 48_000.0;
+            let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+            pcm.extend([v, v]);
+        }
+        queue.push_interleaved(&pcm);
+        queue.skip_frames(928);
+        assert_eq!(queue.frames(), total - 928);
+        assert!(queue.pop_front().is_some());
+        assert_eq!(queue.frames(), total - 929);
+    }
+
+    #[test]
+    fn opus_skip_into_the_unemerged_delay_tail() {
+        // The store delivers pushed - delay frames until more audio is
+        // encoded, but the queue counts pushed frames. Skipping into
+        // that not-yet-emerged tail used to trip the assertion at the
+        // end of skip_frames; the tail frames must instead be dropped
+        // when they emerge.
+        let mut queue = AudioQueue::new(48_000);
+        let mut pcm = Vec::new();
+        for i in 0..1_920 {
+            let t = i as f32 / 48_000.0;
+            let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+            pcm.extend([v, v]);
+        }
+        queue.push_interleaved(&pcm);
+        // Drain everything decodable: 1920 pushed - 120 delay.
+        let mut popped = 0;
+        while queue.pop_front().is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 1_800);
+        assert_eq!(queue.frames(), 120);
+        // Skip the phantom tail: no panic, counts stay exact.
+        queue.skip_frames(120);
+        assert_eq!(queue.frames(), 0);
+        // The next packet's decode first yields the skipped tail
+        // (dropped inside fill_window), then the new audio.
+        queue.push_interleaved(&pcm[..960 * 2]);
+        assert_eq!(queue.frames(), 960);
+        let mut popped = 0;
+        while queue.pop_front().is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 840);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn opus_visqol_series_scores_a_clean_signal() {
+        let mut queue = AudioQueue::new(48_000);
+        // Four seconds of a harmonic stack (a little more music-like
+        // than a lone sine): enough for several 1 s sliding windows.
+        let total = 48_000 * 4;
+        let mut pcm = Vec::with_capacity(total * 2);
+        for i in 0..total {
+            let t = i as f32 / 48_000.0;
+            let v = (t * 220.0 * std::f32::consts::TAU).sin() * 0.3
+                + (t * 440.0 * std::f32::consts::TAU).sin() * 0.2
+                + (t * 880.0 * std::f32::consts::TAU).sin() * 0.1;
+            pcm.extend([v, v]);
+        }
+        queue.push_interleaved(&pcm);
+        // Scoring normally runs on the worker thread; run it inline.
+        let mut series = Vec::new();
+        for _ in 0..10 {
+            if let Some(work) = queue.take_visqol_work() {
+                if let Some(score) = work.score() {
+                    queue.push_visqol_score(score, work.bitrate_kbps);
+                }
+            }
+            series = queue.visqol_snapshot();
+            if !series.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(series.len(), 1, "series: {series:?}");
+        assert!(
+            series[0].0 > 3.5,
+            "clean Opus round trip scored {}",
+            series[0].0
         );
     }
 

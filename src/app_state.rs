@@ -154,6 +154,18 @@ pub struct AppState {
     pub audio_engine: usize,
     /// Longest prerendered audio buffer, in seconds.
     pub audio_buffer_secs: u32,
+    /// Debug builds: Opus bitrate of the prerender buffer, in kbps.
+    #[cfg(debug_assertions)]
+    pub opus_bitrate_kbps: u32,
+    /// Debug builds: whether the ViSQOL graph window is shown.
+    #[cfg(debug_assertions)]
+    pub visqol_window_enabled: bool,
+    #[cfg(debug_assertions)]
+    pub visqol_window_animation: f32,
+    #[cfg(debug_assertions)]
+    pub visqol_slider_dragging: bool,
+    #[cfg(debug_assertions)]
+    pub visqol_bitrate_field: crate::ui_components::numeric_slider::NumericSliderState,
 
     // UI (non-editor)
     pub last_input_event: Option<InputEvent>,
@@ -171,6 +183,8 @@ pub struct AppState {
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
+    #[cfg(debug_assertions)]
+    pub settings_opus_bitrate_slider: crate::ui_components::numeric_slider::NumericSliderState,
     /// Built-in piano synth voice limit; 0 = unlimited.
     pub voice_limit: u32,
     pub settings_voice_limit_slider: crate::ui_components::numeric_slider::NumericSliderState,
@@ -285,6 +299,17 @@ impl AppState {
             midi_ev_mode: 0,
             audio_engine: 0,
             audio_buffer_secs: crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS,
+            #[cfg(debug_assertions)]
+            opus_bitrate_kbps: 256,
+            #[cfg(debug_assertions)]
+            visqol_window_enabled: false,
+            #[cfg(debug_assertions)]
+            visqol_window_animation: 0.0,
+            #[cfg(debug_assertions)]
+            visqol_slider_dragging: false,
+            #[cfg(debug_assertions)]
+            visqol_bitrate_field:
+                crate::ui_components::numeric_slider::NumericSliderState::default(),
 
             // UI (non-editor)
             last_input_event: None,
@@ -302,6 +327,9 @@ impl AppState {
             settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_buffer_slider:
+                crate::ui_components::numeric_slider::NumericSliderState::default(),
+            #[cfg(debug_assertions)]
+            settings_opus_bitrate_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             voice_limit: 0,
             settings_voice_limit_slider: Default::default(),
