@@ -127,6 +127,10 @@ pub struct AppState {
     pub shake_state: ShakeState,
     pub integrate_keyboard: bool,
     pub keyboard_animation: f32,
+    /// Show the piano roll as a frameless background layer filling the
+    /// whole application window, with the other windows above it.
+    pub piano_roll_fullscreen: bool,
+    pub piano_roll_fullscreen_animation: f32,
     pub autoplay_on_load: bool,
     pub autoplay_animation: f32,
     pub pitch_bend_spring_parameters: [u32; 3],
@@ -279,6 +283,8 @@ impl AppState {
             shake_state: ShakeState::new(),
             integrate_keyboard: false,
             keyboard_animation: 0.0,
+            piano_roll_fullscreen: false,
+            piano_roll_fullscreen_animation: 0.0,
             autoplay_on_load: false,
             autoplay_animation: 0.0,
             pitch_bend_spring_parameters: [1, 170, 26],

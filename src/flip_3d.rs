@@ -113,6 +113,12 @@ impl Flip3D {
 
     pub fn open(&mut self, window_manager: &WindowManager, direction: i32) {
         let mut ids = window_manager.get_window_ids_sorted();
+        // Locked windows are background layers, not switchable windows.
+        ids.retain(|id| {
+            window_manager
+                .get_window(*id)
+                .map_or(false, |window| !window.background)
+        });
         if ids.is_empty() {
             return;
         }

@@ -220,6 +220,11 @@ fn main() {
     let mut current_layout_width = 800;
     let mut current_layout_height = 80;
     let mut last_integrate_keyboard = app_state.integrate_keyboard;
+    let mut last_piano_roll_fullscreen = app_state.piano_roll_fullscreen;
+    // Rectangle and z-order of the piano roll window, saved when the
+    // fullscreen piano roll starts so it can be restored as it was.
+    let mut saved_roll_layout: Option<(window_manager::Rectangle, i32)> = None;
+    let mut last_screen_size = (0, 0);
 
     // Piano roll: scans ahead of the playhead on its own threads and hands the
     // render thread finished windows lock-free (see piano_roll.rs). Seeks, new
@@ -348,6 +353,37 @@ fn main() {
             last_integrate_keyboard = app_state.integrate_keyboard;
         }
 
+        // Apply a fullscreen piano roll toggle: on, the piano roll becomes
+        // a background layer covering the whole application window
+        // (the other windows stay visible and usable above it); off, its
+        // saved rectangle and z-order are restored.
+        if app_state.piano_roll_fullscreen != last_piano_roll_fullscreen {
+            last_piano_roll_fullscreen = app_state.piano_roll_fullscreen;
+            current_layout_width = -1; // Force layout update
+            if app_state.piano_roll_fullscreen {
+                if let Some(window) = window_manager.get_window(piano_roll_window_handle) {
+                    saved_roll_layout = Some((window.rectangle, window.z_order));
+                }
+                window_manager.send_window_to_back(piano_roll_window_handle);
+                window_manager.set_window_background(piano_roll_window_handle, true);
+                window_manager.set_window_rectangle(
+                    piano_roll_window_handle,
+                    window_manager::Rectangle::new(
+                        0,
+                        0,
+                        rl.get_screen_width(),
+                        rl.get_screen_height(),
+                    ),
+                );
+            } else {
+                window_manager.set_window_background(piano_roll_window_handle, false);
+                if let Some((rectangle, z_order)) = saved_roll_layout.take() {
+                    window_manager.set_window_rectangle(piano_roll_window_handle, rectangle);
+                    window_manager.set_window_z_order(piano_roll_window_handle, z_order);
+                }
+            }
+        }
+
         // Limit dt to prevent physics explosion on lag (max 100ms)
         let dt = rl.get_frame_time().min(0.1);
 
@@ -380,6 +416,12 @@ fn main() {
         animate_toggle(
             app_state.integrate_keyboard,
             &mut app_state.keyboard_animation,
+            dt,
+            anim_speed,
+        );
+        animate_toggle(
+            app_state.piano_roll_fullscreen,
+            &mut app_state.piano_roll_fullscreen_animation,
             dt,
             anim_speed,
         );
@@ -488,13 +530,30 @@ fn main() {
             dt,
         );
 
+        // While the piano roll is fullscreen, follow application window
+        // resizes so the roll layer always covers the whole window. The
+        // window itself is a background layer, so nothing else can
+        // move or resize it.
+        let screen_size = (rl.get_screen_width(), rl.get_screen_height());
+        if app_state.piano_roll_fullscreen && screen_size != last_screen_size {
+            window_manager.set_window_rectangle(
+                piano_roll_window_handle,
+                window_manager::Rectangle::new(0, 0, screen_size.0, screen_size.1),
+            );
+        }
+        last_screen_size = screen_size;
+
         // Check if keyboard layout needs update
         let layout_update_needed = {
             if app_state.integrate_keyboard {
                 if let Some(pr_win) = window_manager.get_window(piano_roll_window_handle) {
                     let content_w = pr_win.rectangle.width as f32;
-                    let content_h =
-                        (pr_win.rectangle.height - pr_win.get_window_titlebar_height()) as f32;
+                    let titlebar_h = if app_state.piano_roll_fullscreen {
+                        0
+                    } else {
+                        pr_win.get_window_titlebar_height()
+                    };
+                    let content_h = (pr_win.rectangle.height - titlebar_h) as f32;
                     let w = content_w as i32;
                     let h = compute_integrated_keyboard_height(content_w, content_h) as i32;
                     if w != current_layout_width || h != current_layout_height {
@@ -887,6 +946,18 @@ fn main() {
         let is_mouse_down = rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
         let window_ids = window_manager.get_window_ids_sorted();
 
+        // A fullscreen piano roll is frameless: no border and no titlebar,
+        // so its content fills the whole application window while the
+        // other windows float above it.
+        let roll_frameless = app_state.piano_roll_fullscreen;
+        let eff_bt = |wid: i32| -> i32 {
+            if roll_frameless && wid == piano_roll_window_handle {
+                0
+            } else {
+                window_manager::BORDER_THICKNESS
+            }
+        };
+
         // The composite render texture is exactly the screen; it is (re)created only on
         // window resize, above. It used to grow to enclose off-screen windows and bend
         // overflow, reallocating every frame as a window was dragged away, all to hold
@@ -901,7 +972,7 @@ fn main() {
                     content_rt_padding.remove(&wid);
                     continue;
                 }
-                let bt = window_manager::BORDER_THICKNESS;
+                let bt = eff_bt(wid);
                 let base_w = window.rectangle.width + 2 * bt;
                 let base_h = window.rectangle.height + 2 * bt;
 
@@ -946,7 +1017,7 @@ fn main() {
                 Some(w) if w.visible => w,
                 _ => continue,
             };
-            let bt = window_manager::BORDER_THICKNESS;
+            let bt = eff_bt(wid);
             let rt_w = window.rectangle.width + 2 * bt;
             let rt_h = window.rectangle.height + 2 * bt;
             let padding = *content_rt_padding.get(&wid).unwrap_or(&0.0) as i32;
@@ -961,7 +1032,11 @@ fn main() {
                 let mut d_rt = d.begin_texture_mode(&thread, win_rt);
                 d_rt.clear_background(Color::new(0, 0, 0, 0));
 
-                let titlebar_h = window.get_window_titlebar_height();
+                let titlebar_h = if roll_frameless && wid == piano_roll_window_handle {
+                    0
+                } else {
+                    window.get_window_titlebar_height()
+                };
                 let content_w = window.rectangle.width as f32;
                 let content_h = (window.rectangle.height - titlebar_h) as f32;
 
@@ -981,6 +1056,7 @@ fn main() {
                 let fh = content_h as i32 + titlebar_h + 2 * bt;
 
                 // Border strips (shifted down by padding to leave room for bending)
+                if bt > 0 {
                 d_rt.draw_rectangle(0, padding, fw, bt, border_color);
                 d_rt.draw_rectangle(0, fh - bt + padding, fw, bt, border_color);
                 d_rt.draw_rectangle(
@@ -997,6 +1073,7 @@ fn main() {
                     titlebar_h + content_h as i32,
                     border_color,
                 );
+                }
 
                 // Content background
                 d_rt.draw_rectangle(
@@ -1008,6 +1085,7 @@ fn main() {
                 );
 
                 // Title bar
+                if titlebar_h > 0 {
                 let wm_tb_active = window_manager.get_window_titlebar_active_color();
                 let wm_tb_inactive = window_manager.get_window_titlebar_inactive_color();
                 let wm_tb = if window.is_active {
@@ -1030,6 +1108,7 @@ fn main() {
                     titlebar_h - 10,
                     Color::WHITE,
                 );
+                }
 
                 // Content origin in RT-local coordinates
                 let cx = win_org as f32;
@@ -1431,92 +1510,6 @@ fn main() {
             } else {
                 d_rt.clear_background(Color::new(31, 31, 31, 255));
 
-                let fps = 1.0 / d_rt.get_frame_time();
-                d_rt.draw_text(
-                    format!("FPS: {:.2}", fps).as_str(),
-                    10,
-                    10,
-                    20,
-                    Color::WHITE,
-                );
-
-                // Statistics overlay, pinned to the top-right corner (toggled in Settings).
-                // Drawn as a translucent panel; fades with its animation.
-                let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
-                if stats_alpha > 0.01 {
-                    let tempo_us = app_state.tempo_us_value.max(1);
-                    let bpm = (60_000_000.0 / tempo_us as f64).round() as u64;
-                    let total = app_state
-                        .midi_data
-                        .as_ref()
-                        .map(|data| data.total_note_on_events())
-                        .unwrap_or(0);
-                    let mut lines = vec![
-                        format!(
-                            "NPS   {}",
-                            group_thousands(app_state.nps_value.round() as u64)
-                        ),
-                        format!(
-                            "NOTES {} / {}",
-                            group_thousands(engine.notes_played()),
-                            group_thousands(total)
-                        ),
-                        format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
-                    ];
-                    // Prerender engines only.
-                    if let Some(voices) = engine.polyphony() {
-                        lines.push(format!("POLY  {}", group_thousands(voices as u64)));
-                    }
-                    if let Some(vel) = engine.skipping_velocity() {
-                        lines.push(format!("Skipping Vel: {vel}"));
-                    }
-                    if let Some(buffered_ns) = engine.audio_buffer_ns() {
-                        // m:ss.xx, rounded to centiseconds.
-                        let mss = |ns: u64| {
-                            let cs = (ns + 5_000_000) / 10_000_000;
-                            format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
-                        };
-                        let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
-                        lines.push(format!("AUDIO BUF {} / {}", mss(buffered_ns), mss(max_ns)));
-                    }
-                    if let Some((used, _, compressed)) = engine.buffer_memory() {
-                        if compressed {
-                            lines.push(format!("AUDIO BUF {}", utils::format_bytes(used)));
-                        } else {
-                            lines.push(format!("AUDIO BUF {} (PCM)", utils::format_bytes(used)));
-                        }
-                    }
-                    let font_size = 18;
-                    let pad = 8;
-                    let line_h = 22;
-                    let panel_w = 330;
-                    let panel_h = pad * 2 + line_h * lines.len() as i32;
-                    let px = screen_width - panel_w - 10;
-                    let py = 10;
-                    let bg_a = (180.0 * stats_alpha) as u8;
-                    let border_a = (200.0 * stats_alpha) as u8;
-                    let text_a = (255.0 * stats_alpha) as u8;
-                    d_rt.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 24, bg_a));
-                    // draw_rectangle_lines is GL-line based and rasterizes off-by-one from the
-                    // filled rect, leaving a 1px sliver of fill outside the border. draw_rectangle_lines_ex
-                    // draws the border as filled rects inside the rectangle bounds, so it lands
-                    // exactly on the fill's edge columns/rows.
-                    d_rt.draw_rectangle_lines_ex(
-                        Rectangle::new(px as f32, py as f32, panel_w as f32, panel_h as f32),
-                        1.0,
-                        Color::new(0, 135, 200, border_a),
-                    );
-                    for (i, line) in lines.iter().enumerate() {
-                        d_rt.draw_text(
-                            line,
-                            px + pad,
-                            py + pad + i as i32 * line_h,
-                            font_size,
-                            Color::new(210, 225, 255, text_a),
-                        );
-                    }
-                }
-
                 for &wid in &window_ids {
                     let window = match window_manager.get_window(wid) {
                         Some(w) if w.visible => w,
@@ -1527,7 +1520,7 @@ fn main() {
                         None => continue,
                     };
 
-                    let bt = window_manager::BORDER_THICKNESS;
+                    let bt = eff_bt(wid);
                     let rt_w = win_rt.texture.width as f32;
                     let rt_h = win_rt.texture.height as f32;
                     let screen_x = (window.rectangle.left() - bt) as f32;
@@ -1662,6 +1655,97 @@ fn main() {
             Color::WHITE,
         );
 
+        // Topmost screen layer: the FPS readout and the statistics
+        // overlay are drawn on the backbuffer after the window composite,
+        // so no window can cover them.
+        if !flip_3d.is_active() {
+            let fps = 1.0 / d.get_frame_time();
+            d.draw_text(
+                format!("FPS: {:.2}", fps).as_str(),
+                10,
+                10,
+                20,
+                Color::WHITE,
+            );
+
+            // Statistics overlay, pinned to the top-right corner (toggled in Settings).
+            // Drawn as a translucent panel; fades with its animation.
+            let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
+            if stats_alpha > 0.01 {
+                let tempo_us = app_state.tempo_us_value.max(1);
+                let bpm = (60_000_000.0 / tempo_us as f64).round() as u64;
+                let total = app_state
+                    .midi_data
+                    .as_ref()
+                    .map(|data| data.total_note_on_events())
+                    .unwrap_or(0);
+                let mut lines = vec![
+                    format!(
+                        "NPS   {}",
+                        group_thousands(app_state.nps_value.round() as u64)
+                    ),
+                    format!(
+                        "NOTES {} / {}",
+                        group_thousands(engine.notes_played()),
+                        group_thousands(total)
+                    ),
+                    format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
+                ];
+                // Prerender engines only.
+                if let Some(voices) = engine.polyphony() {
+                    lines.push(format!("POLY  {}", group_thousands(voices as u64)));
+                }
+                if let Some(vel) = engine.skipping_velocity() {
+                    lines.push(format!("Skipping Vel: {vel}"));
+                }
+                if let Some(buffered_ns) = engine.audio_buffer_ns() {
+                    // m:ss.xx, rounded to centiseconds.
+                    let mss = |ns: u64| {
+                        let cs = (ns + 5_000_000) / 10_000_000;
+                        format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
+                    };
+                    let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
+                    lines.push(format!("AUDIO BUF {} / {}", mss(buffered_ns), mss(max_ns)));
+                }
+                if let Some((used, _, compressed)) = engine.buffer_memory() {
+                    if compressed {
+                        lines.push(format!("AUDIO BUF {}", utils::format_bytes(used)));
+                    } else {
+                        lines.push(format!("AUDIO BUF {} (PCM)", utils::format_bytes(used)));
+                    }
+                }
+                let font_size = 18;
+                let pad = 8;
+                let line_h = 22;
+                let panel_w = 330;
+                let panel_h = pad * 2 + line_h * lines.len() as i32;
+                let px = screen_width - panel_w - 10;
+                let py = 10;
+                let bg_a = (180.0 * stats_alpha) as u8;
+                let border_a = (200.0 * stats_alpha) as u8;
+                let text_a = (255.0 * stats_alpha) as u8;
+                d.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 24, bg_a));
+                // draw_rectangle_lines is GL-line based and rasterizes off-by-one from the
+                // filled rect, leaving a 1px sliver of fill outside the border. draw_rectangle_lines_ex
+                // draws the border as filled rects inside the rectangle bounds, so it lands
+                // exactly on the fill's edge columns/rows.
+                d.draw_rectangle_lines_ex(
+                    Rectangle::new(px as f32, py as f32, panel_w as f32, panel_h as f32),
+                    1.0,
+                    Color::new(0, 135, 200, border_a),
+                );
+                for (i, line) in lines.iter().enumerate() {
+                    d.draw_text(
+                        line,
+                        px + pad,
+                        py + pad + i as i32 * line_h,
+                        font_size,
+                        Color::new(210, 225, 255, text_a),
+                    );
+                }
+            }
+        }
+
         // Flip 3D draws to the backbuffer rather than render_texture because only
         // the backbuffer is multisampled, and the tilted card edges need MSAA.
         flip_3d.draw(
@@ -1717,6 +1801,8 @@ fn main() {
                             app_state.shake_animation,
                             &mut app_state.integrate_keyboard,
                             app_state.keyboard_animation,
+                            &mut app_state.piano_roll_fullscreen,
+                            app_state.piano_roll_fullscreen_animation,
                             &mut app_state.settings_scroll_y,
                             wheel,
                             &mut app_state.autoplay_on_load,

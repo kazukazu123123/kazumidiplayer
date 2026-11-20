@@ -1057,6 +1057,8 @@ pub fn draw_settings_overlay(
     shake_animation: f32,
     integrate_keyboard: &mut bool,
     keyboard_animation: f32,
+    piano_roll_fullscreen: &mut bool,
+    piano_roll_fullscreen_animation: f32,
     scroll_y: &mut f32,
     mouse_wheel: f32,
     autoplay_on_load: &mut bool,
@@ -1458,6 +1460,25 @@ pub fn draw_settings_overlay(
                     Some(mouse_world_pos),
                 ) {
                     *integrate_keyboard = !*integrate_keyboard;
+                }
+            }
+
+            // Fullscreen Piano Roll Toggle
+            let y = layout.next(30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Spread the piano roll across the whole application window as a background layer, with the other windows floating above it."));
+            let fullscreen_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
+            if is_visible(fullscreen_rect.y, fullscreen_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    fullscreen_rect,
+                    "Fullscreen Piano Roll",
+                    piano_roll_fullscreen_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *piano_roll_fullscreen = !*piano_roll_fullscreen;
                 }
             }
 

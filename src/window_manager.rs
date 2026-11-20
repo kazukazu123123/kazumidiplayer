@@ -131,6 +131,10 @@ pub struct Window {
     pub title: String,
     pub is_active: bool,
     pub visible: bool,
+    /// A background window is a back layer: it cannot be moved, resized
+    /// or raised by input, but it can still become active and receive
+    /// content clicks.
+    pub background: bool,
     pub rectangle: Rectangle,
     window_titlebar_height: i32,
     pub min_width: Option<i32>,
@@ -157,6 +161,7 @@ impl Window {
             title,
             is_active: false,
             visible: true,
+            background: false,
             rectangle: Rectangle::new(
                 x.max(0),
                 y.max(0),
@@ -294,6 +299,16 @@ impl WindowManager {
     }
 
     pub fn activate_window(&mut self, window_id: i32) {
+        // Background windows take focus without being raised above
+        // the other windows: layering and activation stay separate.
+        if self.windows.get(&window_id).map_or(false, |w| w.background) {
+            self.deactivate_all_windows();
+            if let Some(window) = self.windows.get_mut(&window_id) {
+                window.is_active = true;
+            }
+            return;
+        }
+
         // Deactivate all windows
         self.deactivate_all_windows();
 
@@ -333,7 +348,7 @@ impl WindowManager {
                     let (resize_mode, _) =
                         self.get_resize_mode_at_position(window_id, mouse_location);
 
-                    if resize_mode != ResizeMode::None {
+                    if !window.background && resize_mode != ResizeMode::None {
                         let start_rect = window.rectangle;
                         target_window_id = Some(window_id);
                         self.is_resizing = true;
@@ -351,7 +366,7 @@ impl WindowManager {
                         self.window_titlebar_height,
                     );
 
-                    if titlebar_rect.contains(mouse_location) {
+                    if !window.background && titlebar_rect.contains(mouse_location) {
                         let window_left = window.rectangle.left();
                         let window_top = window.rectangle.top();
 
@@ -382,6 +397,9 @@ impl WindowManager {
         }
 
         if let Some(id) = target_window_id {
+            // activate_window keeps background windows in the back layer:
+            // the click gives them focus (and unfocuses the others)
+            // without raising them.
             self.activate_window(id);
             // Re-borrow window to handle input safely
             if let Some(window) = self.windows.get_mut(&id) {
@@ -576,9 +594,69 @@ impl WindowManager {
 
     pub fn move_window(&mut self, window_id: i32, x: i32, y: i32) {
         if let Some(window) = self.windows.get_mut(&window_id) {
+            if window.background {
+                return;
+            }
             window.rectangle.x = x;
             window.rectangle.y = y;
         }
+    }
+
+    pub fn set_window_rectangle(&mut self, window_id: i32, rectangle: Rectangle) {
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.rectangle = rectangle;
+        }
+    }
+
+    pub fn set_window_background(&mut self, window_id: i32, background: bool) {
+        if background {
+            if self.dragging_window == Some(window_id) {
+                self.is_dragging = false;
+                self.dragging_window = None;
+            }
+            if self.resizing_window == Some(window_id) {
+                self.is_resizing = false;
+                self.resizing_window = None;
+            }
+        }
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.background = background;
+        }
+    }
+
+    pub fn send_window_to_back(&mut self, window_id: i32) {
+        let Some(old_z) = self.windows.get(&window_id).map(|w| w.z_order) else {
+            return;
+        };
+        let min_z = self
+            .windows
+            .values()
+            .map(|w| w.z_order)
+            .min()
+            .unwrap_or(old_z);
+        if min_z == old_z {
+            return;
+        }
+        let new_z = min_z - 1;
+        self.z_order_to_id.remove(&old_z);
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.z_order = new_z;
+        }
+        self.z_order_to_id.insert(new_z, window_id);
+    }
+
+    pub fn set_window_z_order(&mut self, window_id: i32, z_order: i32) {
+        let Some(old_z) = self.windows.get(&window_id).map(|w| w.z_order) else {
+            return;
+        };
+        if old_z == z_order {
+            return;
+        }
+        self.z_order_to_id.remove(&old_z);
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.z_order = z_order;
+        }
+        self.z_order_to_id.insert(z_order, window_id);
     }
 
     pub fn set_window_min_size(
@@ -645,6 +723,9 @@ impl WindowManager {
         mouse_pos: Point,
     ) -> (ResizeMode, CursorType) {
         if let Some(window) = self.windows.get(&window_id) {
+            if window.background {
+                return (ResizeMode::None, CursorType::Default);
+            }
             let rect = &window.rectangle;
             let resize_margin = BORDER_THICKNESS * 2;
 
