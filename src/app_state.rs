@@ -131,6 +131,10 @@ pub struct AppState {
     /// whole application window, with the other windows above it.
     pub piano_roll_fullscreen: bool,
     pub piano_roll_fullscreen_animation: f32,
+    /// While the piano roll is fullscreen, pin the player controls
+    /// window to the top of the application window.
+    pub dock_controls_top: bool,
+    pub dock_controls_top_animation: f32,
     pub autoplay_on_load: bool,
     pub autoplay_animation: f32,
     pub pitch_bend_spring_parameters: [u32; 3],
@@ -158,8 +162,7 @@ pub struct AppState {
     pub audio_engine: usize,
     /// Longest prerendered audio buffer, in seconds.
     pub audio_buffer_secs: u32,
-    /// Debug builds: Opus bitrate of the prerender buffer, in kbps.
-    #[cfg(debug_assertions)]
+    /// Opus bitrate of the prerender buffer, in kbps.
     pub opus_bitrate_kbps: u32,
     /// Debug builds: whether the ViSQOL graph window is shown.
     #[cfg(debug_assertions)]
@@ -187,7 +190,6 @@ pub struct AppState {
     pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
     pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
-    #[cfg(debug_assertions)]
     pub settings_opus_bitrate_slider: crate::ui_components::numeric_slider::NumericSliderState,
     /// Built-in piano synth voice limit; 0 = unlimited.
     pub voice_limit: u32,
@@ -285,6 +287,8 @@ impl AppState {
             keyboard_animation: 0.0,
             piano_roll_fullscreen: false,
             piano_roll_fullscreen_animation: 0.0,
+            dock_controls_top: false,
+            dock_controls_top_animation: 0.0,
             autoplay_on_load: false,
             autoplay_animation: 0.0,
             pitch_bend_spring_parameters: [1, 170, 26],
@@ -305,7 +309,6 @@ impl AppState {
             midi_ev_mode: 0,
             audio_engine: 0,
             audio_buffer_secs: crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS,
-            #[cfg(debug_assertions)]
             opus_bitrate_kbps: 256,
             #[cfg(debug_assertions)]
             visqol_window_enabled: false,
@@ -334,7 +337,6 @@ impl AppState {
             settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
             settings_audio_buffer_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
-            #[cfg(debug_assertions)]
             settings_opus_bitrate_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             voice_limit: 0,

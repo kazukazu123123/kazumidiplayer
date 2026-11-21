@@ -1059,6 +1059,8 @@ pub fn draw_settings_overlay(
     keyboard_animation: f32,
     piano_roll_fullscreen: &mut bool,
     piano_roll_fullscreen_animation: f32,
+    dock_controls_top: &mut bool,
+    dock_controls_top_animation: f32,
     scroll_y: &mut f32,
     mouse_wheel: f32,
     autoplay_on_load: &mut bool,
@@ -1091,12 +1093,10 @@ pub fn draw_settings_overlay(
     // Prerender buffer (allocated bytes, output rate, Opus-compressed);
     // `None` while no prerender engine is open.
     buffer_memory: Option<(u64, u32, bool)>,
-    // Debug builds: Opus bitrate of the prerender buffer, and the
-    // ViSQOL graph window toggle.
-    #[cfg(debug_assertions)]
+    // Opus bitrate of the prerender buffer.
     opus_bitrate_kbps: &mut u32,
-    #[cfg(debug_assertions)]
     opus_bitrate_slider: &mut NumericSliderState,
+    // Debug builds: the ViSQOL graph window toggle.
     #[cfg(debug_assertions)]
     visqol_window_enabled: &mut bool,
     #[cfg(debug_assertions)]
@@ -1126,7 +1126,6 @@ pub fn draw_settings_overlay(
     let numeric_home = d.is_key_pressed(KeyboardKey::KEY_HOME);
     let numeric_end = d.is_key_pressed(KeyboardKey::KEY_END);
     let numeric_enter = d.is_key_pressed(KeyboardKey::KEY_ENTER);
-    #[cfg(debug_assertions)]
     let numeric_kp_enter = d.is_key_pressed(KeyboardKey::KEY_KP_ENTER);
     let numeric_escape = d.is_key_pressed(KeyboardKey::KEY_ESCAPE);
     let numeric_shift =
@@ -1482,6 +1481,25 @@ pub fn draw_settings_overlay(
                 }
             }
 
+            // Dock Player Controls to Top Toggle
+            let y = layout.next(30.0);
+            tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), "Pin the Player Controls window to the top of the application window, spanning its full width, while the piano roll is fullscreen."));
+            let dock_rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
+            if is_visible(dock_rect.y, dock_rect.height) {
+                if draw_toggle(
+                    &mut d_scissor,
+                    dock_rect,
+                    "Dock Player Controls to Top",
+                    dock_controls_top_animation,
+                    true,
+                    eased_t,
+                    click_pos,
+                    Some(mouse_world_pos),
+                ) {
+                    *dock_controls_top = !*dock_controls_top;
+                }
+            }
+
             // Autoplay on Load Toggle
             let y = layout.next(30.0);
             tips.push((
@@ -1591,8 +1609,7 @@ pub fn draw_settings_overlay(
                 }
             }
 
-            // Debug builds: Opus bitrate of the prerender buffer.
-            #[cfg(debug_assertions)]
+            // Opus bitrate of the prerender buffer.
             {
                 let y = layout.next(52.0);
                 if is_visible(sy(y), 52.0) {
@@ -1619,7 +1636,7 @@ pub fn draw_settings_overlay(
                     wheel_consumed |= draw_u32_numeric_slider(
                         &mut d_scissor,
                         Rectangle::new(column_x, sy(y), column_width, 52.0),
-                        "Opus Bitrate (debug)",
+                        "Opus Bitrate",
                         opus_bitrate_kbps,
                         6,
                         510,

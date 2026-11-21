@@ -54,8 +54,7 @@ pub enum PlayerCommand {
     SetS16Clipping(bool),
     /// Built-in piano synth: most voices at once, 0 = unlimited.
     SetVoiceLimit(u32),
-    /// Debug builds: Opus bitrate for the prerender buffer, in kbps.
-    #[cfg(debug_assertions)]
+    /// Opus bitrate for the prerender buffer, in kbps.
     SetOpusBitrate(u32),
 }
 
@@ -333,7 +332,6 @@ impl PlayerHandle {
             let mut audio_buffer_secs = crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS;
             let mut s16_clipping = false;
             let mut voice_limit = 0u32;
-            #[cfg(debug_assertions)]
             let mut opus_bitrate_kbps = 256u32;
             #[cfg(debug_assertions)]
             let mut visqol_consumed: usize = 0;
@@ -502,7 +500,6 @@ impl PlayerHandle {
                                 stream.set_voice_limit(limit);
                             }
                         }
-                        #[cfg(debug_assertions)]
                         PlayerCommand::SetOpusBitrate(kbps) => {
                             opus_bitrate_kbps = kbps;
                             if let Some(p) = prerender!(player) {
@@ -559,7 +556,6 @@ impl PlayerHandle {
                             if let Some(p) = prerender!(player) {
                                 p.set_bend_override(player.bend_override());
                                 p.set_max_buffer_secs(audio_buffer_secs);
-                                #[cfg(debug_assertions)]
                                 p.set_opus_bitrate(opus_bitrate_kbps);
                                 p.set_limiter_bypassed(s16_clipping);
                                 p.set_data(player.data.clone());
@@ -1119,8 +1115,7 @@ impl PlayerHandle {
         let _ = self.tx_command.send(PlayerCommand::SetVoiceLimit(limit));
     }
 
-    /// Debug builds: set the Opus bitrate of the prerender buffer.
-    #[cfg(debug_assertions)]
+    /// Set the Opus bitrate of the prerender buffer.
     pub fn set_opus_bitrate(&self, kbps: u32) {
         let _ = self.tx_command.send(PlayerCommand::SetOpusBitrate(kbps));
     }

@@ -498,9 +498,8 @@ impl OpusStore {
         }
     }
 
-    /// Debug builds: set the encoder bit rate (kbps, clamped to the
-    /// selectable range) for the rest of this stream.
-    #[cfg(debug_assertions)]
+    /// Set the encoder bit rate (kbps, clamped to the selectable
+    /// range) for the rest of this stream.
     fn set_bitrate(&mut self, kbps: u32) {
         self.bitrate_bps = (kbps.clamp(6, 510) * 1_000) as i32;
         self.encoder.bitrate_bps = self.bitrate_bps;
@@ -848,8 +847,7 @@ impl AudioQueue {
         }
     }
 
-    /// Debug builds: set the Opus encoder bit rate (kbps).
-    #[cfg(debug_assertions)]
+    /// Set the Opus encoder bit rate (kbps).
     fn set_opus_bitrate(&mut self, kbps: u32) {
         if let Store::Opus(store) = &mut self.store {
             store.set_bitrate(kbps);
@@ -1097,8 +1095,7 @@ impl Session {
         self.shared.lock().ring.visqol_snapshot()
     }
 
-    /// Debug builds: set the Opus encoder bit rate (kbps, 6 to 510).
-    #[cfg(debug_assertions)]
+    /// Set the Opus encoder bit rate (kbps, 6 to 510).
     pub fn set_opus_bitrate(&self, kbps: u32) {
         self.shared.lock().ring.set_opus_bitrate(kbps);
     }
