@@ -25,6 +25,16 @@
 /// Overall level before polyphonic summing. Calibrated so a 48-note full-velocity
 /// chord sits near the prerender limiter's -0.5 dBFS ceiling without heavy gain reduction.
 const VOICE_GAIN: f32 = 0.1;
+
+/// The one setting this synth publishes to the settings UI.
+pub const VOICE_LIMIT_SETTING: crate::audio_engine::EngineSettingDef =
+    crate::audio_engine::EngineSettingDef {
+        key: "voice_limit",
+        label: "Voice Limit (0 = unlimited)",
+        help: "Most notes the Piano engine plays at once (0 = unlimited). Over the limit, the quietest notes are faded out first, not the oldest, so loud and long-ringing notes stay. Lower uses less CPU on dense MIDIs.",
+        kind: crate::audio_engine::EngineSettingKind::U32Range { min: 0, max: 100_000 },
+        default: crate::audio_engine::EngineSettingValue::U32(0),
+    };
 /// SIMD-friendly lane count per voice.
 const LANES: usize = 32;
 /// Partials that get a prompt/aftersound lane pair; the rest get one lane.
@@ -1013,6 +1023,185 @@ impl PianoPrerender {
     }
 }
 
+/// Frames rendered per audio-callback block of the realtime stream.
+/// 256 frames at 48 kHz quantizes note onsets to about 5 ms, the same
+/// chunk size the prerender path renders in.
+const STREAM_BLOCK: usize = 256;
+
+/// Messages from the realtime engine's handle to its audio callback.
+enum StreamMsg {
+    Midi(u32),
+    VoiceLimit(u32),
+    LimiterBypassed(bool),
+}
+
+/// Lives in the audio callback: applies queued messages at each block
+/// boundary, renders one block of the prerender synth, and limits it with
+/// the same settings the prerender path uses (that limiter adds no delay,
+/// it only smooths a peak envelope, so realtime latency stays one block).
+struct StreamRenderer {
+    piano: PianoPrerender,
+    rx: std::sync::mpsc::Receiver<StreamMsg>,
+    limiter: crate::audio_limiter::AudioLimiter,
+    limiter_bypassed: bool,
+    left: [f32; STREAM_BLOCK],
+    right: [f32; STREAM_BLOCK],
+    interleaved: Vec<f32>,
+    pos: usize,
+}
+
+impl StreamRenderer {
+    fn render_block(&mut self) {
+        for msg in self.rx.try_iter() {
+            match msg {
+                StreamMsg::Midi(data) => self.piano.send_at(0, data),
+                StreamMsg::VoiceLimit(limit) => self.piano.set_voice_limit(limit),
+                StreamMsg::LimiterBypassed(bypassed) => self.limiter_bypassed = bypassed,
+            }
+        }
+        self.piano.render(&mut self.left, &mut self.right);
+        self.interleaved.clear();
+        for i in 0..STREAM_BLOCK {
+            self.interleaved.push(self.left[i]);
+            self.interleaved.push(self.right[i]);
+        }
+        if !self.limiter_bypassed {
+            self.limiter.process(&mut self.interleaved);
+        }
+        self.pos = 0;
+    }
+
+    fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, out: &mut [T], channels: usize) {
+        for frame in out.chunks_mut(channels) {
+            if self.pos == STREAM_BLOCK {
+                self.render_block();
+            }
+            let l = self.interleaved[self.pos * 2];
+            let r = self.interleaved[self.pos * 2 + 1];
+            self.pos += 1;
+            if channels == 1 {
+                frame[0] = T::from_sample((l + r) * 0.5);
+                continue;
+            }
+            for (i, sample) in frame.iter_mut().enumerate() {
+                let v = match i {
+                    0 => l,
+                    1 => r,
+                    _ => 0.0,
+                };
+                *sample = T::from_sample(v);
+            }
+        }
+    }
+}
+
+fn build_piano_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    mut renderer: StreamRenderer,
+) -> Result<cpal::Stream, String> {
+    use cpal::traits::DeviceTrait;
+    let channels = config.channels as usize;
+    device
+        .build_output_stream::<T, _, _>(
+            config,
+            move |out: &mut [T], _| renderer.fill(out, channels),
+            |err| eprintln!("[WARN] Piano output error: {err}"),
+            None,
+        )
+        .map_err(|e| format!("Failed to open audio output: {e}"))
+}
+
+/// The piano synth as a realtime engine: the same voices and cached strikes
+/// as [`PianoPrerender`], rendered block by block in the audio callback
+/// instead of ahead of playback into a buffer.
+pub struct PianoStream {
+    /// Messages for the audio callback, applied at the next block.
+    tx: std::sync::mpsc::Sender<StreamMsg>,
+    /// Dropping this ends the thread that owns the (non-Send) cpal stream.
+    _shutdown: std::sync::mpsc::Sender<()>,
+}
+
+impl PianoStream {
+    /// Build the note cache and open the default output on a background
+    /// thread. The result arrives on the returned receiver.
+    pub fn spawn() -> std::sync::mpsc::Receiver<Result<PianoStream, String>> {
+        let (tx_result, rx_result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (tx_shutdown, rx_shutdown) = std::sync::mpsc::channel::<()>();
+            let stream = match open_piano_stream(tx_shutdown) {
+                Ok((stream, handle)) => {
+                    if tx_result.send(Ok(handle)).is_err() {
+                        return;
+                    }
+                    stream
+                }
+                Err(e) => {
+                    let _ = tx_result.send(Err(e));
+                    return;
+                }
+            };
+            // Returns once the handle (and its shutdown sender) is dropped.
+            let _ = rx_shutdown.recv();
+            drop(stream);
+        });
+        rx_result
+    }
+
+    pub fn send(&self, data: u32) {
+        let _ = self.tx.send(StreamMsg::Midi(data));
+    }
+
+    pub fn set_voice_limit(&self, limit: u32) {
+        let _ = self.tx.send(StreamMsg::VoiceLimit(limit));
+    }
+
+    pub fn set_limiter_bypassed(&self, bypassed: bool) {
+        let _ = self.tx.send(StreamMsg::LimiterBypassed(bypassed));
+    }
+}
+
+fn open_piano_stream(
+    shutdown: std::sync::mpsc::Sender<()>,
+) -> Result<(cpal::Stream, PianoStream), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("No audio output device found")?;
+    let supported = device
+        .default_output_config()
+        .map_err(|e| format!("No usable output format: {e}"))?;
+    let rate = supported.sample_rate();
+    let format = supported.sample_format();
+    let config = supported.config();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let renderer = StreamRenderer {
+        piano: PianoPrerender::new(rate),
+        rx,
+        // Same settings as the prerender path's limiter (see prerender.rs),
+        // on interleaved stereo so both channels share one gain.
+        limiter: crate::audio_limiter::AudioLimiter::new(rate as f32 * 2.0, 0.0, 100.0, 50.0),
+        limiter_bypassed: false,
+        left: [0.0; STREAM_BLOCK],
+        right: [0.0; STREAM_BLOCK],
+        interleaved: Vec::with_capacity(STREAM_BLOCK * 2),
+        pos: STREAM_BLOCK,
+    };
+    let stream = match format {
+        cpal::SampleFormat::F32 => build_piano_stream::<f32>(&device, config, renderer)?,
+        cpal::SampleFormat::I16 => build_piano_stream::<i16>(&device, config, renderer)?,
+        cpal::SampleFormat::U16 => build_piano_stream::<u16>(&device, config, renderer)?,
+        cpal::SampleFormat::I32 => build_piano_stream::<i32>(&device, config, renderer)?,
+        other => return Err(format!("Unsupported output sample format: {other}")),
+    };
+    stream
+        .play()
+        .map_err(|e| format!("Failed to start audio output: {e}"))?;
+    Ok((stream, PianoStream { tx, _shutdown: shutdown }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1339,33 @@ mod tests {
         for (a, b) in l.iter().zip(&el).chain(r.iter().zip(&er)) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn stream_renderer_plays_and_damps_notes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut r = StreamRenderer {
+            piano: PianoPrerender::new(48_000),
+            rx,
+            limiter: crate::audio_limiter::AudioLimiter::new(96_000.0, 0.0, 100.0, 50.0),
+            limiter_bypassed: false,
+            left: [0.0; STREAM_BLOCK],
+            right: [0.0; STREAM_BLOCK],
+            interleaved: Vec::new(),
+            pos: STREAM_BLOCK,
+        };
+        tx.send(StreamMsg::Midi(ON | 60 << 8 | 100 << 16)).unwrap();
+        let mut out = vec![0.0f32; STREAM_BLOCK * 2 * 4];
+        r.fill(&mut out, 2);
+        assert!(out.iter().any(|&s| s != 0.0));
+        // The limiter keeps the realtime output within full scale.
+        assert!(out.iter().all(|&s| s.abs() <= 1.0));
+        tx.send(StreamMsg::Midi(OFF | 60 << 8)).unwrap();
+        let mut out = vec![0.0f32; STREAM_BLOCK * 2];
+        for _ in 0..200 {
+            r.fill(&mut out, 2);
+        }
+        assert!(r.piano.voices.is_empty());
     }
 
     #[test]

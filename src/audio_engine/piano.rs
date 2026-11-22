@@ -1,5 +1,5 @@
-use super::synths::piano::PianoPrerender;
-use super::{AudioEngine, RenderMode};
+use super::synths::piano::{PianoPrerender, PianoStream, VOICE_LIMIT_SETTING};
+use super::{AudioEngine, EngineSettingDef, EngineSettingValue, RenderMode};
 
 impl AudioEngine for PianoPrerender {
     const LABEL: &'static str = "Piano (Prerender)";
@@ -32,7 +32,45 @@ impl AudioEngine for PianoPrerender {
         PianoPrerender::polyphony(self)
     }
 
-    fn set_voice_limit(&mut self, limit: u32) {
-        PianoPrerender::set_voice_limit(self, limit)
+    const SETTINGS: &'static [EngineSettingDef] = &[VOICE_LIMIT_SETTING];
+
+    fn set_setting(&mut self, key: &str, value: EngineSettingValue) {
+        if key == VOICE_LIMIT_SETTING.key
+            && let EngineSettingValue::U32(limit) = value
+        {
+            PianoPrerender::set_voice_limit(self, limit);
+        }
+    }
+}
+
+impl AudioEngine for PianoStream {
+    const LABEL: &'static str = "Piano";
+
+    fn open() -> Result<Self, String> {
+        PianoStream::spawn()
+            .recv()
+            .map_err(|_| "Piano output thread ended".to_string())?
+    }
+
+    fn send_midi_event(&mut self, data: u32) -> u32 {
+        self.send(data);
+        0
+    }
+
+    /// Dropping the stream stops audio; nothing else to release.
+    fn close(&mut self) {}
+
+    const SETTINGS: &'static [EngineSettingDef] = &[VOICE_LIMIT_SETTING];
+
+    fn set_setting(&mut self, key: &str, value: EngineSettingValue) {
+        if key == VOICE_LIMIT_SETTING.key
+            && let EngineSettingValue::U32(limit) = value
+        {
+            PianoStream::set_voice_limit(self, limit);
+        }
+    }
+
+    fn set_limiter_bypassed(&mut self, bypassed: bool) {
+        PianoStream::set_limiter_bypassed(self, bypassed);
     }
 }

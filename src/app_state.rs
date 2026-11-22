@@ -192,8 +192,8 @@ pub struct AppState {
     pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub settings_opus_bitrate_slider: crate::ui_components::numeric_slider::NumericSliderState,
     /// Built-in piano synth voice limit; 0 = unlimited.
-    pub voice_limit: u32,
-    pub settings_voice_limit_slider: crate::ui_components::numeric_slider::NumericSliderState,
+    pub engine_settings: std::collections::HashMap<String, crate::audio_engine::EngineSettingValue>,
+    pub engine_setting_sliders: std::collections::HashMap<String, crate::ui_components::numeric_slider::NumericSliderState>,
     pub settings_parse_threads_slider: crate::ui_components::numeric_slider::NumericSliderState,
     pub speed_slider_dragging: bool,
 
@@ -339,8 +339,8 @@ impl AppState {
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
             settings_opus_bitrate_slider:
                 crate::ui_components::numeric_slider::NumericSliderState::default(),
-            voice_limit: 0,
-            settings_voice_limit_slider: Default::default(),
+            engine_settings: Default::default(),
+            engine_setting_sliders: Default::default(),
             settings_parse_threads_slider: Default::default(),
             speed_slider_dragging: false,
 

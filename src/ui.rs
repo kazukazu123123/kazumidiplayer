@@ -1109,8 +1109,8 @@ pub fn draw_settings_overlay(
     show_stats_animation: f32,
     vsync: &mut bool,
     vsync_animation: f32,
-    voice_limit: &mut u32,
-    voice_limit_slider: &mut NumericSliderState,
+    engine_settings: &mut std::collections::HashMap<String, crate::audio_engine::EngineSettingValue>,
+    engine_setting_sliders: &mut std::collections::HashMap<String, NumericSliderState>,
 ) -> bool {
     // Capture text-entry input before entering drawing modes.
     let mut numeric_typed = Vec::new();
@@ -1670,47 +1670,83 @@ pub fn draw_settings_overlay(
                 }
             }
 
-            // Voice limit of the built-in piano synth; applies immediately.
-            {
-                let y = layout.next(52.0);
-                tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), "Most notes the Piano engine plays at once (0 = unlimited). Over the limit, the quietest notes are faded out first, not the oldest, so loud and long-ringing notes stay. Lower uses less CPU on dense MIDIs."));
-                if is_visible(sy(y), 52.0) {
-                    let input = NumericSliderInput {
-                        click_pos,
-                        mouse_pos: mouse_world_pos,
-                        mouse_down: is_mouse_down,
-                        wheel: mouse_wheel,
-                        shift: numeric_shift,
-                        control: numeric_control,
-                        typed: numeric_typed.clone(),
-                        backspace: numeric_backspace,
-                        delete: numeric_delete,
-                        left: numeric_left,
-                        right: numeric_right,
-                        home: numeric_home,
-                        end: numeric_end,
-                        enter: numeric_enter,
-                        escape: numeric_escape,
-                    };
-                    let enabled = crate::audio_engine::EngineSelection::LABELS
-                        .get(*audio_engine)
-                        .is_some_and(|l| *l == "Piano (Prerender)");
-                    wheel_consumed |= draw_u32_numeric_slider(
-                        &mut d_scissor,
-                        Rectangle::new(column_x, sy(y), column_width, 52.0),
-                        "Voice Limit (0 = unlimited)",
-                        voice_limit,
-                        0,
-                        100_000,
-                        voice_limit_slider,
-                        &input,
-                        eased_t,
-                        enabled,
-                        Some("Piano engine only"),
-                    );
+            // Settings the selected engine publishes for itself (see
+            // `EngineSettingDef`): drawn generically here, so an engine's own
+            // controls appear without the panel hardcoding any of them.
+            for def in crate::audio_engine::EngineSelection::from_index(*audio_engine).settings() {
+                match def.kind {
+                    crate::audio_engine::EngineSettingKind::U32Range { min, max } => {
+                        let y = layout.next(52.0);
+                        tips.push((Rectangle::new(column_x, sy(y), column_width, 52.0), def.help));
+                        if is_visible(sy(y), 52.0) {
+                            let input = NumericSliderInput {
+                                click_pos,
+                                mouse_pos: mouse_world_pos,
+                                mouse_down: is_mouse_down,
+                                wheel: mouse_wheel,
+                                shift: numeric_shift,
+                                control: numeric_control,
+                                typed: numeric_typed.clone(),
+                                backspace: numeric_backspace,
+                                delete: numeric_delete,
+                                left: numeric_left,
+                                right: numeric_right,
+                                home: numeric_home,
+                                end: numeric_end,
+                                enter: numeric_enter,
+                                escape: numeric_escape,
+                            };
+                            let crate::audio_engine::EngineSettingValue::U32(value) = engine_settings
+                                .entry(def.key.to_string())
+                                .or_insert(def.default)
+                            else {
+                                continue;
+                            };
+                            let slider = engine_setting_sliders
+                                .entry(def.key.to_string())
+                                .or_default();
+                            wheel_consumed |= draw_u32_numeric_slider(
+                                &mut d_scissor,
+                                Rectangle::new(column_x, sy(y), column_width, 52.0),
+                                def.label,
+                                value,
+                                min,
+                                max,
+                                slider,
+                                &input,
+                                eased_t,
+                                true,
+                                None,
+                            );
+                        }
+                    }
+                    crate::audio_engine::EngineSettingKind::Bool => {
+                        let y = layout.next(30.0);
+                        tips.push((Rectangle::new(column_x, sy(y), column_width, 30.0), def.help));
+                        let rect = Rectangle::new(column_x, sy(y), column_width.min(240.0), 30.0);
+                        if is_visible(rect.y, rect.height) {
+                            let crate::audio_engine::EngineSettingValue::Bool(value) = engine_settings
+                                .entry(def.key.to_string())
+                                .or_insert(def.default)
+                            else {
+                                continue;
+                            };
+                            if draw_toggle(
+                                &mut d_scissor,
+                                rect,
+                                def.label,
+                                if *value { 1.0 } else { 0.0 },
+                                true,
+                                eased_t,
+                                click_pos,
+                                Some(mouse_world_pos),
+                            ) {
+                                *value = !*value;
+                            }
+                        }
+                    }
                 }
             }
-
             // Prerender engines render the file themselves, so the MIDI output
             // pacing settings below have nothing to act on.
             let prerender_engine = crate::audio_engine::EngineSelection::from_index(*audio_engine)

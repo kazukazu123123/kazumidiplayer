@@ -29,6 +29,42 @@ pub enum RenderMode {
     Prerender,
 }
 
+/// A value of a setting an engine publishes (see [`EngineSettingDef`]).
+// `Bool` is part of the vocabulary from the start: the settings UI and
+// the plumbing already handle it, though no engine publishes one yet.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineSettingValue {
+    U32(u32),
+    Bool(bool),
+}
+
+/// How the settings UI presents one published setting.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub enum EngineSettingKind {
+    /// A numeric slider over `min..=max`.
+    U32Range { min: u32, max: u32 },
+    /// An on/off toggle.
+    Bool,
+}
+
+/// One setting an engine publishes for itself. The settings panel draws
+/// every definition of the selected engine generically, and the engine
+/// receives changes through [`AudioEngine::set_setting`], so an engine's
+/// own controls need no hardcoded support in the app.
+#[derive(Clone, Copy, Debug)]
+pub struct EngineSettingDef {
+    /// Stable identifier passed to `set_setting`.
+    pub key: &'static str,
+    /// Label shown next to the control.
+    pub label: &'static str,
+    /// Tooltip text.
+    pub help: &'static str,
+    pub kind: EngineSettingKind,
+    pub default: EngineSettingValue,
+}
+
 /// One MIDI output backend.
 pub trait AudioEngine: Send + 'static {
     /// Name shown in the settings combo box.
@@ -36,6 +72,10 @@ pub trait AudioEngine: Send + 'static {
 
     /// How this engine renders. Defaults to [`RenderMode::Realtime`].
     const RENDER_MODE: RenderMode = RenderMode::Realtime;
+
+    /// Settings this engine publishes to the settings UI (see
+    /// [`EngineSettingDef`]). Defaults to none.
+    const SETTINGS: &'static [EngineSettingDef] = &[];
 
     /// Open the engine. Runs on a background thread, so it may block
     /// (e.g. while samples download).
@@ -84,10 +124,11 @@ pub trait AudioEngine: Send + 'static {
         let _ = bypassed;
     }
 
-    /// Most voices sounding at once (0 = unlimited). Only the built-in piano
-    /// synth has a voice limit; other engines ignore this.
-    fn set_voice_limit(&mut self, limit: u32) {
-        let _ = limit;
+    /// Apply one of this engine's published settings (see
+    /// [`EngineSettingDef`]). Engines apply the keys they publish and
+    /// ignore the rest.
+    fn set_setting(&mut self, key: &str, value: EngineSettingValue) {
+        let _ = (key, value);
     }
 }
 
@@ -95,6 +136,7 @@ pub trait AudioEngine: Send + 'static {
 pub struct EngineDef {
     label: &'static str,
     render_mode: RenderMode,
+    settings: &'static [EngineSettingDef],
     open: fn() -> Result<SharedEngine, String>,
 }
 
@@ -104,6 +146,7 @@ pub const fn register<E: AudioEngine>() -> EngineDef {
     EngineDef {
         label: E::LABEL,
         render_mode: E::RENDER_MODE,
+        settings: E::SETTINGS,
         open: || E::open().map(|e| Arc::new(Mutex::new(e)) as SharedEngine),
     }
 }
@@ -117,7 +160,7 @@ trait ErasedEngine: Send {
     fn render(&mut self, left: &mut [f32], right: &mut [f32]);
     fn polyphony(&self) -> u32;
     fn set_limiter_bypassed(&mut self, bypassed: bool);
-    fn set_voice_limit(&mut self, limit: u32);
+    fn set_setting(&mut self, key: &str, value: EngineSettingValue);
 }
 
 impl<E: AudioEngine> ErasedEngine for E {
@@ -149,8 +192,8 @@ impl<E: AudioEngine> ErasedEngine for E {
         AudioEngine::set_limiter_bypassed(self, bypassed)
     }
 
-    fn set_voice_limit(&mut self, limit: u32) {
-        AudioEngine::set_voice_limit(self, limit)
+    fn set_setting(&mut self, key: &str, value: EngineSettingValue) {
+        AudioEngine::set_setting(self, key, value)
     }
 }
 
@@ -161,6 +204,7 @@ pub const ENGINES: &[EngineDef] = &[
     register::<synths::csynth::CSynthStream>(),
     register::<synths::csynth::CSynthPrerender>(),
     register::<synths::piano::PianoPrerender>(),
+    register::<synths::piano::PianoStream>(),
 ];
 
 const ENGINE_COUNT: usize = ENGINES.len();
@@ -195,6 +239,11 @@ impl EngineSelection {
 
     pub fn render_mode(self) -> RenderMode {
         ENGINES[self.0].render_mode
+    }
+
+    /// Settings the selected engine publishes for itself.
+    pub fn settings(self) -> &'static [EngineSettingDef] {
+        ENGINES[self.0].settings
     }
 
     pub fn start(self) -> Receiver<Result<OutputStream, String>> {
@@ -332,10 +381,10 @@ impl OutputStream {
         lock(&self.engine).set_limiter_bypassed(bypassed);
     }
 
-    /// Most voices sounding at once (0 = unlimited). For a prerender engine
+    /// Apply one of the engine's published settings. For a prerender engine
     /// the buffered audio is re-rendered, so the change is heard right away.
-    pub fn set_voice_limit(&self, limit: u32) {
-        lock(&self.engine).set_voice_limit(limit);
+    pub fn set_setting(&self, key: &str, value: EngineSettingValue) {
+        lock(&self.engine).set_setting(key, value);
         if let Some(p) = &self.prerender {
             p.rerender();
         }

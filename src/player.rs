@@ -53,7 +53,7 @@ pub enum PlayerCommand {
     /// S16 Clipping: no limiter, hard-clipped peaks instead.
     SetS16Clipping(bool),
     /// Built-in piano synth: most voices at once, 0 = unlimited.
-    SetVoiceLimit(u32),
+    SetEngineSetting { key: String, value: crate::audio_engine::EngineSettingValue },
     /// Opus bitrate for the prerender buffer, in kbps.
     SetOpusBitrate(u32),
 }
@@ -331,7 +331,7 @@ impl PlayerHandle {
             let mut midi_ev_fifo = VecDeque::<BufferedMidiEvent>::new();
             let mut audio_buffer_secs = crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS;
             let mut s16_clipping = false;
-            let mut voice_limit = 0u32;
+            let mut engine_settings: Vec<(String, crate::audio_engine::EngineSettingValue)> = Vec::new();
             let mut opus_bitrate_kbps = 256u32;
             #[cfg(debug_assertions)]
             let mut visqol_consumed: usize = 0;
@@ -494,10 +494,11 @@ impl PlayerHandle {
                                 p.set_limiter_bypassed(enabled);
                             }
                         }
-                        PlayerCommand::SetVoiceLimit(limit) => {
-                            voice_limit = limit;
+                        PlayerCommand::SetEngineSetting { key, value } => {
+                            engine_settings.retain(|(k, _)| *k != key);
+                            engine_settings.push((key.clone(), value));
                             if let Some(ref stream) = player.stream {
-                                stream.set_voice_limit(limit);
+                                stream.set_setting(&key, value);
                             }
                         }
                         PlayerCommand::SetOpusBitrate(kbps) => {
@@ -548,10 +549,12 @@ impl PlayerHandle {
                             player.send_all_notes_off();
                             player.stream = stream;
                             player.reset_playback_state();
-                            // Re-apply S16 Clipping and the voice limit to the new output.
+                            // Re-apply S16 Clipping and the engine settings to the new output.
                             if let Some(ref stream) = player.stream {
                                 stream.set_limiter_bypassed(s16_clipping);
-                                stream.set_voice_limit(voice_limit);
+                                for (key, value) in &engine_settings {
+                                    stream.set_setting(key, *value);
+                                }
                             }
                             if let Some(p) = prerender!(player) {
                                 p.set_bend_override(player.bend_override());
@@ -1109,10 +1112,17 @@ impl PlayerHandle {
         let _ = self.tx_command.send(PlayerCommand::SetS16Clipping(enabled));
     }
 
-    /// Built-in piano synth: most voices sounding at once, quietest cut
-    /// first; 0 = unlimited.
-    pub fn set_voice_limit(&self, limit: u32) {
-        let _ = self.tx_command.send(PlayerCommand::SetVoiceLimit(limit));
+    /// Apply one of the selected engine's published settings (see
+    /// `EngineSettingDef`); engines that do not publish the key ignore it.
+    pub fn set_engine_setting(
+        &self,
+        key: &str,
+        value: crate::audio_engine::EngineSettingValue,
+    ) {
+        let _ = self.tx_command.send(PlayerCommand::SetEngineSetting {
+            key: key.to_string(),
+            value,
+        });
     }
 
     /// Set the Opus bitrate of the prerender buffer.

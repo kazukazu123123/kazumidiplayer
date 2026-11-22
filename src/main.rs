@@ -1910,7 +1910,7 @@ fn main() {
                         let prev_parse_threads = app_state.parse_threads;
                         let prev_audio_engine = app_state.audio_engine;
                         let prev_audio_buffer_secs = app_state.audio_buffer_secs;
-                        let prev_voice_limit = app_state.voice_limit;
+                        let prev_engine_settings = app_state.engine_settings.clone();
                         let prev_opus_bitrate_kbps = app_state.opus_bitrate_kbps;
                         if ui::draw_settings_overlay(
                             d,
@@ -1981,8 +1981,8 @@ fn main() {
                             app_state.show_stats_animation,
                             &mut app_state.vsync_enabled,
                             app_state.vsync_animation,
-                            &mut app_state.voice_limit,
-                            &mut app_state.settings_voice_limit_slider,
+                            &mut app_state.engine_settings,
+                            &mut app_state.engine_setting_sliders,
                         ) {
                             close_requested = true;
                         }
@@ -2020,8 +2020,10 @@ fn main() {
                         if app_state.audio_buffer_secs != prev_audio_buffer_secs {
                             engine.set_audio_buffer_secs(app_state.audio_buffer_secs);
                         }
-                        if app_state.voice_limit != prev_voice_limit {
-                            engine.set_voice_limit(app_state.voice_limit);
+                        for (key, value) in &app_state.engine_settings {
+                            if prev_engine_settings.get(key) != Some(value) {
+                                engine.set_engine_setting(key, *value);
+                            }
                         }
                         if app_state.opus_bitrate_kbps != prev_opus_bitrate_kbps {
                             engine.set_opus_bitrate(app_state.opus_bitrate_kbps);
