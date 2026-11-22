@@ -1734,10 +1734,22 @@ fn main() {
                         ),
                         format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
                     ];
-                    // Prerender engines only.
-                    if let Some(voices) = engine.polyphony() {
-                        lines.push(format!("POLY  {}", group_thousands(voices as u64)));
-                    }
+                    // Polyphony and render load; engines that do not
+                    // report them show N/A.
+                    lines.push(format!(
+                        "POLY  {}",
+                        engine
+                            .polyphony()
+                            .map(|voices| group_thousands(voices as u64))
+                            .unwrap_or_else(|| "N/A".to_string())
+                    ));
+                    lines.push(format!(
+                        "LOAD  {}",
+                        engine
+                            .render_load()
+                            .map(|load| format!("{:.1}%", load * 100.0))
+                            .unwrap_or_else(|| "N/A".to_string())
+                    ));
                     if let Some(vel) = engine.skipping_velocity() {
                         lines.push(format!("Skipping Vel: {vel}"));
                     }

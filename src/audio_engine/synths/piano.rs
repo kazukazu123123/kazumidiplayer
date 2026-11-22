@@ -447,6 +447,12 @@ fn mix_flat(
     gr: f32,
 ) -> usize {
     let n = to - from;
+    if n == 0 {
+        // Nothing to add. The read position may sit past the end of the
+        // strike (a pitch-bend skip can leave it there), which is out of
+        // range even for an empty slice.
+        return index;
+    }
     let src = &s[index..index + n];
     for ((l, r), &v) in left[from..to].iter_mut().zip(&mut right[from..to]).zip(src) {
         let x = v as f32;
@@ -1193,9 +1199,21 @@ enum StreamMsg {
 /// boundary, renders one block of the prerender synth, and limits it with
 /// the same settings the prerender path uses (that limiter adds no delay,
 /// it only smooths a peak envelope, so realtime latency stays one block).
+/// What the audio callback publishes for the handle: voices sounding
+/// after the last block, and the smoothed share of one block's playback
+/// time its rendering took (1.0 = the whole block, i.e. 100%).
+#[derive(Default)]
+struct StreamStats {
+    polyphony: std::sync::atomic::AtomicU32,
+    load: std::sync::atomic::AtomicU32,
+}
+
 struct StreamRenderer {
     piano: PianoPrerender,
     rx: std::sync::mpsc::Receiver<StreamMsg>,
+    stats: std::sync::Arc<StreamStats>,
+    /// Smoothed render load, published into `stats` after every block.
+    load: f32,
     limiter: crate::audio_limiter::AudioLimiter,
     limiter_bypassed: bool,
     left: [f32; STREAM_BLOCK],
@@ -1213,7 +1231,17 @@ impl StreamRenderer {
                 StreamMsg::LimiterBypassed(bypassed) => self.limiter_bypassed = bypassed,
             }
         }
+        let started = std::time::Instant::now();
         self.piano.render(&mut self.left, &mut self.right);
+        let took = started.elapsed().as_secs_f32();
+        let budget = STREAM_BLOCK as f32 / self.piano.rate() as f32;
+        self.load += (took / budget - self.load) * 0.05;
+        self.stats
+            .polyphony
+            .store(self.piano.polyphony(), std::sync::atomic::Ordering::Relaxed);
+        self.stats
+            .load
+            .store(self.load.to_bits(), std::sync::atomic::Ordering::Relaxed);
         self.interleaved.clear();
         for i in 0..STREAM_BLOCK {
             self.interleaved.push(self.left[i]);
@@ -1272,6 +1300,8 @@ fn build_piano_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
 pub struct PianoStream {
     /// Messages for the audio callback, applied at the next block.
     tx: std::sync::mpsc::Sender<StreamMsg>,
+    /// Stats the audio callback publishes (see [`StreamStats`]).
+    stats: std::sync::Arc<StreamStats>,
     /// Dropping this ends the thread that owns the (non-Send) cpal stream.
     _shutdown: std::sync::mpsc::Sender<()>,
 }
@@ -1313,6 +1343,23 @@ impl PianoStream {
     pub fn set_limiter_bypassed(&self, bypassed: bool) {
         let _ = self.tx.send(StreamMsg::LimiterBypassed(bypassed));
     }
+
+    /// Voices sounding after the last rendered block.
+    pub fn polyphony(&self) -> u32 {
+        self.stats
+            .polyphony
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Smoothed share of one block's playback time spent rendering it
+    /// (1.0 = the whole block, i.e. 100%).
+    pub fn render_load(&self) -> f32 {
+        f32::from_bits(
+            self.stats
+                .load
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 fn open_piano_stream(
@@ -1331,9 +1378,12 @@ fn open_piano_stream(
     let config = supported.config();
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let stats = std::sync::Arc::new(StreamStats::default());
     let renderer = StreamRenderer {
         piano: PianoPrerender::new(rate),
         rx,
+        stats: stats.clone(),
+        load: 0.0,
         // Same settings as the prerender path's limiter (see prerender.rs),
         // on interleaved stereo so both channels share one gain.
         limiter: crate::audio_limiter::AudioLimiter::new(rate as f32 * 2.0, 0.0, 100.0, 50.0),
@@ -1353,7 +1403,14 @@ fn open_piano_stream(
     stream
         .play()
         .map_err(|e| format!("Failed to start audio output: {e}"))?;
-    Ok((stream, PianoStream { tx, _shutdown: shutdown }))
+    Ok((
+        stream,
+        PianoStream {
+            tx,
+            stats,
+            _shutdown: shutdown,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1501,6 +1558,8 @@ mod tests {
         let mut r = StreamRenderer {
             piano: PianoPrerender::new(48_000),
             rx,
+            stats: std::sync::Arc::new(StreamStats::default()),
+            load: 0.0,
             limiter: crate::audio_limiter::AudioLimiter::new(96_000.0, 0.0, 100.0, 50.0),
             limiter_bypassed: false,
             left: [0.0; STREAM_BLOCK],
@@ -1658,6 +1717,43 @@ mod tests {
         assert!(soft.gain < hard.gain);
         assert_eq!(hard.lp, 1.0);
         assert!(soft.lp < 1.0);
+    }
+
+    #[test]
+    fn voice_past_the_cached_strike_renders_silently() {
+        // A pitch-bend skip can leave a voice's read position past the
+        // end of the cached strike. Rendering it must not panic (the
+        // flat mix sliced at that position even for an empty span) and
+        // must retire the voice.
+        let cached = CachedNote {
+            samples: vec![1_000; 7_288],
+            scale: 1.0,
+            loud: vec![0.5; 29],
+            loud_suffix: vec![0.5; 29],
+        };
+        let spec = NoteSpec::new(60, 48_000);
+        let mut voice = Voice {
+            seq: 0,
+            channel: 0,
+            note: 60,
+            pos: 7_315.0,
+            gain: 1.0,
+            lp: 1.0,
+            lp_y: 0.0,
+            env: 1.0,
+            damped: false,
+            pedal_held: false,
+            fading: false,
+            dead: false,
+            start: 0,
+            release_at: None,
+            kill_at: None,
+        };
+        let mut left = [0.0f32; 256];
+        let mut right = [0.0f32; 256];
+        voice.render(&mut left, &mut right, &spec, &cached, &[(0, 1.0)], 1.0, 0.5);
+        assert!(voice.dead);
+        assert!(left.iter().chain(&right).all(|&v| v == 0.0));
     }
 
     /// Measurement only: steady-state render cost at extreme polyphony.

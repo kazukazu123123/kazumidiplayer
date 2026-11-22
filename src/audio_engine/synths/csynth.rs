@@ -6,7 +6,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use csynth::limiter::Limiter;
 use csynth::{PianoProcessor, QUANTUM};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 /// Where the MPP piano samples come from when there is no local or cached copy.
@@ -196,12 +198,26 @@ impl MidiState {
     }
 }
 
+/// What the audio callback publishes for the handle: voices sounding
+/// after the last quantum, and the smoothed share of one quantum's
+/// playback time its rendering took (1.0 = the whole quantum, i.e. 100%).
+#[derive(Default)]
+struct StreamStats {
+    polyphony: AtomicU32,
+    load: AtomicU32,
+}
+
 /// Lives in the audio callback: drains the queue at each quantum and renders.
 struct Renderer {
     piano: PianoProcessor,
     midi: MidiState,
     limiter: Limiter,
     rx: Receiver<u32>,
+    stats: Arc<StreamStats>,
+    /// Smoothed render load, published into `stats` after every quantum.
+    load: f32,
+    /// Playback time of one quantum, in seconds (the load's denominator).
+    block_secs: f32,
     left: [f32; QUANTUM],
     right: [f32; QUANTUM],
     interleaved: Vec<f32>,
@@ -216,7 +232,14 @@ impl Renderer {
                 self.midi.apply(&mut self.piano, now, event);
             }
         }
+        let started = std::time::Instant::now();
         self.piano.process(&mut self.left, &mut self.right);
+        let took = started.elapsed().as_secs_f32();
+        self.load += (took / self.block_secs - self.load) * 0.05;
+        self.stats
+            .polyphony
+            .store(self.piano.stats.active, Ordering::Relaxed);
+        self.stats.load.store(self.load.to_bits(), Ordering::Relaxed);
         self.interleaved.clear();
         for i in 0..QUANTUM {
             self.interleaved.push(self.left[i]);
@@ -269,6 +292,8 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
 pub struct CSynthStream {
     /// Messages for the audio callback, applied at the next quantum.
     tx: Sender<u32>,
+    /// Stats the audio callback publishes (see [`StreamStats`]).
+    stats: Arc<StreamStats>,
     /// Dropping this ends the thread that owns the (non-Send) cpal stream.
     _shutdown: Sender<()>,
 }
@@ -302,6 +327,17 @@ impl CSynthStream {
     pub fn send(&self, data: u32) {
         let _ = self.tx.send(data);
     }
+
+    /// Voices sounding after the last rendered quantum.
+    pub fn polyphony(&self) -> u32 {
+        self.stats.polyphony.load(Ordering::Relaxed)
+    }
+
+    /// Smoothed share of one quantum's playback time spent rendering it
+    /// (1.0 = the whole quantum, i.e. 100%).
+    pub fn render_load(&self) -> f32 {
+        f32::from_bits(self.stats.load.load(Ordering::Relaxed))
+    }
 }
 
 fn open(shutdown: Sender<()>) -> Result<(cpal::Stream, CSynthStream), String> {
@@ -325,11 +361,15 @@ fn open(shutdown: Sender<()>) -> Result<(cpal::Stream, CSynthStream), String> {
     drop(bundle);
 
     let (tx, rx) = mpsc::channel();
+    let stats = Arc::new(StreamStats::default());
     let renderer = Renderer {
         piano: PianoProcessor::new(samples, rate),
         midi: MidiState::default(),
         limiter: csynth::output_limiter(rate),
         rx,
+        stats: stats.clone(),
+        load: 0.0,
+        block_secs: QUANTUM as f32 / rate as f32,
         left: [0.0; QUANTUM],
         right: [0.0; QUANTUM],
         interleaved: Vec::with_capacity(QUANTUM * 2),
@@ -349,6 +389,7 @@ fn open(shutdown: Sender<()>) -> Result<(cpal::Stream, CSynthStream), String> {
         stream,
         CSynthStream {
             tx,
+            stats,
             _shutdown: shutdown,
         },
     ))
@@ -597,6 +638,9 @@ mod tests {
             midi: MidiState::default(),
             limiter: engine.limiter,
             rx,
+            stats: Arc::new(StreamStats::default()),
+            load: 0.0,
+            block_secs: QUANTUM as f32 / 48_000.0,
             left: [0.0; QUANTUM],
             right: [0.0; QUANTUM],
             interleaved: Vec::with_capacity(QUANTUM * 2),

@@ -111,10 +111,19 @@ pub trait AudioEngine: Send + 'static {
         right.fill(0.0);
     }
 
-    /// Voices sounding at the end of the last `render`, shown as the
-    /// polyphony counter. Prerender engines only.
-    fn polyphony(&self) -> u32 {
-        0
+    /// Voices sounding at the end of the last render (or, for a realtime
+    /// engine, the last rendered block), shown as the polyphony counter.
+    /// `None` when the engine cannot report it; the stats display then
+    /// shows N/A.
+    fn polyphony(&self) -> Option<u32> {
+        None
+    }
+
+    /// Smoothed share of one block's playback time spent rendering it
+    /// (1.0 = the whole block, i.e. 100%). `None` when the engine does
+    /// not measure it; the stats display then shows N/A.
+    fn render_load(&self) -> Option<f32> {
+        None
     }
 
     /// Bypass the engine's own output limiter, for S16 Clipping. Some
@@ -158,7 +167,8 @@ trait ErasedEngine: Send {
     fn sample_rate(&self) -> u32;
     fn send_midi_event_at(&mut self, frame: u32, data: u32);
     fn render(&mut self, left: &mut [f32], right: &mut [f32]);
-    fn polyphony(&self) -> u32;
+    fn polyphony(&self) -> Option<u32>;
+    fn render_load(&self) -> Option<f32>;
     fn set_limiter_bypassed(&mut self, bypassed: bool);
     fn set_setting(&mut self, key: &str, value: EngineSettingValue);
 }
@@ -184,8 +194,12 @@ impl<E: AudioEngine> ErasedEngine for E {
         AudioEngine::render(self, left, right)
     }
 
-    fn polyphony(&self) -> u32 {
+    fn polyphony(&self) -> Option<u32> {
         AudioEngine::polyphony(self)
+    }
+
+    fn render_load(&self) -> Option<f32> {
+        AudioEngine::render_load(self)
     }
 
     fn set_limiter_bypassed(&mut self, bypassed: bool) {
@@ -293,7 +307,7 @@ impl OutputStream {
                             engine.send_midi_event_at(frame, msg);
                         }
                         engine.render(left, right);
-                        engine.polyphony()
+                        engine.polyphony().unwrap_or(0)
                     });
                     match prerender::Session::start(rate, render) {
                         Ok(session) => Some(session),
@@ -373,6 +387,18 @@ impl OutputStream {
     /// The prerender session, for [`RenderMode::Prerender`] engines.
     pub fn prerender(&self) -> Option<&prerender::Session> {
         self.prerender.as_ref()
+    }
+
+    /// Voices sounding, for engines that report it (see
+    /// [`AudioEngine::polyphony`]).
+    pub fn polyphony(&self) -> Option<u32> {
+        lock(&self.engine).polyphony()
+    }
+
+    /// Smoothed render load (1.0 = 100% of the realtime budget), for
+    /// engines that measure it (see [`AudioEngine::render_load`]).
+    pub fn render_load(&self) -> Option<f32> {
+        lock(&self.engine).render_load()
     }
 
     /// S16 Clipping: bypass the engine's own output limiter.

@@ -168,6 +168,9 @@ struct State {
     voice_marks: VecDeque<(u64, u32)>,
     /// Highest note-on velocity rendering currently drops (0: none).
     drop_velocity: u32,
+    /// Smoothed share of one chunk's playback time rendering a chunk
+    /// takes (1.0 = the whole chunk, i.e. 100%).
+    render_load: f32,
     /// S16 Clipping: skip the output limiter; overflowing samples wrap
     /// around to the other end of the 16-bit range.
     limiter_bypassed: bool,
@@ -908,6 +911,7 @@ impl Session {
                 resume_at: Some(0),
                 voice_marks: VecDeque::new(),
                 drop_velocity: 0,
+                render_load: 0.0,
                 limiter_bypassed: false,
                 shutdown: false,
             }),
@@ -1117,6 +1121,12 @@ impl Session {
     pub fn polyphony(&self) -> u32 {
         let mut s = self.shared.lock();
         heard_polyphony(&mut s)
+    }
+
+    /// Smoothed share of one chunk's playback time rendering a chunk
+    /// takes (1.0 = the whole chunk, i.e. 100%).
+    pub fn render_load(&self) -> f32 {
+        self.shared.lock().render_load
     }
 }
 
@@ -1489,7 +1499,9 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
             msgs.push((frame as u32, bend_override.rewrite(msg)));
         }
         pending.clear();
+        let render_started = std::time::Instant::now();
         let voices = render(&msgs, &mut left, &mut right);
+        let render_took = render_started.elapsed().as_secs_f32();
         msgs.clear();
         interleaved.clear();
         interleaved.extend(left.iter().zip(&right).flat_map(|(&l, &r)| [l, r]));
@@ -1519,6 +1531,8 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
             s.started |= s.ring.ready_frames() > 0;
             let start = chunk_start.max(s.played);
             s.voice_marks.push_back((start, voices));
+            let budget = CHUNK_FRAMES as f32 / rate as f32;
+            s.render_load += (render_took / budget - s.render_load) * 0.05;
         }
     }
 }
@@ -1719,6 +1733,7 @@ mod tests {
             resume_at: None,
             voice_marks: VecDeque::new(),
             drop_velocity: 0,
+            render_load: 0.0,
             limiter_bypassed: false,
             shutdown: false,
         };
@@ -1752,6 +1767,7 @@ mod tests {
             resume_at: None,
             voice_marks: VecDeque::new(),
             drop_velocity: 0,
+            render_load: 0.0,
             limiter_bypassed: false,
             shutdown: false,
         }

@@ -28,8 +28,8 @@ impl AudioEngine for PianoPrerender {
         PianoPrerender::render(self, left, right);
     }
 
-    fn polyphony(&self) -> u32 {
-        PianoPrerender::polyphony(self)
+    fn polyphony(&self) -> Option<u32> {
+        Some(PianoPrerender::polyphony(self))
     }
 
     const SETTINGS: &'static [EngineSettingDef] = &[VOICE_LIMIT_SETTING];
@@ -72,5 +72,13 @@ impl AudioEngine for PianoStream {
 
     fn set_limiter_bypassed(&mut self, bypassed: bool) {
         PianoStream::set_limiter_bypassed(self, bypassed);
+    }
+
+    fn polyphony(&self) -> Option<u32> {
+        Some(PianoStream::polyphony(self))
+    }
+
+    fn render_load(&self) -> Option<f32> {
+        Some(PianoStream::render_load(self))
     }
 }

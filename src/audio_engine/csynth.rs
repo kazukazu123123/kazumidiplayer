@@ -18,6 +18,14 @@ impl AudioEngine for CSynthStream {
 
     /// Dropping the stream stops audio; nothing else to release.
     fn close(&mut self) {}
+
+    fn polyphony(&self) -> Option<u32> {
+        Some(CSynthStream::polyphony(self))
+    }
+
+    fn render_load(&self) -> Option<f32> {
+        Some(CSynthStream::render_load(self))
+    }
 }
 
 use super::RenderMode;
@@ -53,8 +61,8 @@ impl AudioEngine for CSynthPrerender {
         CSynthPrerender::render(self, left, right);
     }
 
-    fn polyphony(&self) -> u32 {
-        CSynthPrerender::polyphony(self)
+    fn polyphony(&self) -> Option<u32> {
+        Some(CSynthPrerender::polyphony(self))
     }
 
     fn set_limiter_bypassed(&mut self, bypassed: bool) {

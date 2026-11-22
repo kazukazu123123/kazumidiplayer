@@ -173,8 +173,12 @@ pub struct PlayerHandle {
     alive: Arc<AtomicBool>,
     // Prerendered audio waiting to play; `u64::MAX` for realtime outputs.
     audio_buffer_ns: Arc<AtomicU64>,
-    // Voices heard from a prerender engine; `u32::MAX` for realtime outputs.
+    // Voices sounding in the output engine; `u32::MAX` when it does not
+    // report a count.
     polyphony: Arc<AtomicU32>,
+    // Smoothed share of the realtime budget the engine spends rendering
+    // (f32 bits; 1.0 = 100%); `u32::MAX` when it does not report one.
+    render_load: Arc<AtomicU32>,
     // Note-on velocity a prerender engine drops up to; 0 when not skipping.
     drop_velocity: Arc<AtomicU32>,
     // Prerender buffer allocation in bytes and output rate; `u64::MAX` / 0
@@ -209,6 +213,7 @@ impl Clone for PlayerHandle {
             alive: self.alive.clone(),
             audio_buffer_ns: self.audio_buffer_ns.clone(),
             polyphony: self.polyphony.clone(),
+            render_load: self.render_load.clone(),
             drop_velocity: self.drop_velocity.clone(),
             buffer_memory: self.buffer_memory.clone(),
             output_rate: self.output_rate.clone(),
@@ -244,6 +249,8 @@ impl PlayerHandle {
         let audio_buffer_ns_for_thread = audio_buffer_ns.clone();
         let polyphony = Arc::new(AtomicU32::new(u32::MAX));
         let polyphony_for_thread = polyphony.clone();
+        let render_load = Arc::new(AtomicU32::new(u32::MAX));
+        let render_load_for_thread = render_load.clone();
         let drop_velocity = Arc::new(AtomicU32::new(0));
         let drop_velocity_for_thread = drop_velocity.clone();
         let buffer_memory = Arc::new(AtomicU64::new(u64::MAX));
@@ -989,7 +996,25 @@ impl PlayerHandle {
                     Ordering::Relaxed,
                 );
                 polyphony_for_thread.store(
-                    prerender!(player).map_or(u32::MAX, |p| p.polyphony()),
+                    match prerender!(player) {
+                        Some(p) => p.polyphony(),
+                        None => player
+                            .stream
+                            .as_ref()
+                            .and_then(|s| s.polyphony())
+                            .unwrap_or(u32::MAX),
+                    },
+                    Ordering::Relaxed,
+                );
+                render_load_for_thread.store(
+                    match prerender!(player) {
+                        Some(p) => p.render_load().to_bits(),
+                        None => player
+                            .stream
+                            .as_ref()
+                            .and_then(|s| s.render_load())
+                            .map_or(u32::MAX, f32::to_bits),
+                    },
                     Ordering::Relaxed,
                 );
                 drop_velocity_for_thread.store(
@@ -1069,6 +1094,7 @@ impl PlayerHandle {
             alive,
             audio_buffer_ns,
             polyphony,
+            render_load,
             drop_velocity,
             buffer_memory,
             output_rate,
@@ -1169,9 +1195,17 @@ impl PlayerHandle {
         Some(self.audio_buffer_ns.load(Ordering::Relaxed)).filter(|&ns| ns != u64::MAX)
     }
 
-    /// Voices sounding in a prerender engine, or `None` for a realtime output.
+    /// Voices sounding in the output engine, or `None` when it does not
+    /// report a count.
     pub fn polyphony(&self) -> Option<u32> {
         Some(self.polyphony.load(Ordering::Relaxed)).filter(|&n| n != u32::MAX)
+    }
+
+    /// Smoothed share of the realtime budget the engine spends rendering
+    /// (1.0 = 100%), or `None` when it does not report one.
+    pub fn render_load(&self) -> Option<f32> {
+        let bits = self.render_load.load(Ordering::Relaxed);
+        (bits != u32::MAX).then(|| f32::from_bits(bits))
     }
 
     /// Velocity notes are being skipped up to, or `None` when not skipping.
