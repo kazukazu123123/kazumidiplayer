@@ -22,6 +22,8 @@
 //! pitch sample-accurately, held notes included. Unlimited polyphony; voices
 //! render in parallel on every logical core.
 
+use crate::audio_engine::stream_stats::StreamStats;
+
 /// Overall level before polyphonic summing. Calibrated so a 48-note full-velocity
 /// chord sits near the prerender limiter's -0.5 dBFS ceiling without heavy gain reduction.
 const VOICE_GAIN: f32 = 0.1;
@@ -1208,15 +1210,6 @@ enum StreamMsg {
 /// boundary, renders one block of the prerender synth, and limits it with
 /// the same settings the prerender path uses (that limiter adds no delay,
 /// it only smooths a peak envelope, so realtime latency stays one block).
-/// What the audio callback publishes for the handle: voices sounding
-/// after the last block, and the smoothed share of one block's playback
-/// time its rendering took (1.0 = the whole block, i.e. 100%).
-#[derive(Default)]
-struct StreamStats {
-    polyphony: std::sync::atomic::AtomicU32,
-    load: std::sync::atomic::AtomicU32,
-}
-
 struct StreamRenderer {
     piano: PianoPrerender,
     rx: std::sync::mpsc::Receiver<StreamMsg>,
@@ -1245,12 +1238,7 @@ impl StreamRenderer {
         let took = started.elapsed().as_secs_f32();
         let budget = STREAM_BLOCK as f32 / self.piano.rate() as f32;
         self.load += (took / budget - self.load) * 0.05;
-        self.stats
-            .polyphony
-            .store(self.piano.polyphony(), std::sync::atomic::Ordering::Relaxed);
-        self.stats
-            .load
-            .store(self.load.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.stats.publish(self.piano.polyphony(), self.load);
         self.interleaved.clear();
         for i in 0..STREAM_BLOCK {
             self.interleaved.push(self.left[i]);
@@ -1355,19 +1343,13 @@ impl PianoStream {
 
     /// Voices sounding after the last rendered block.
     pub fn polyphony(&self) -> u32 {
-        self.stats
-            .polyphony
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.stats.polyphony()
     }
 
     /// Smoothed share of one block's playback time spent rendering it
     /// (1.0 = the whole block, i.e. 100%).
     pub fn render_load(&self) -> f32 {
-        f32::from_bits(
-            self.stats
-                .load
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        self.stats.load()
     }
 }
 

@@ -2,11 +2,11 @@
 //! callback, which schedules them on CSynth's stream clock and renders through
 //! cpal. CSynth itself opens no device, so this module owns the cpal stream.
 
+use crate::audio_engine::stream_stats::StreamStats;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use csynth::limiter::Limiter;
 use csynth::{PianoProcessor, QUANTUM};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -198,15 +198,6 @@ impl MidiState {
     }
 }
 
-/// What the audio callback publishes for the handle: voices sounding
-/// after the last quantum, and the smoothed share of one quantum's
-/// playback time its rendering took (1.0 = the whole quantum, i.e. 100%).
-#[derive(Default)]
-struct StreamStats {
-    polyphony: AtomicU32,
-    load: AtomicU32,
-}
-
 /// Lives in the audio callback: drains the queue at each quantum and renders.
 struct Renderer {
     piano: PianoProcessor,
@@ -236,10 +227,7 @@ impl Renderer {
         self.piano.process(&mut self.left, &mut self.right);
         let took = started.elapsed().as_secs_f32();
         self.load += (took / self.block_secs - self.load) * 0.05;
-        self.stats
-            .polyphony
-            .store(self.piano.stats.active, Ordering::Relaxed);
-        self.stats.load.store(self.load.to_bits(), Ordering::Relaxed);
+        self.stats.publish(self.piano.stats.active, self.load);
         self.interleaved.clear();
         for i in 0..QUANTUM {
             self.interleaved.push(self.left[i]);
@@ -330,13 +318,13 @@ impl CSynthStream {
 
     /// Voices sounding after the last rendered quantum.
     pub fn polyphony(&self) -> u32 {
-        self.stats.polyphony.load(Ordering::Relaxed)
+        self.stats.polyphony()
     }
 
     /// Smoothed share of one quantum's playback time spent rendering it
     /// (1.0 = the whole quantum, i.e. 100%).
     pub fn render_load(&self) -> f32 {
-        f32::from_bits(self.stats.load.load(Ordering::Relaxed))
+        self.stats.load()
     }
 }
 

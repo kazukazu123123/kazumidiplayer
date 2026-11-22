@@ -11,6 +11,7 @@ mod kdmapi;
 mod pending;
 mod piano;
 pub mod prerender;
+pub mod stream_stats;
 pub mod synths;
 
 use std::sync::atomic::{AtomicBool, Ordering};
