@@ -1716,7 +1716,7 @@ fn main() {
                 let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
                 if stats_alpha > 0.01 {
                     let tempo_us = app_state.tempo_us_value.max(1);
-                    let bpm = (60_000_000.0 / tempo_us as f64).round() as u64;
+                    let bpm = 60_000_000.0 / tempo_us as f64;
                     let total = app_state
                         .midi_data
                         .as_ref()
@@ -1732,7 +1732,7 @@ fn main() {
                             group_thousands(engine.notes_played()),
                             group_thousands(total)
                         ),
-                        format!("BPM   {} ({})", bpm, group_thousands(tempo_us as u64)),
+                        format!("BPM   {:.2} ({})", bpm, group_thousands(tempo_us as u64)),
                     ];
                     // Polyphony and render load; engines that do not
                     // report them show N/A.
