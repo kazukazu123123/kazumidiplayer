@@ -35,6 +35,15 @@ pub const VOICE_LIMIT_SETTING: crate::audio_engine::EngineSettingDef =
         kind: crate::audio_engine::EngineSettingKind::U32Range { min: 0, max: 100_000 },
         default: crate::audio_engine::EngineSettingValue::U32(0),
     };
+/// The thread-count setting this synth publishes to the settings UI.
+pub const THREADS_SETTING: crate::audio_engine::EngineSettingDef =
+    crate::audio_engine::EngineSettingDef {
+        key: "threads",
+        label: "Threads (0 = auto)",
+        help: "Worker threads the Piano engine renders with. 0 is auto: all cores but two, which stay free for the UI and the audio callback. Changing it rebuilds the worker pool; renders in flight finish on the old one.",
+        kind: crate::audio_engine::EngineSettingKind::U32Range { min: 0, max: 32 },
+        default: crate::audio_engine::EngineSettingValue::U32(0),
+    };
 /// SIMD-friendly lane count per voice.
 const LANES: usize = 32;
 /// Partials that get a prompt/aftersound lane pair; the rest get one lane.

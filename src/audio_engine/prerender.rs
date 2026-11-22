@@ -89,30 +89,67 @@ fn set_current_thread_priority(low: bool) {
 /// buffer is comfortably full, and compete normally when it runs low. Always
 /// below normal would let a busy UI starve rendering outright.
 fn set_render_priority(low: bool) {
+    SYNTH_POOL_LOW.store(low, std::sync::atomic::Ordering::Relaxed);
     set_current_thread_priority(low);
     synth_pool().broadcast(|_| set_current_thread_priority(low));
 }
+
+/// The priority new synth pool threads start with, so a pool rebuilt by
+/// [`set_synth_threads`] matches the render thread's current state
+/// instead of waiting for its next change.
+static SYNTH_POOL_LOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The current synth pool; replaced by [`set_synth_threads`].
+static SYNTH_POOL: std::sync::RwLock<Option<std::sync::Arc<rayon::ThreadPool>>> =
+    std::sync::RwLock::new(None);
 
 /// Below this fraction of the maximum, rendering runs at normal priority...
 const URGENT_BELOW: f64 = 0.25;
 /// ...until the buffer is back above this fraction.
 const RELAXED_ABOVE: f64 = 0.5;
 
-/// Worker pool for synths that render in parallel: all logical cores but
-/// two, which stay free for the UI and the audio callback even while the
-/// pool runs flat out refilling the buffer. Separate from rayon's global
-/// pool; its priority follows the render thread's (see
+/// Worker threads for the synth pool in auto mode: all logical cores
+/// but two, which stay free for the UI and the audio callback even while
+/// the pool runs flat out refilling the buffer.
+fn auto_synth_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    cores.saturating_sub(2).max(1)
+}
+
+fn build_synth_pool(threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("synth-{i}"))
+        .start_handler(|_| {
+            set_current_thread_priority(SYNTH_POOL_LOW.load(std::sync::atomic::Ordering::Relaxed))
+        })
+        .build()
+        .expect("failed to start synth thread pool")
+}
+
+/// Worker pool for synths that render in parallel. Separate from rayon's
+/// global pool; its priority follows the render thread's (see
 /// [`set_render_priority`]).
-pub fn synth_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(cores.saturating_sub(2).max(1))
-            .thread_name(|i| format!("synth-{i}"))
-            .build()
-            .expect("failed to start synth thread pool")
-    })
+pub fn synth_pool() -> std::sync::Arc<rayon::ThreadPool> {
+    if let Some(pool) = SYNTH_POOL.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return pool.clone();
+    }
+    let mut slot = SYNTH_POOL.write().unwrap_or_else(|e| e.into_inner());
+    slot.get_or_insert_with(|| std::sync::Arc::new(build_synth_pool(auto_synth_threads())))
+        .clone()
+}
+
+/// Set the synth pool's worker count (0 = auto, see
+/// [`auto_synth_threads`]). The pool is rebuilt; work in flight finishes
+/// on the old one.
+pub fn set_synth_threads(threads: u32) {
+    let count = if threads == 0 {
+        auto_synth_threads()
+    } else {
+        threads as usize
+    };
+    let pool = std::sync::Arc::new(build_synth_pool(count));
+    *SYNTH_POOL.write().unwrap_or_else(|e| e.into_inner()) = Some(pool);
 }
 
 /// Song position reached after `frames` output frames from `base_ns`.
