@@ -1,14 +1,9 @@
-use crate::blur_requester::BlurRequester;
 use crate::midi_parser_worker::ParseProgress;
-use crate::overlay_manager::OverlayManager;
 use crate::player::{PlayerCommand, PlayerFeedback, PlayerHandle, PlayerState};
-use crate::shaking::ShakeState;
 use crate::ui_components::piano_keyboard;
 use crate::utils::get_note_color_by_track_channel;
-use crate::window_manager::{self, InputEvent};
+use crate::window_manager;
 use raylib::prelude::*;
-use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -72,140 +67,21 @@ pub enum AppOverlay {
     PlayerCrashed,
 }
 
+mod playback;
+mod settings;
+mod ui_state;
+
+pub use playback::Playback;
+pub use settings::Settings;
+pub use ui_state::UiState;
+
+/// Everything the app remembers between frames, in three groups by
+/// role: the user's settings, the playback session, and transient
+/// UI state (animations, drags and widget states).
 pub struct AppState {
-    // Player State
-    pub current_progress: Option<ParseProgress>,
-    /// Ring of `(instant, bytes_done, events_done)` parse-progress snapshots kept for a
-    /// ~0.5s window, so the parse rates are moving averages rather than jumpy deltas.
-    pub parse_rate_samples: VecDeque<(Instant, u64, u64)>,
-    /// Most recent parse speed in events per second, shown in the loading overlay.
-    pub parse_eps: f64,
-    /// Most recent parse speed in bytes per second, shown in the loading overlay.
-    pub parse_bps: f64,
-    pub is_dragging_seek: bool,
-    pub last_state: PlayerState,
-    pub is_loading: bool,
-    /// Present only while the finished loading panel is animating out.
-    pub parse_toast: Option<ParseToast>,
-    pub is_tick_based: bool,
-    /// Piano-roll scroll speed multiplier (higher = notes move faster, shorter
-    /// visible window). Adjusted with the mouse wheel over the piano roll.
-    pub note_speed: f32,
-    /// Playback speed multiplier (0.05 to 4.0, slider-controlled; 1.0 = normal).
-    pub playback_speed: f32,
-    /// Worker threads kazumidiparser uses to parse a file (1..=cpu_threads()).
-    pub parse_threads: u32,
-
-    // Statistics overlay
-    pub show_stats: bool,
-    pub show_stats_animation: f32,
-    pub stats_clock: f32,
-    // Display: wait for the monitor's refresh (on), or render as fast as possible (off).
-    pub vsync_enabled: bool,
-    pub vsync_animation: f32,
-    pub nps_samples: VecDeque<(f32, u64)>,
-    pub nps_value: f32,
-    pub tempo_us_value: u32,
-    pub tick_map: Option<Vec<(u64, u32, u64)>>,
-    pub midi_data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
-    pub last_seek_sent_ns: Option<u64>,
-
-    // Animation
-    pub tick_based_animation: f32,
-    /// Pulses the piano-roll zoom in time with the MIDI tempo.
-    pub beat_bounce_enabled: bool,
-    pub beat_bounce_animation: f32,
-    /// Peak piano-roll zoom added at the start of a pulse, in percent (0..=25).
-    pub beat_bounce_amount: u32,
-    /// Rhythmic note value used for each pulse: 4 = quarter, 8 = eighth, etc.
-    pub beat_bounce_note_value: u32,
-    /// Shift each pulse by half of the selected note interval.
-    pub beat_bounce_offbeat: bool,
-    pub beat_bounce_offbeat_animation: f32,
-    pub shake_enabled: bool,
-    pub shake_animation: f32,
-    pub shake_state: ShakeState,
-    pub integrate_keyboard: bool,
-    pub keyboard_animation: f32,
-    /// Show the piano roll as a frameless background layer filling the
-    /// whole application window, with the other windows above it.
-    pub piano_roll_fullscreen: bool,
-    pub piano_roll_fullscreen_animation: f32,
-    /// While the piano roll is fullscreen, pin the player controls
-    /// window to the top of the application window.
-    pub dock_controls_top: bool,
-    pub dock_controls_top_animation: f32,
-    pub autoplay_on_load: bool,
-    pub autoplay_animation: f32,
-    pub pitch_bend_spring_parameters: [u32; 3],
-    pub pitch_bend_spring_sliders: [crate::ui_components::numeric_slider::NumericSliderState; 3],
-    pub pitch_bend_move_window_enabled: bool,
-    pub pitch_bend_move_window_animation: f32,
-    pub pitch_bend_window_enabled: bool,
-    pub pitch_bend_window_animation: f32,
-    pub pitch_bend_override_enabled: bool,
-    pub pitch_bend_override_animation: f32,
-    pub pitch_bend_multiplier: u8, // 1-127 (semitones)
-    pub unlimited_output_enabled: bool,
-    pub unlimited_output_animation: f32,
-    /// S16 Clipping: no limiter, wrap-around overflow instead
-    /// (prerender engines only).
-    pub s16_clipping_enabled: bool,
-    pub s16_clipping_animation: f32,
-    /// When the S16 enable warning was opened, as program time in seconds
-    /// from `get_time()`; `None` when closed.
-    pub s16_warning_opened_at: Option<f64>,
-    pub midi_ev_buffer_size: u32,
-    /// 0 = legacy/no buffer, 1 = buffered slowdown, 2 = buffered catch-up.
-    pub midi_ev_mode: usize,
-    /// Index into `AudioEngine::ALL`.
-    pub audio_engine: usize,
-    /// Longest prerendered audio buffer, in seconds.
-    pub audio_buffer_secs: u32,
-    /// Opus bitrate of the prerender buffer, in kbps.
-    pub opus_bitrate_kbps: u32,
-    /// Debug builds: whether the ViSQOL graph window is shown.
-    #[cfg(debug_assertions)]
-    pub visqol_window_enabled: bool,
-    #[cfg(debug_assertions)]
-    pub visqol_window_animation: f32,
-    #[cfg(debug_assertions)]
-    pub visqol_slider_dragging: bool,
-    #[cfg(debug_assertions)]
-    pub visqol_bitrate_field: crate::ui_components::numeric_slider::NumericSliderState,
-
-    // UI (non-editor)
-    pub last_input_event: Option<InputEvent>,
-    pub settings_scroll_y: f32,
-    pub settings_scrollbar_dragging: bool,
-    pub settings_scrollbar_drag_start_y: f32,
-    pub settings_scrollbar_drag_start_scroll: f32,
-    pub settings_pb_multiplier_slider: crate::ui_components::numeric_slider::NumericSliderState,
-    pub settings_beat_bounce_amount_slider:
-        crate::ui_components::numeric_slider::NumericSliderState,
-    pub settings_beat_bounce_note_value_slider:
-        crate::ui_components::numeric_slider::NumericSliderState,
-    pub settings_midi_ev_buffer_size_slider:
-        crate::ui_components::numeric_slider::NumericSliderState,
-    pub settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState,
-    pub settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState,
-    pub settings_audio_buffer_slider: crate::ui_components::numeric_slider::NumericSliderState,
-    pub settings_opus_bitrate_slider: crate::ui_components::numeric_slider::NumericSliderState,
-    /// Built-in piano synth voice limit; 0 = unlimited.
-    pub engine_settings: std::collections::HashMap<String, crate::audio_engine::EngineSettingValue>,
-    pub engine_setting_sliders: std::collections::HashMap<String, crate::ui_components::numeric_slider::NumericSliderState>,
-    pub settings_parse_threads_slider: crate::ui_components::numeric_slider::NumericSliderState,
-    pub speed_slider_dragging: bool,
-
-    // Editor
-    pub text_editor: crate::ui_components::text_editor::TextEditorState,
-
-    // Systems
-    pub blur_requester: BlurRequester,
-    pub overlay_manager: OverlayManager<AppOverlay>,
-    /// Audio engine status banner: (message, is_error). Fades out after a while.
-    pub audio_banner: Option<(String, bool)>,
-    pub audio_banner_timer: f32,
+    pub settings: Settings,
+    pub playback: Playback,
+    pub ui: UiState,
 }
 
 pub const OVERLAY_FADE_DURATION: f32 = 0.2;
@@ -246,117 +122,15 @@ fn calculate_tick_map(data: &kazumidiparser::MIDIPlayerData) -> Vec<(u64, u32, u
 impl AppState {
     pub fn new() -> Self {
         Self {
-            // Player State
-            current_progress: None,
-            parse_rate_samples: VecDeque::new(),
-            parse_eps: 0.0,
-            parse_bps: 0.0,
-            is_dragging_seek: false,
-            last_state: PlayerState::Stopped,
-            is_loading: false,
-            parse_toast: None,
-            is_tick_based: false,
-            note_speed: 1.0,
-            playback_speed: 1.0,
-            parse_threads: cpu_threads(),
-            show_stats: true,
-            show_stats_animation: 0.0,
-            stats_clock: 0.0,
-            // Matches the window, which is created with vsync on.
-            vsync_enabled: true,
-            vsync_animation: 0.0,
-            nps_samples: VecDeque::new(),
-            nps_value: 0.0,
-            tempo_us_value: 500_000,
-            tick_map: None,
-            midi_data: None,
-            last_seek_sent_ns: None,
-
-            // Animation
-            tick_based_animation: 0.0,
-            beat_bounce_enabled: false,
-            beat_bounce_animation: 0.0,
-            beat_bounce_amount: 8,
-            beat_bounce_note_value: 4,
-            beat_bounce_offbeat: false,
-            beat_bounce_offbeat_animation: 0.0,
-            shake_enabled: false,
-            shake_animation: 0.0,
-            shake_state: ShakeState::new(),
-            integrate_keyboard: false,
-            keyboard_animation: 0.0,
-            piano_roll_fullscreen: false,
-            piano_roll_fullscreen_animation: 0.0,
-            dock_controls_top: false,
-            dock_controls_top_animation: 0.0,
-            autoplay_on_load: false,
-            autoplay_animation: 0.0,
-            pitch_bend_spring_parameters: [1, 170, 26],
-            pitch_bend_spring_sliders: std::array::from_fn(|_| Default::default()),
-            pitch_bend_move_window_enabled: true,
-            pitch_bend_move_window_animation: 1.0,
-            pitch_bend_window_enabled: true,
-            pitch_bend_window_animation: 1.0,
-            pitch_bend_override_enabled: false,
-            pitch_bend_override_animation: 0.0,
-            pitch_bend_multiplier: 12, // default 12 semitones
-            unlimited_output_enabled: false,
-            unlimited_output_animation: 0.0,
-            s16_clipping_enabled: false,
-            s16_clipping_animation: 0.0,
-            s16_warning_opened_at: None,
-            midi_ev_buffer_size: crate::player::DEFAULT_MIDI_EV_BUFFER_SIZE,
-            midi_ev_mode: 0,
-            audio_engine: 0,
-            audio_buffer_secs: crate::audio_engine::prerender::DEFAULT_MAX_BUFFER_SECS,
-            opus_bitrate_kbps: 256,
-            #[cfg(debug_assertions)]
-            visqol_window_enabled: false,
-            #[cfg(debug_assertions)]
-            visqol_window_animation: 0.0,
-            #[cfg(debug_assertions)]
-            visqol_slider_dragging: false,
-            #[cfg(debug_assertions)]
-            visqol_bitrate_field:
-                crate::ui_components::numeric_slider::NumericSliderState::default(),
-
-            // UI (non-editor)
-            last_input_event: None,
-            settings_scroll_y: 0.0,
-            settings_scrollbar_dragging: false,
-            settings_scrollbar_drag_start_y: 0.0,
-            settings_scrollbar_drag_start_scroll: 0.0,
-            settings_pb_multiplier_slider: Default::default(),
-            settings_beat_bounce_amount_slider:
-                crate::ui_components::numeric_slider::NumericSliderState::default(),
-            settings_beat_bounce_note_value_slider:
-                crate::ui_components::numeric_slider::NumericSliderState::default(),
-            settings_midi_ev_buffer_size_slider:
-                crate::ui_components::numeric_slider::NumericSliderState::default(),
-            settings_midi_ev_mode_combo: crate::ui_components::combo_box::ComboBoxState::default(),
-            settings_audio_engine_combo: crate::ui_components::combo_box::ComboBoxState::default(),
-            settings_audio_buffer_slider:
-                crate::ui_components::numeric_slider::NumericSliderState::default(),
-            settings_opus_bitrate_slider:
-                crate::ui_components::numeric_slider::NumericSliderState::default(),
-            engine_settings: Default::default(),
-            engine_setting_sliders: Default::default(),
-            settings_parse_threads_slider: Default::default(),
-            speed_slider_dragging: false,
-
-            // Editor
-            text_editor: Default::default(),
-
-            // Systems
-            blur_requester: BlurRequester::new(),
-            overlay_manager: OverlayManager::new(OVERLAY_FADE_DURATION),
-            audio_banner: None,
-            audio_banner_timer: 0.0,
+            settings: Settings::new(),
+            playback: Playback::new(),
+            ui: UiState::new(),
         }
     }
 
+
     pub fn get_weighted_time(&self, time_ns: u64) -> u64 {
-        if let Some(map) = &self.tick_map {
+        if let Some(map) = &self.playback.tick_map {
             let idx = map.partition_point(|(t, _, _)| *t <= time_ns);
             if idx == 0 {
                 return time_ns;
@@ -380,43 +154,43 @@ impl AppState {
     ) {
         match feedback {
             PlayerFeedback::ParseFailed(path) => {
-                self.is_loading = false;
+                self.playback.is_loading = false;
                 self.reset_parse_progress();
                 println!("[AppState] Parse failed: {}", path);
             }
             PlayerFeedback::ParseCancelled => {
-                self.is_loading = false;
+                self.playback.is_loading = false;
                 self.reset_parse_progress();
             }
             PlayerFeedback::Loaded(path, parse_duration) => {
-                self.is_loading = false;
+                self.playback.is_loading = false;
                 // Snapshot the final numbers before they are cleared: the toast carries the
                 // panel out of the screen still showing them.
-                self.parse_toast = Some(ParseToast {
+                self.playback.parse_toast = Some(ParseToast {
                     elapsed: 0.0,
                     parse_duration,
-                    progress: self.current_progress,
-                    parse_bps: self.parse_bps,
-                    parse_eps: self.parse_eps,
+                    progress: self.playback.current_progress,
+                    parse_bps: self.playback.parse_bps,
+                    parse_eps: self.playback.parse_eps,
                 });
                 self.reset_parse_progress();
-                self.is_dragging_seek = false;
-                self.last_seek_sent_ns = None;
+                self.playback.is_dragging_seek = false;
+                self.playback.last_seek_sent_ns = None;
 
                 if let Some(midi_data) = engine.get_midi_data() {
-                    self.tick_map = Some(calculate_tick_map(&midi_data));
-                    self.midi_data = Some(midi_data.clone());
+                    self.playback.tick_map = Some(calculate_tick_map(&midi_data));
+                    self.playback.midi_data = Some(midi_data.clone());
                 } else {
-                    self.midi_data = None;
-                    self.tick_map = None;
+                    self.playback.midi_data = None;
+                    self.playback.tick_map = None;
                 }
 
-                if self.autoplay_on_load {
+                if self.settings.autoplay_on_load {
                     tx_commands.send(PlayerCommand::Play).ok();
                 }
             }
             PlayerFeedback::Progress(progress) => {
-                self.current_progress = Some(progress);
+                self.playback.current_progress = Some(progress);
                 self.update_parse_rate(progress, Instant::now());
             }
         }
@@ -424,10 +198,10 @@ impl AppState {
 
     /// Advances the finished-parse panel's exit animation and drops it when it is done.
     pub fn update_parse_toast(&mut self, dt: f32) {
-        if let Some(toast) = &mut self.parse_toast {
+        if let Some(toast) = &mut self.playback.parse_toast {
             toast.elapsed += dt;
             if toast.elapsed >= ParseToast::total() {
-                self.parse_toast = None;
+                self.playback.parse_toast = None;
             }
         }
     }
@@ -437,23 +211,23 @@ impl AppState {
     /// to something inert and raise the terminal overlay, rather than leaving a UI that
     /// looks alive and answers nothing.
     pub fn enter_player_crashed(&mut self) {
-        self.is_loading = false;
-        self.parse_toast = None;
-        self.current_progress = None;
+        self.playback.is_loading = false;
+        self.playback.parse_toast = None;
+        self.playback.current_progress = None;
         self.reset_parse_progress();
-        self.is_dragging_seek = false;
-        self.last_seek_sent_ns = None;
-        self.midi_data = None;
-        self.tick_map = None;
-        self.last_state = PlayerState::Stopped;
-        self.overlay_manager.open(AppOverlay::PlayerCrashed);
+        self.playback.is_dragging_seek = false;
+        self.playback.last_seek_sent_ns = None;
+        self.playback.midi_data = None;
+        self.playback.tick_map = None;
+        self.playback.last_state = PlayerState::Stopped;
+        self.ui.overlay_manager.open(AppOverlay::PlayerCrashed);
     }
 
     fn reset_parse_progress(&mut self) {
-        self.current_progress = None;
-        self.parse_rate_samples.clear();
-        self.parse_eps = 0.0;
-        self.parse_bps = 0.0;
+        self.playback.current_progress = None;
+        self.playback.parse_rate_samples.clear();
+        self.playback.parse_eps = 0.0;
+        self.playback.parse_bps = 0.0;
     }
 
     /// Fold one progress snapshot into the moving-average parse rates. The parser polls
@@ -462,24 +236,24 @@ impl AppState {
     fn update_parse_rate(&mut self, progress: ParseProgress, now: Instant) {
         const WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
-        self.parse_rate_samples
+        self.playback.parse_rate_samples
             .push_back((now, progress.bytes_done, progress.events_done));
-        while let Some(&(t, _, _)) = self.parse_rate_samples.front() {
-            if now.duration_since(t) > WINDOW && self.parse_rate_samples.len() > 2 {
-                self.parse_rate_samples.pop_front();
+        while let Some(&(t, _, _)) = self.playback.parse_rate_samples.front() {
+            if now.duration_since(t) > WINDOW && self.playback.parse_rate_samples.len() > 2 {
+                self.playback.parse_rate_samples.pop_front();
             } else {
                 break;
             }
         }
 
         if let (Some(&(t0, b0, e0)), Some(&(t1, b1, e1))) = (
-            self.parse_rate_samples.front(),
-            self.parse_rate_samples.back(),
+            self.playback.parse_rate_samples.front(),
+            self.playback.parse_rate_samples.back(),
         ) {
             let dt = t1.duration_since(t0).as_secs_f64();
             if dt > 0.0 {
-                self.parse_bps = b1.saturating_sub(b0) as f64 / dt;
-                self.parse_eps = e1.saturating_sub(e0) as f64 / dt;
+                self.playback.parse_bps = b1.saturating_sub(b0) as f64 / dt;
+                self.playback.parse_eps = e1.saturating_sub(e0) as f64 / dt;
             }
         }
     }
@@ -487,24 +261,24 @@ impl AppState {
     pub fn handle_file_drop(&mut self, path: &str, tx_commands: &mpsc::Sender<PlayerCommand>) {
         // With the player gone the load command has no reader; accepting the file would
         // only spin the loading overlay forever.
-        if self.overlay_manager.current_kind() == Some(AppOverlay::PlayerCrashed) {
+        if self.ui.overlay_manager.current_kind() == Some(AppOverlay::PlayerCrashed) {
             return;
         }
-        self.is_loading = true;
-        self.is_dragging_seek = false;
-        self.last_seek_sent_ns = None;
-        self.parse_toast = None;
-        self.current_progress = None;
-        self.midi_data = None;
-        self.tick_map = None;
+        self.playback.is_loading = true;
+        self.playback.is_dragging_seek = false;
+        self.playback.last_seek_sent_ns = None;
+        self.playback.parse_toast = None;
+        self.playback.current_progress = None;
+        self.playback.midi_data = None;
+        self.playback.tick_map = None;
         tx_commands
             .send(PlayerCommand::LoadFile(path.to_string()))
             .ok();
     }
 
     pub fn update_player_state(&mut self, st: PlayerState) {
-        if st != self.last_state && st != PlayerState::Loading {
-            self.last_state = st;
+        if st != self.playback.last_state && st != PlayerState::Loading {
+            self.playback.last_state = st;
         }
     }
 
@@ -513,27 +287,27 @@ impl AppState {
     }
 
     pub fn start_seeking(&mut self, preview_ns: u64, engine: &PlayerHandle) {
-        self.is_dragging_seek = true;
-        self.last_seek_sent_ns = Some(preview_ns);
+        self.playback.is_dragging_seek = true;
+        self.playback.last_seek_sent_ns = Some(preview_ns);
         engine.send(PlayerCommand::Seek(preview_ns));
     }
 
     pub fn update_seek_preview(&mut self, seek_ns: u64, engine: &PlayerHandle) {
         // Only send Seek to the engine when the position changes meaningfully
         // to avoid flooding the player with seek commands every frame.
-        let should_seek = match self.last_seek_sent_ns {
+        let should_seek = match self.playback.last_seek_sent_ns {
             Some(prev) => seek_ns.abs_diff(prev) > 1_000_000,
             None => true,
         };
         if should_seek {
-            self.last_seek_sent_ns = Some(seek_ns);
+            self.playback.last_seek_sent_ns = Some(seek_ns);
             engine.send(PlayerCommand::Seek(seek_ns));
         }
     }
 
     pub fn release_seek(&mut self) {
-        self.is_dragging_seek = false;
-        self.last_seek_sent_ns = None;
+        self.playback.is_dragging_seek = false;
+        self.playback.last_seek_sent_ns = None;
     }
 
     pub fn draw_keyboard(

@@ -2,6 +2,7 @@ mod controls;
 mod editor;
 mod loading;
 mod settings;
+mod stats;
 mod tooltip;
 mod visqol;
 
@@ -11,6 +12,7 @@ pub use loading::{
     draw_audio_banner, draw_loading_overlay, draw_parse_toast, draw_player_crashed_overlay,
 };
 pub use settings::draw_settings_overlay;
+pub use stats::draw_stats_overlay;
 pub use tooltip::draw_pending_tooltip;
 #[cfg(debug_assertions)]
 pub use visqol::draw_visqol_window;

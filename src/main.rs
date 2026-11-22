@@ -10,6 +10,7 @@ mod overlay_manager;
 mod piano_roll;
 mod player;
 mod shaking;
+mod settings_sync;
 mod ui;
 mod ui_components;
 mod utils;
@@ -22,21 +23,6 @@ use raylib::prelude::*;
 use std::sync::mpsc;
 
 use crate::window_manager::WindowManager;
-
-// Format an integer with comma thousands separators (e.g. 1204880 -> "1,204,880").
-fn group_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
 
 fn animate_toggle(condition: bool, value: &mut f32, dt: f32, speed: f32) {
     if condition {
@@ -135,10 +121,10 @@ fn main() {
 
     // The output arrives asynchronously (an engine may take a while to open);
     // until then the player runs silent.
-    let startup_audio_engine = audio_engine::EngineSelection::from_index(app_state.audio_engine);
+    let startup_audio_engine = audio_engine::EngineSelection::from_index(app_state.settings.audio_engine);
     let mut pending_audio_engine = Some((startup_audio_engine, startup_audio_engine.start()));
     let engine = PlayerHandle::spawn(rx_commands_from_main, tx_feedback_to_main, None);
-    engine.set_audio_buffer_secs(app_state.audio_buffer_secs);
+    engine.set_audio_buffer_secs(app_state.settings.audio_buffer_secs);
 
     let mut render_texture = rl
         .load_render_texture(
@@ -232,8 +218,8 @@ fn main() {
 
     let mut current_layout_width = 800;
     let mut current_layout_height = 80;
-    let mut last_integrate_keyboard = app_state.integrate_keyboard;
-    let mut last_piano_roll_fullscreen = app_state.piano_roll_fullscreen;
+    let mut last_integrate_keyboard = app_state.settings.integrate_keyboard;
+    let mut last_piano_roll_fullscreen = app_state.settings.piano_roll_fullscreen;
     // Rectangle and z-order of the piano roll window, saved when the
     // fullscreen piano roll starts so it can be restored as it was.
     let mut saved_roll_layout: Option<(window_manager::Rectangle, i32)> = None;
@@ -302,10 +288,10 @@ fn main() {
             match rx.try_recv() {
                 Ok(Ok(stream)) => {
                     engine.set_output(Some(stream));
-                    if app_state.audio_banner.is_some() {
-                        app_state.audio_banner =
+                    if app_state.ui.audio_banner.is_some() {
+                        app_state.ui.audio_banner =
                             Some((format!("{} ready", audio_engine.label()), false));
-                        app_state.audio_banner_timer = 0.0;
+                        app_state.ui.audio_banner_timer = 0.0;
                     }
                     pending_audio_engine = None;
                 }
@@ -314,14 +300,14 @@ fn main() {
                         "[WARN] {}: {e}. Audio output unchanged.",
                         audio_engine.label()
                     );
-                    app_state.audio_banner = Some((format!("{}: {e}", audio_engine.label()), true));
-                    app_state.audio_banner_timer = 0.0;
+                    app_state.ui.audio_banner = Some((format!("{}: {e}", audio_engine.label()), true));
+                    app_state.ui.audio_banner_timer = 0.0;
                     pending_audio_engine = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     // Keep a loading banner up until the result arrives.
-                    if matches!(app_state.audio_banner, Some((_, false))) {
-                        app_state.audio_banner_timer = 0.0;
+                    if matches!(app_state.ui.audio_banner, Some((_, false))) {
+                        app_state.ui.audio_banner_timer = 0.0;
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => pending_audio_engine = None,
@@ -335,13 +321,13 @@ fn main() {
         let pitch_bend_normalized = engine.get_pitch_bend_normalized();
         let pitch_bend_range = engine.get_pitch_bend_range();
         if !rl.is_window_maximized() && !rl.is_window_minimized() && !rl.is_window_fullscreen() {
-            let target_x = if app_state.pitch_bend_move_window_enabled {
+            let target_x = if app_state.settings.pitch_bend_move_window_enabled {
                 pitch_bend_normalized.clamp(-1.0, 1.0) * (pitch_bend_range.max(0.0) / 12.0) * 40.0
             } else {
                 0.0
             };
             let target = Vector2::new(target_x, (target_x / 10.0).sin() * 20.0);
-            let [mass, stiffness, damping] = app_state.pitch_bend_spring_parameters;
+            let [mass, stiffness, damping] = app_state.settings.pitch_bend_spring_parameters;
             // Small semi-implicit integration steps keep stiff springs stable.
             let dt = rl.get_frame_time().clamp(0.0, 0.1);
             let steps = (dt / 0.001).ceil().max(1.0) as u32;
@@ -368,7 +354,7 @@ fn main() {
         }
         let mut duration_ns = engine.duration_ns();
 
-        let is_loading = st == PlayerState::Loading || app_state.is_loading;
+        let is_loading = st == PlayerState::Loading || app_state.playback.is_loading;
         let is_midi_loaded = duration_ns > 1 && !is_loading;
 
         if is_loading {
@@ -376,19 +362,19 @@ fn main() {
         }
 
         // Update layout when integration setting changes
-        if app_state.integrate_keyboard != last_integrate_keyboard {
+        if app_state.settings.integrate_keyboard != last_integrate_keyboard {
             current_layout_width = -1; // Force layout update
-            last_integrate_keyboard = app_state.integrate_keyboard;
+            last_integrate_keyboard = app_state.settings.integrate_keyboard;
         }
 
         // Apply a fullscreen piano roll toggle: on, the piano roll becomes
         // a background layer covering the whole application window
         // (the other windows stay visible and usable above it); off, its
         // saved rectangle and z-order are restored.
-        if app_state.piano_roll_fullscreen != last_piano_roll_fullscreen {
-            last_piano_roll_fullscreen = app_state.piano_roll_fullscreen;
+        if app_state.settings.piano_roll_fullscreen != last_piano_roll_fullscreen {
+            last_piano_roll_fullscreen = app_state.settings.piano_roll_fullscreen;
             current_layout_width = -1; // Force layout update
-            if app_state.piano_roll_fullscreen {
+            if app_state.settings.piano_roll_fullscreen {
                 if let Some(window) = window_manager.get_window(piano_roll_window_handle) {
                     saved_roll_layout = Some((window.rectangle, window.z_order));
                 }
@@ -419,7 +405,7 @@ fn main() {
         // it instead of running underneath, and the window is marked
         // background so input cannot drag or resize it. Undocking
         // restores the rectangle it had before docking.
-        let controls_docked = app_state.piano_roll_fullscreen && app_state.dock_controls_top;
+        let controls_docked = app_state.settings.piano_roll_fullscreen && app_state.settings.dock_controls_top;
         if controls_docked != last_controls_docked {
             last_controls_docked = controls_docked;
             if controls_docked {
@@ -433,7 +419,7 @@ fn main() {
                 if let Some(rectangle) = saved_controls_rect.take() {
                     window_manager.set_window_rectangle(controls_window_handle, rectangle);
                 }
-                if app_state.piano_roll_fullscreen {
+                if app_state.settings.piano_roll_fullscreen {
                     window_manager.set_window_rectangle(
                         piano_roll_window_handle,
                         window_manager::Rectangle::new(
@@ -465,128 +451,128 @@ fn main() {
         // Update toggle animations
         let anim_speed = 10.0;
         animate_toggle(
-            app_state.is_tick_based,
-            &mut app_state.tick_based_animation,
+            app_state.playback.is_tick_based,
+            &mut app_state.ui.tick_based_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.beat_bounce_enabled,
-            &mut app_state.beat_bounce_animation,
+            app_state.settings.beat_bounce_enabled,
+            &mut app_state.ui.beat_bounce_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.beat_bounce_offbeat,
-            &mut app_state.beat_bounce_offbeat_animation,
+            app_state.settings.beat_bounce_offbeat,
+            &mut app_state.ui.beat_bounce_offbeat_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.shake_enabled,
-            &mut app_state.shake_animation,
+            app_state.settings.shake_enabled,
+            &mut app_state.ui.shake_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.integrate_keyboard,
-            &mut app_state.keyboard_animation,
+            app_state.settings.integrate_keyboard,
+            &mut app_state.ui.keyboard_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.piano_roll_fullscreen,
-            &mut app_state.piano_roll_fullscreen_animation,
+            app_state.settings.piano_roll_fullscreen,
+            &mut app_state.ui.piano_roll_fullscreen_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.dock_controls_top,
-            &mut app_state.dock_controls_top_animation,
+            app_state.settings.dock_controls_top,
+            &mut app_state.ui.dock_controls_top_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.autoplay_on_load,
-            &mut app_state.autoplay_animation,
+            app_state.settings.autoplay_on_load,
+            &mut app_state.ui.autoplay_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.pitch_bend_move_window_enabled,
-            &mut app_state.pitch_bend_move_window_animation,
+            app_state.settings.pitch_bend_move_window_enabled,
+            &mut app_state.ui.pitch_bend_move_window_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.pitch_bend_window_enabled,
-            &mut app_state.pitch_bend_window_animation,
+            app_state.settings.pitch_bend_window_enabled,
+            &mut app_state.ui.pitch_bend_window_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.pitch_bend_override_enabled,
-            &mut app_state.pitch_bend_override_animation,
+            app_state.settings.pitch_bend_override_enabled,
+            &mut app_state.ui.pitch_bend_override_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.unlimited_output_enabled,
-            &mut app_state.unlimited_output_animation,
+            app_state.settings.unlimited_output_enabled,
+            &mut app_state.ui.unlimited_output_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.s16_clipping_enabled,
-            &mut app_state.s16_clipping_animation,
+            app_state.settings.s16_clipping_enabled,
+            &mut app_state.ui.s16_clipping_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.show_stats,
-            &mut app_state.show_stats_animation,
+            app_state.settings.show_stats,
+            &mut app_state.ui.show_stats_animation,
             dt,
             anim_speed,
         );
         animate_toggle(
-            app_state.vsync_enabled,
-            &mut app_state.vsync_animation,
+            app_state.settings.vsync_enabled,
+            &mut app_state.ui.vsync_animation,
             dt,
             anim_speed,
         );
         #[cfg(debug_assertions)]
         animate_toggle(
-            app_state.visqol_window_enabled,
-            &mut app_state.visqol_window_animation,
+            app_state.settings.visqol_window_enabled,
+            &mut app_state.ui.visqol_window_animation,
             dt,
             anim_speed,
         );
 
-        app_state.stats_clock += dt;
+        app_state.playback.stats_clock += dt;
         {
             let now_notes = engine.notes_played();
-            let clock = app_state.stats_clock;
-            app_state.nps_samples.push_back((clock, now_notes));
-            while app_state.nps_samples.len() > 1
+            let clock = app_state.playback.stats_clock;
+            app_state.playback.nps_samples.push_back((clock, now_notes));
+            while app_state.playback.nps_samples.len() > 1
                 && app_state
-                    .nps_samples
+                    .playback.nps_samples
                     .get(1)
                     .map_or(false, |&(t, _)| clock - t > 1.0)
             {
-                app_state.nps_samples.pop_front();
+                app_state.playback.nps_samples.pop_front();
             }
             if let (Some(&(t0, n0)), Some(&(t1, n1))) =
-                (app_state.nps_samples.front(), app_state.nps_samples.back())
+                (app_state.playback.nps_samples.front(), app_state.playback.nps_samples.back())
             {
                 let span = t1 - t0;
-                app_state.nps_value = if span > 1e-3 {
+                app_state.playback.nps_value = if span > 1e-3 {
                     (n1.saturating_sub(n0)) as f32 / span
                 } else {
                     0.0
                 };
             }
         }
-        app_state.tempo_us_value = engine
+        app_state.playback.tempo_us_value = engine
             .get_midi_data()
             .map(|data| {
                 let parser_data = unsafe { &*data.as_ptr() };
@@ -595,9 +581,9 @@ fn main() {
             .unwrap_or(500_000);
 
         // Shaking Window Logic
-        app_state.shake_state.update(
-            app_state.shake_enabled,
-            app_state.integrate_keyboard,
+        app_state.ui.shake_state.update(
+            app_state.settings.shake_enabled,
+            app_state.settings.integrate_keyboard,
             piano_roll_window_handle,
             piano_keyboard_window_handle,
             &mut window_manager,
@@ -607,7 +593,7 @@ fn main() {
             is_midi_loaded,
             is_loading,
             st,
-            app_state.is_dragging_seek,
+            app_state.playback.is_dragging_seek,
             dt,
         );
 
@@ -616,7 +602,7 @@ fn main() {
         // window itself is a background layer, so nothing else can
         // move or resize it.
         let screen_size = (rl.get_screen_width(), rl.get_screen_height());
-        if app_state.piano_roll_fullscreen && screen_size != last_screen_size {
+        if app_state.settings.piano_roll_fullscreen && screen_size != last_screen_size {
             // While the controls are docked, the roll starts below the
             // dock strip instead of covering the whole window.
             let (roll_y, roll_h) = if last_controls_docked {
@@ -633,10 +619,10 @@ fn main() {
 
         // Check if keyboard layout needs update
         let layout_update_needed = {
-            if app_state.integrate_keyboard {
+            if app_state.settings.integrate_keyboard {
                 if let Some(pr_win) = window_manager.get_window(piano_roll_window_handle) {
                     let content_w = pr_win.rectangle.width as f32;
-                    let titlebar_h = if app_state.piano_roll_fullscreen {
+                    let titlebar_h = if app_state.settings.piano_roll_fullscreen {
                         0
                     } else {
                         pr_win.get_window_titlebar_height()
@@ -704,24 +690,24 @@ fn main() {
         // taken back down: once the player thread is gone the session is over, and any
         // other overlay would only offer controls that no longer do anything.
         let player_crashed =
-            app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::PlayerCrashed);
+            app_state.ui.overlay_manager.current_kind() == Some(app_state::AppOverlay::PlayerCrashed);
         if !engine.is_alive() && !player_crashed {
             app_state.enter_player_crashed();
         }
 
-        let is_processing = app_state.current_progress.is_some();
+        let is_processing = app_state.playback.current_progress.is_some();
         if !player_crashed && engine.is_alive() {
             if is_loading || is_processing {
                 app_state
-                    .overlay_manager
+                    .ui.overlay_manager
                     .open(app_state::AppOverlay::Loading);
-            } else if app_state.overlay_manager.current_kind()
+            } else if app_state.ui.overlay_manager.current_kind()
                 == Some(app_state::AppOverlay::Loading)
             {
-                app_state.overlay_manager.close();
+                app_state.ui.overlay_manager.close();
             }
         }
-        app_state.overlay_manager.update(dt);
+        app_state.ui.overlay_manager.update(dt);
         app_state.update_parse_toast(dt);
 
         // Aero Flip 3D. Ctrl+Tab cycles forward, Ctrl+Shift+Tab backward.
@@ -731,8 +717,8 @@ fn main() {
         let shift_down = rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT)
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
         let tab_pressed = rl.is_key_pressed(KeyboardKey::KEY_TAB);
-        let overlay_blocks = app_state.overlay_manager.blocks_input()
-            || app_state.overlay_manager.get_fade_t() > 0.0;
+        let overlay_blocks = app_state.ui.overlay_manager.blocks_input()
+            || app_state.ui.overlay_manager.get_fade_t() > 0.0;
 
         if flip_3d.is_interactive() {
             if overlay_blocks || rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
@@ -761,21 +747,21 @@ fn main() {
         }
         flip_3d.update(dt);
 
-        app_state.last_input_event = None;
+        app_state.ui.last_input_event = None;
         let active_window_id;
 
         // Block interaction if an overlay or Flip 3D is active
-        if app_state.overlay_manager.blocks_input() || flip_3d.is_active() {
+        if app_state.ui.overlay_manager.blocks_input() || flip_3d.is_active() {
             active_window_id = None;
             if !flip_3d.is_active() {
                 if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                    app_state.last_input_event =
+                    app_state.ui.last_input_event =
                         Some(window_manager::InputEvent::MouseDown(mouse_point));
                 } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-                    app_state.last_input_event =
+                    app_state.ui.last_input_event =
                         Some(window_manager::InputEvent::MouseUp(mouse_point));
                 } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
-                    app_state.last_input_event =
+                    app_state.ui.last_input_event =
                         Some(window_manager::InputEvent::MouseMove(mouse_point));
                 }
             }
@@ -784,16 +770,16 @@ fn main() {
             if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
                 active_window_id = window_manager.mouse_down(mouse_point, screen_rect);
                 if active_window_id.is_some() {
-                    app_state.last_input_event =
+                    app_state.ui.last_input_event =
                         Some(window_manager::InputEvent::MouseDown(mouse_point));
                 }
             } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
                 active_window_id = window_manager.mouse_up(mouse_point);
-                app_state.last_input_event = Some(window_manager::InputEvent::MouseUp(mouse_point));
+                app_state.ui.last_input_event = Some(window_manager::InputEvent::MouseUp(mouse_point));
             } else {
                 active_window_id = window_manager.mouse_move(mouse_point);
                 if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
-                    app_state.last_input_event =
+                    app_state.ui.last_input_event =
                         Some(window_manager::InputEvent::MouseMove(mouse_point));
                 }
             }
@@ -833,32 +819,32 @@ fn main() {
         // Multiplicative steps give smooth, symmetric zoom in/out. The floor is only
         // there to keep the arithmetic alive (see MIN_NOTE_SPEED), not to bound how
         // far out you can zoom; the ceiling is the real zoom-in limit.
-        if wheel != 0.0 && !app_state.overlay_manager.blocks_input() && !flip_3d.is_active() {
-            app_state.note_speed = (app_state.note_speed * 1.1_f32.powf(wheel))
+        if wheel != 0.0 && !app_state.ui.overlay_manager.blocks_input() && !flip_3d.is_active() {
+            app_state.playback.note_speed = (app_state.playback.note_speed * 1.1_f32.powf(wheel))
                 .clamp(piano_roll::MIN_NOTE_SPEED, piano_roll::MAX_NOTE_SPEED);
         }
 
         // Debug builds: track whether the ViSQOL window owns keyboard focus.
         #[cfg(debug_assertions)]
-        let visqol_is_active = !app_state.overlay_manager.blocks_input()
+        let visqol_is_active = !app_state.ui.overlay_manager.blocks_input()
             && !flip_3d.is_active()
             && window_manager
                 .get_window(visqol_window_handle)
                 .is_some_and(|w| w.visible && w.is_active);
         #[cfg(debug_assertions)]
         if !visqol_is_active {
-            app_state.visqol_bitrate_field.editing = false;
-            app_state.visqol_bitrate_field.select_all = false;
-            app_state.visqol_slider_dragging = false;
+            app_state.ui.visqol_bitrate_field.editing = false;
+            app_state.ui.visqol_bitrate_field.select_all = false;
+            app_state.ui.visqol_slider_dragging = false;
         }
         #[cfg(debug_assertions)]
-        let visqol_blocks_keys = visqol_is_active && app_state.visqol_bitrate_field.editing;
+        let visqol_blocks_keys = visqol_is_active && app_state.ui.visqol_bitrate_field.editing;
         #[cfg(not(debug_assertions))]
         let visqol_blocks_keys = false;
 
         // Handle keyboard shortcuts only when overlay is completely closed
-        if !app_state.overlay_manager.blocks_input()
-            && app_state.overlay_manager.get_fade_t() == 0.0
+        if !app_state.ui.overlay_manager.blocks_input()
+            && app_state.ui.overlay_manager.get_fade_t() == 0.0
             && !flip_3d.is_active()
             && !visqol_blocks_keys
         {
@@ -902,23 +888,23 @@ fn main() {
         }
 
         if rl.is_key_pressed(KeyboardKey::KEY_S) && !flip_3d.is_active() && !visqol_blocks_keys {
-            if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::Settings) {
-                app_state.overlay_manager.close();
-            } else if !app_state.overlay_manager.blocks_input() {
-                let text_editor_focused = app_state.overlay_manager.current_kind()
+            if app_state.ui.overlay_manager.current_kind() == Some(app_state::AppOverlay::Settings) {
+                app_state.ui.overlay_manager.close();
+            } else if !app_state.ui.overlay_manager.blocks_input() {
+                let text_editor_focused = app_state.ui.overlay_manager.current_kind()
                     == Some(app_state::AppOverlay::TextEditor)
-                    && app_state.text_editor.focused;
+                    && app_state.ui.text_editor.focused;
                 if !text_editor_focused {
-                    app_state.settings_scroll_y = 0.0;
-                    app_state.settings_scrollbar_dragging = false;
-                    app_state.s16_warning_opened_at = None;
+                    app_state.ui.settings_scroll_y = 0.0;
+                    app_state.ui.settings_scrollbar_dragging = false;
+                    app_state.ui.s16_warning_opened_at = None;
                     {
-                        app_state.settings_opus_bitrate_slider.editing = false;
-                        app_state.settings_opus_bitrate_slider.dragging = false;
-                        app_state.settings_opus_bitrate_slider.select_all = false;
+                        app_state.ui.settings_opus_bitrate_slider.editing = false;
+                        app_state.ui.settings_opus_bitrate_slider.dragging = false;
+                        app_state.ui.settings_opus_bitrate_slider.select_all = false;
                     }
                     app_state
-                        .overlay_manager
+                        .ui.overlay_manager
                         .open(app_state::AppOverlay::Settings);
                     window_manager.mouse_up(mouse_point);
                 }
@@ -926,24 +912,24 @@ fn main() {
         }
 
         if rl.is_key_pressed(KeyboardKey::KEY_P) && !flip_3d.is_active() && !visqol_blocks_keys {
-            if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
-                if !app_state.text_editor.focused {
-                    app_state.overlay_manager.close();
+            if app_state.ui.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
+                if !app_state.ui.text_editor.focused {
+                    app_state.ui.overlay_manager.close();
                 }
-            } else if !app_state.overlay_manager.blocks_input() {
+            } else if !app_state.ui.overlay_manager.blocks_input() {
                 app_state
-                    .overlay_manager
+                    .ui.overlay_manager
                     .open(app_state::AppOverlay::TextEditor);
-                app_state.text_editor.reset_interaction();
+                app_state.ui.text_editor.reset_interaction();
                 window_manager.mouse_up(mouse_point);
             }
         }
 
-        if app_state.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
+        if app_state.ui.overlay_manager.current_kind() == Some(app_state::AppOverlay::TextEditor) {
             // First Escape drops the editor's focus, the next one closes the overlay.
-            let focus_dropped = app_state.text_editor.update(&mut rl, dt);
+            let focus_dropped = app_state.ui.text_editor.update(&mut rl, dt);
             if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) && !focus_dropped {
-                app_state.overlay_manager.close();
+                app_state.ui.overlay_manager.close();
             }
         }
 
@@ -952,7 +938,7 @@ fn main() {
         let screen_height = rl.get_screen_height();
 
         // Cursor handling: only use window_manager cursors when overlay is NOT shown or fading
-        if app_state.overlay_manager.blocks_input() || flip_3d.is_active() {
+        if app_state.ui.overlay_manager.blocks_input() || flip_3d.is_active() {
             rl.set_mouse_cursor(MouseCursor::MOUSE_CURSOR_DEFAULT);
         } else {
             let cursor = window_manager.get_cursor_type(mouse_point);
@@ -1037,7 +1023,7 @@ fn main() {
         // so its content fills the whole application window while the
         // other windows float above it. Docked player controls are
         // frameless too, so the dock strip is content only.
-        let roll_frameless = app_state.piano_roll_fullscreen;
+        let roll_frameless = app_state.settings.piano_roll_fullscreen;
         let controls_frameless = controls_docked;
         let eff_bt = |wid: i32| -> i32 {
             if (roll_frameless && wid == piano_roll_window_handle)
@@ -1070,8 +1056,8 @@ fn main() {
                 // Piano Keyboard window (and Piano Roll when keyboard is integrated)
                 // reserve extra vertical padding for bending.
                 let needs_bend = wid == piano_keyboard_window_handle
-                    || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
-                let needs_bend = needs_bend && app_state.pitch_bend_window_enabled;
+                    || (wid == piano_roll_window_handle && app_state.settings.integrate_keyboard);
+                let needs_bend = needs_bend && app_state.settings.pitch_bend_window_enabled;
                 let padding = if needs_bend {
                     compute_kb_bend_padding(base_w as f32, pitch_bend_range) as i32
                 } else {
@@ -1238,7 +1224,7 @@ fn main() {
                     match wid {
                         id if id == piano_roll_window_handle => {
                             // Reserve the bottom strip for the integrated keyboard.
-                            let keyboard_h = if app_state.integrate_keyboard {
+                            let keyboard_h = if app_state.settings.integrate_keyboard {
                                 compute_integrated_keyboard_height(cw, ch)
                             } else {
                                 0.0
@@ -1261,8 +1247,8 @@ fn main() {
                                     let top_tick = piano_roll::future_tick(
                                         parser_data,
                                         playback_position_ns,
-                                        app_state.is_tick_based,
-                                        app_state.note_speed,
+                                        app_state.playback.is_tick_based,
+                                        app_state.playback.note_speed,
                                         roll_h,
                                     )
                                     .min(parser_data.max_tick);
@@ -1302,23 +1288,23 @@ fn main() {
                                         parser_data,
                                         playback_position_ns,
                                         roll_area,
-                                        app_state.is_tick_based,
-                                        app_state.note_speed
+                                        app_state.playback.is_tick_based,
+                                        app_state.playback.note_speed
                                             * beat_bounce_multiplier(
                                                 parser_data,
                                                 playback_position_ns,
                                                 st == PlayerState::Playing,
-                                                app_state.beat_bounce_amount,
-                                                app_state.beat_bounce_note_value,
-                                                app_state.beat_bounce_offbeat,
-                                                app_state.beat_bounce_animation,
+                                                app_state.settings.beat_bounce_amount,
+                                                app_state.settings.beat_bounce_note_value,
+                                                app_state.settings.beat_bounce_offbeat,
+                                                app_state.ui.beat_bounce_animation,
                                             ),
                                     );
                                 }
                             }
 
                             // Draw integrated keyboard if enabled
-                            if app_state.integrate_keyboard {
+                            if app_state.settings.integrate_keyboard {
                                 let keyboard_rect =
                                     Rectangle::new(cx, cy + ch - keyboard_h, cw, keyboard_h);
                                 app_state.draw_keyboard(
@@ -1342,12 +1328,12 @@ fn main() {
                                 && local_mouse.y >= cy
                                 && local_mouse.y < cy + ch;
 
-                            let is_input_blocked = app_state.overlay_manager.blocks_input();
+                            let is_input_blocked = app_state.ui.overlay_manager.blocks_input();
                             let current_event = if active_window_id == Some(controls_window_handle)
                                 && is_inside_content
                                 && !is_input_blocked
                             {
-                                app_state.last_input_event.map(|e| match e {
+                                app_state.ui.last_input_event.map(|e| match e {
                                     window_manager::InputEvent::MouseDown(p) => {
                                         window_manager::InputEvent::MouseDown(
                                             window_manager::Point {
@@ -1418,7 +1404,7 @@ fn main() {
                                 // Buffered audio is wall-clock time; scale to song time.
                                 engine.audio_buffer_ns().map(|buffered| {
                                     playback_position_ns.saturating_add(
-                                        (buffered as f64 * app_state.playback_speed as f64) as u64,
+                                        (buffered as f64 * app_state.playback.playback_speed as f64) as u64,
                                     )
                                 }),
                             ) {
@@ -1428,7 +1414,7 @@ fn main() {
                                 app_state.start_seeking(seek_ns, &engine);
                             }
 
-                            let prev_speed = app_state.playback_speed;
+                            let prev_speed = app_state.playback.playback_speed;
                             ui::draw_media_controls(
                                 &mut d_scissor,
                                 &tx_commands_to_player,
@@ -1442,16 +1428,16 @@ fn main() {
                                 current_event,
                                 ui_mouse_pos,
                                 is_mouse_down,
-                                &mut app_state.playback_speed,
-                                &mut app_state.speed_slider_dragging,
+                                &mut app_state.playback.playback_speed,
+                                &mut app_state.ui.speed_slider_dragging,
                                 cx + cw - 10.0,
                             );
-                            if app_state.playback_speed != prev_speed {
-                                engine.set_speed(app_state.playback_speed);
+                            if app_state.playback.playback_speed != prev_speed {
+                                engine.set_speed(app_state.playback.playback_speed);
                             }
 
                             // Drag handling does not draw, so it can stay inside the scissor block.
-                            if app_state.is_dragging_seek && !app_state.overlay_manager.is_active()
+                            if app_state.playback.is_dragging_seek && !app_state.ui.overlay_manager.is_active()
                             {
                                 if d_scissor.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
                                     let seek_x = cx + 10.0;
@@ -1471,7 +1457,7 @@ fn main() {
                             }
                         }
                         id if id == piano_keyboard_window_handle
-                            && !app_state.integrate_keyboard =>
+                            && !app_state.settings.integrate_keyboard =>
                         {
                             app_state.draw_keyboard(
                                 &mut d_scissor,
@@ -1505,21 +1491,21 @@ fn main() {
                                 && local_mouse.y < cy + ch;
 
                             let is_input_blocked =
-                                app_state.overlay_manager.blocks_input() || flip_3d.is_active();
+                                app_state.ui.overlay_manager.blocks_input() || flip_3d.is_active();
                             let allow_input = active_window_id == Some(visqol_window_handle)
                                 && is_inside_content
                                 && !is_input_blocked;
 
                             if !is_mouse_down || is_input_blocked || !window.is_active {
-                                app_state.visqol_slider_dragging = false;
+                                app_state.ui.visqol_slider_dragging = false;
                             }
 
                             // Keep forwarding local mouse coordinates while dragging the vertical
                             // slider so dragging past the window edge clamps cleanly to 6..=510
                             // instead of freezing mid-drag.
-                            let forward_mouse = allow_input || app_state.visqol_slider_dragging;
+                            let forward_mouse = allow_input || app_state.ui.visqol_slider_dragging;
                             let current_event = if forward_mouse {
-                                app_state.last_input_event.map(|e| match e {
+                                app_state.ui.last_input_event.map(|e| match e {
                                     window_manager::InputEvent::MouseDown(p) => {
                                         window_manager::InputEvent::MouseDown(
                                             window_manager::Point {
@@ -1584,7 +1570,7 @@ fn main() {
 
                             let is_pcm = matches!(engine.buffer_memory(), Some((_, _, false)));
 
-                            let prev_opus_bitrate_kbps = app_state.opus_bitrate_kbps;
+                            let prev_opus_bitrate_kbps = app_state.settings.opus_bitrate_kbps;
                             let series = engine.visqol_series();
                             ui::draw_visqol_window(
                                 &mut d_scissor,
@@ -1594,16 +1580,16 @@ fn main() {
                                 ch,
                                 &series,
                                 is_pcm,
-                                &mut app_state.opus_bitrate_kbps,
+                                &mut app_state.settings.opus_bitrate_kbps,
                                 current_event,
                                 ui_mouse_pos,
                                 is_mouse_down && !is_input_blocked,
-                                &mut app_state.visqol_slider_dragging,
-                                &mut app_state.visqol_bitrate_field,
+                                &mut app_state.ui.visqol_slider_dragging,
+                                &mut app_state.ui.visqol_bitrate_field,
                                 &field_input,
                             );
-                            if app_state.opus_bitrate_kbps != prev_opus_bitrate_kbps {
-                                engine.set_opus_bitrate(app_state.opus_bitrate_kbps);
+                            if app_state.settings.opus_bitrate_kbps != prev_opus_bitrate_kbps {
+                                engine.set_opus_bitrate(app_state.settings.opus_bitrate_kbps);
                             }
                         }
                         _ => {}
@@ -1640,8 +1626,8 @@ fn main() {
                     let screen_y = (window.rectangle.top() - bt) as f32;
 
                     let needs_bend = wid == piano_keyboard_window_handle
-                        || (wid == piano_roll_window_handle && app_state.integrate_keyboard);
-                    let needs_bend = needs_bend && app_state.pitch_bend_window_enabled;
+                        || (wid == piano_roll_window_handle && app_state.settings.integrate_keyboard);
+                    let needs_bend = needs_bend && app_state.settings.pitch_bend_window_enabled;
                     if needs_bend {
                         let win_w = (window.rectangle.width + 2 * bt) as f32;
                         let win_h = (window.rectangle.height + 2 * bt) as f32;
@@ -1712,93 +1698,7 @@ fn main() {
                 );
 
                 // Statistics overlay, pinned to the top-right corner (toggled in Settings).
-                // Drawn as a translucent panel; fades with its animation.
-                let stats_alpha = app_state.show_stats_animation.clamp(0.0, 1.0);
-                if stats_alpha > 0.01 {
-                    let tempo_us = app_state.tempo_us_value.max(1);
-                    let bpm = 60_000_000.0 / tempo_us as f64;
-                    let total = app_state
-                        .midi_data
-                        .as_ref()
-                        .map(|data| data.total_note_on_events())
-                        .unwrap_or(0);
-                    let mut lines = vec![
-                        format!(
-                            "NPS   {}",
-                            group_thousands(app_state.nps_value.round() as u64)
-                        ),
-                        format!(
-                            "NOTES {} / {}",
-                            group_thousands(engine.notes_played()),
-                            group_thousands(total)
-                        ),
-                        format!("BPM   {:.2} ({})", bpm, group_thousands(tempo_us as u64)),
-                    ];
-                    // Polyphony and render load; engines that do not
-                    // report them show N/A.
-                    lines.push(format!(
-                        "POLY  {}",
-                        engine
-                            .polyphony()
-                            .map(|voices| group_thousands(voices as u64))
-                            .unwrap_or_else(|| "N/A".to_string())
-                    ));
-                    lines.push(format!(
-                        "LOAD  {}",
-                        engine
-                            .render_load()
-                            .map(|load| format!("{:.1}%", load * 100.0))
-                            .unwrap_or_else(|| "N/A".to_string())
-                    ));
-                    if let Some(vel) = engine.skipping_velocity() {
-                        lines.push(format!("Skipping Vel: {vel}"));
-                    }
-                    if let Some(buffered_ns) = engine.audio_buffer_ns() {
-                        // m:ss.xx, rounded to centiseconds.
-                        let mss = |ns: u64| {
-                            let cs = (ns + 5_000_000) / 10_000_000;
-                            format!("{}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
-                        };
-                        let max_ns = app_state.audio_buffer_secs as u64 * 1_000_000_000;
-                        lines.push(format!("AUDIO BUF {} / {}", mss(buffered_ns), mss(max_ns)));
-                    }
-                    if let Some((used, _, compressed)) = engine.buffer_memory() {
-                        if compressed {
-                            lines.push(format!("AUDIO BUF {}", utils::format_bytes(used)));
-                        } else {
-                            lines.push(format!("AUDIO BUF {} (PCM)", utils::format_bytes(used)));
-                        }
-                    }
-                    let font_size = 18;
-                    let pad = 8;
-                    let line_h = 22;
-                    let panel_w = 330;
-                    let panel_h = pad * 2 + line_h * lines.len() as i32;
-                    let px = screen_width - panel_w - 10;
-                    let py = 10 + top_offset;
-                    let bg_a = (180.0 * stats_alpha) as u8;
-                    let border_a = (200.0 * stats_alpha) as u8;
-                    let text_a = (255.0 * stats_alpha) as u8;
-                    d_rt.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 24, bg_a));
-                    // draw_rectangle_lines is GL-line based and rasterizes off-by-one from the
-                    // filled rect, leaving a 1px sliver of fill outside the border. draw_rectangle_lines_ex
-                    // draws the border as filled rects inside the rectangle bounds, so it lands
-                    // exactly on the fill's edge columns/rows.
-                    d_rt.draw_rectangle_lines_ex(
-                        Rectangle::new(px as f32, py as f32, panel_w as f32, panel_h as f32),
-                        1.0,
-                        Color::new(0, 135, 200, border_a),
-                    );
-                    for (i, line) in lines.iter().enumerate() {
-                        d_rt.draw_text(
-                            line,
-                            px + pad,
-                            py + pad + i as i32 * line_h,
-                            font_size,
-                            Color::new(210, 225, 255, text_a),
-                        );
-                    }
-                }
+                ui::draw_stats_overlay(&mut d_rt, &app_state, &engine, screen_width, top_offset);
             }
             {
                 let mut d_rt = d.begin_texture_mode(&thread, &mut render_texture);
@@ -1816,18 +1716,18 @@ fn main() {
             }
         }
         // Phase 4: Blur request for overlays
-        if app_state.overlay_manager.blocks_input() {
-            let eased_t = 1.0 - (1.0 - app_state.overlay_manager.get_fade_t()).powi(2);
+        if app_state.ui.overlay_manager.blocks_input() {
+            let eased_t = 1.0 - (1.0 - app_state.ui.overlay_manager.get_fade_t()).powi(2);
             let blur_strength = (eased_t * 8.0) as u16;
             if blur_strength > 0 {
-                app_state.blur_requester.apply_blur(
+                app_state.ui.blur_requester.apply_blur(
                     Rectangle::new(0.0, 0.0, screen_width as f32, screen_height as f32),
                     Some(blur_strength),
                 );
             }
         }
 
-        let blur_requests = app_state.blur_requester.consume_all();
+        let blur_requests = app_state.ui.blur_requester.consume_all();
         if !blur_requests.is_empty() {
             let screen_w = render_texture.texture.width as f32;
             let screen_h = render_texture.texture.height as f32;
@@ -1903,165 +1803,103 @@ fn main() {
             screen_height,
         );
 
+        // Snapshot the settings before the overlay can edit them; any
+        // changes are forwarded to the player after the draw below.
+        let prev_settings = (app_state.ui.overlay_manager.current_kind()
+            == Some(app_state::AppOverlay::Settings))
+        .then(|| settings_sync::PrevSettings::snapshot(&app_state));
         let mut close_requested = false;
         app_state
-            .overlay_manager
+            .ui.overlay_manager
             .draw(
                 &mut d,
                 screen_width,
                 screen_height,
                 |d, fade_t, kind| match kind {
                     app_state::AppOverlay::Settings => {
-                        let prev_pb_override = app_state.pitch_bend_override_enabled;
-                        let prev_vsync = app_state.vsync_enabled;
-                        let prev_pb_multiplier = app_state.pitch_bend_multiplier;
-                        let prev_unlimited_output = app_state.unlimited_output_enabled;
-                        let prev_s16_clipping = app_state.s16_clipping_enabled;
-                        let prev_midi_ev_buffer_size = app_state.midi_ev_buffer_size;
-                        let prev_midi_ev_mode = app_state.midi_ev_mode;
-                        let prev_parse_threads = app_state.parse_threads;
-                        let prev_audio_engine = app_state.audio_engine;
-                        let prev_audio_buffer_secs = app_state.audio_buffer_secs;
-                        let prev_engine_settings = app_state.engine_settings.clone();
-                        let prev_opus_bitrate_kbps = app_state.opus_bitrate_kbps;
                         if ui::draw_settings_overlay(
                             d,
                             screen_width,
                             screen_height,
                             fade_t,
-                            app_state.last_input_event,
+                            app_state.ui.last_input_event,
                             mouse_pos,
                             is_mouse_down,
-                            &mut app_state.is_tick_based,
-                            app_state.tick_based_animation,
-                            &mut app_state.beat_bounce_enabled,
-                            app_state.beat_bounce_animation,
-                            &mut app_state.beat_bounce_amount,
-                            &mut app_state.settings_beat_bounce_amount_slider,
-                            &mut app_state.beat_bounce_note_value,
-                            &mut app_state.settings_beat_bounce_note_value_slider,
-                            &mut app_state.beat_bounce_offbeat,
-                            app_state.beat_bounce_offbeat_animation,
-                            &mut app_state.shake_enabled,
-                            app_state.shake_animation,
-                            &mut app_state.integrate_keyboard,
-                            app_state.keyboard_animation,
-                            &mut app_state.piano_roll_fullscreen,
-                            app_state.piano_roll_fullscreen_animation,
-                            &mut app_state.dock_controls_top,
-                            app_state.dock_controls_top_animation,
-                            &mut app_state.settings_scroll_y,
+                            &mut app_state.playback.is_tick_based,
+                            app_state.ui.tick_based_animation,
+                            &mut app_state.settings.beat_bounce_enabled,
+                            app_state.ui.beat_bounce_animation,
+                            &mut app_state.settings.beat_bounce_amount,
+                            &mut app_state.ui.settings_beat_bounce_amount_slider,
+                            &mut app_state.settings.beat_bounce_note_value,
+                            &mut app_state.ui.settings_beat_bounce_note_value_slider,
+                            &mut app_state.settings.beat_bounce_offbeat,
+                            app_state.ui.beat_bounce_offbeat_animation,
+                            &mut app_state.settings.shake_enabled,
+                            app_state.ui.shake_animation,
+                            &mut app_state.settings.integrate_keyboard,
+                            app_state.ui.keyboard_animation,
+                            &mut app_state.settings.piano_roll_fullscreen,
+                            app_state.ui.piano_roll_fullscreen_animation,
+                            &mut app_state.settings.dock_controls_top,
+                            app_state.ui.dock_controls_top_animation,
+                            &mut app_state.ui.settings_scroll_y,
                             wheel,
-                            &mut app_state.autoplay_on_load,
-                            app_state.autoplay_animation,
-                            &mut app_state.pitch_bend_window_enabled,
-                            app_state.pitch_bend_window_animation,
-                            &mut app_state.pitch_bend_move_window_enabled,
-                            app_state.pitch_bend_move_window_animation,
-                            &mut app_state.pitch_bend_spring_parameters,
-                            &mut app_state.pitch_bend_spring_sliders,
-                            &mut app_state.pitch_bend_override_enabled,
-                            app_state.pitch_bend_override_animation,
-                            &mut app_state.pitch_bend_multiplier,
-                            &mut app_state.unlimited_output_enabled,
-                            app_state.unlimited_output_animation,
-                            &mut app_state.s16_clipping_enabled,
-                            app_state.s16_clipping_animation,
-                            &mut app_state.s16_warning_opened_at,
-                            &mut app_state.midi_ev_buffer_size,
-                            &mut app_state.settings_scrollbar_dragging,
-                            &mut app_state.settings_scrollbar_drag_start_y,
-                            &mut app_state.settings_scrollbar_drag_start_scroll,
-                            &mut app_state.settings_pb_multiplier_slider,
-                            &mut app_state.settings_midi_ev_buffer_size_slider,
-                            &mut app_state.audio_engine,
-                            &mut app_state.settings_audio_engine_combo,
-                            &mut app_state.audio_buffer_secs,
-                            &mut app_state.settings_audio_buffer_slider,
+                            &mut app_state.settings.autoplay_on_load,
+                            app_state.ui.autoplay_animation,
+                            &mut app_state.settings.pitch_bend_window_enabled,
+                            app_state.ui.pitch_bend_window_animation,
+                            &mut app_state.settings.pitch_bend_move_window_enabled,
+                            app_state.ui.pitch_bend_move_window_animation,
+                            &mut app_state.settings.pitch_bend_spring_parameters,
+                            &mut app_state.ui.pitch_bend_spring_sliders,
+                            &mut app_state.settings.pitch_bend_override_enabled,
+                            app_state.ui.pitch_bend_override_animation,
+                            &mut app_state.settings.pitch_bend_multiplier,
+                            &mut app_state.settings.unlimited_output_enabled,
+                            app_state.ui.unlimited_output_animation,
+                            &mut app_state.settings.s16_clipping_enabled,
+                            app_state.ui.s16_clipping_animation,
+                            &mut app_state.ui.s16_warning_opened_at,
+                            &mut app_state.settings.midi_ev_buffer_size,
+                            &mut app_state.ui.settings_scrollbar_dragging,
+                            &mut app_state.ui.settings_scrollbar_drag_start_y,
+                            &mut app_state.ui.settings_scrollbar_drag_start_scroll,
+                            &mut app_state.ui.settings_pb_multiplier_slider,
+                            &mut app_state.ui.settings_midi_ev_buffer_size_slider,
+                            &mut app_state.settings.audio_engine,
+                            &mut app_state.ui.settings_audio_engine_combo,
+                            &mut app_state.settings.audio_buffer_secs,
+                            &mut app_state.ui.settings_audio_buffer_slider,
                             engine.buffer_memory(),
-                            &mut app_state.opus_bitrate_kbps,
-                            &mut app_state.settings_opus_bitrate_slider,
+                            &mut app_state.settings.opus_bitrate_kbps,
+                            &mut app_state.ui.settings_opus_bitrate_slider,
                             #[cfg(debug_assertions)]
-                            &mut app_state.visqol_window_enabled,
+                            &mut app_state.settings.visqol_window_enabled,
                             #[cfg(debug_assertions)]
-                            app_state.visqol_window_animation,
-                            &mut app_state.midi_ev_mode,
-                            &mut app_state.settings_midi_ev_mode_combo,
-                            &mut app_state.parse_threads,
-                            &mut app_state.settings_parse_threads_slider,
-                            &mut app_state.show_stats,
-                            app_state.show_stats_animation,
-                            &mut app_state.vsync_enabled,
-                            app_state.vsync_animation,
-                            &mut app_state.engine_settings,
-                            &mut app_state.engine_setting_sliders,
+                            app_state.ui.visqol_window_animation,
+                            &mut app_state.settings.midi_ev_mode,
+                            &mut app_state.ui.settings_midi_ev_mode_combo,
+                            &mut app_state.settings.parse_threads,
+                            &mut app_state.ui.settings_parse_threads_slider,
+                            &mut app_state.settings.show_stats,
+                            app_state.ui.show_stats_animation,
+                            &mut app_state.settings.vsync_enabled,
+                            app_state.ui.vsync_animation,
+                            &mut app_state.settings.engine_settings,
+                            &mut app_state.ui.engine_setting_sliders,
                         ) {
                             close_requested = true;
-                        }
-                        if app_state.vsync_enabled != prev_vsync {
-                            // raylib switches GLFW's swap interval at runtime
-                            // through the window state flag.
-                            const FLAG_VSYNC_HINT: u32 = 0x0000_0040;
-                            unsafe {
-                                if app_state.vsync_enabled {
-                                    raylib::ffi::SetWindowState(FLAG_VSYNC_HINT);
-                                } else {
-                                    raylib::ffi::ClearWindowState(FLAG_VSYNC_HINT);
-                                }
-                            }
-                        }
-                        if app_state.pitch_bend_override_enabled != prev_pb_override {
-                            engine.set_pitch_bend_override(app_state.pitch_bend_override_enabled);
-                        }
-                        if app_state.pitch_bend_multiplier != prev_pb_multiplier {
-                            engine.set_pitch_bend_multiplier(app_state.pitch_bend_multiplier);
-                        }
-                        if app_state.unlimited_output_enabled != prev_unlimited_output {
-                            engine.set_unlimited_output(app_state.unlimited_output_enabled);
-                        }
-                        if app_state.s16_clipping_enabled != prev_s16_clipping {
-                            engine.set_s16_clipping(app_state.s16_clipping_enabled);
-                        }
-                        if app_state.midi_ev_buffer_size != prev_midi_ev_buffer_size {
-                            engine.set_midi_ev_buffer_size(app_state.midi_ev_buffer_size);
-                        }
-                        if app_state.midi_ev_mode != prev_midi_ev_mode {
-                            engine.set_legacy_midi_output(app_state.midi_ev_mode == 0);
-                            engine.set_midi_ev_catch_up(app_state.midi_ev_mode == 2);
-                        }
-                        if app_state.audio_buffer_secs != prev_audio_buffer_secs {
-                            engine.set_audio_buffer_secs(app_state.audio_buffer_secs);
-                        }
-                        for (key, value) in &app_state.engine_settings {
-                            if prev_engine_settings.get(key) != Some(value) {
-                                engine.set_engine_setting(key, *value);
-                            }
-                        }
-                        if app_state.opus_bitrate_kbps != prev_opus_bitrate_kbps {
-                            engine.set_opus_bitrate(app_state.opus_bitrate_kbps);
-                        }
-                        if app_state.parse_threads != prev_parse_threads {
-                            engine.set_parse_threads(app_state.parse_threads);
-                        }
-                        if app_state.audio_engine != prev_audio_engine {
-                            let selected =
-                                audio_engine::EngineSelection::from_index(app_state.audio_engine);
-                            // Replacing a pending load drops it; the current output keeps
-                            // playing until the new one is ready.
-                            pending_audio_engine = Some((selected, selected.start()));
-                            app_state.audio_banner =
-                                Some((format!("Loading {}...", selected.label()), false));
-                            app_state.audio_banner_timer = 0.0;
                         }
 
                         window_manager.set_window_visible(
                             piano_keyboard_window_handle,
-                            !app_state.integrate_keyboard,
+                            !app_state.settings.integrate_keyboard,
                         );
                         #[cfg(debug_assertions)]
                         window_manager.set_window_visible(
                             visqol_window_handle,
-                            app_state.visqol_window_enabled,
+                            app_state.settings.visqol_window_enabled,
                         );
                     }
                     app_state::AppOverlay::PlayerCrashed => {
@@ -2070,15 +1908,15 @@ fn main() {
                     app_state::AppOverlay::Loading => {
                         // Once the parse is done the toast owns the panel and carries it to
                         // the corner; only the dimming backdrop is left to fade out here.
-                        if app_state.parse_toast.is_none() {
+                        if app_state.playback.parse_toast.is_none() {
                             ui::draw_loading_overlay(
                                 d,
                                 screen_width,
                                 screen_height,
                                 fade_t,
-                                &app_state.current_progress,
-                                app_state.parse_bps,
-                                app_state.parse_eps,
+                                &app_state.playback.current_progress,
+                                app_state.playback.parse_bps,
+                                app_state.playback.parse_eps,
                             );
                         }
                     }
@@ -2088,11 +1926,11 @@ fn main() {
                             screen_width,
                             screen_height,
                             fade_t,
-                            app_state.last_input_event,
+                            app_state.ui.last_input_event,
                             mouse_pos,
                             is_mouse_down,
                             wheel,
-                            &mut app_state.text_editor,
+                            &mut app_state.ui.text_editor,
                         );
                         if close {
                             close_requested = true;
@@ -2100,16 +1938,24 @@ fn main() {
                         if apply {
                             println!(
                                 "[TextEditor] Apply clicked. Content:\n{}",
-                                app_state.text_editor.text()
+                                app_state.ui.text_editor.text()
                             );
                         }
                     }
                 },
             );
+        if let Some(prev_settings) = &prev_settings {
+            settings_sync::apply_settings_changes(
+                &mut app_state,
+                prev_settings,
+                &engine,
+                &mut pending_audio_engine,
+            );
+        }
 
         // Drawn outside the overlay manager: it outlives the overlay's fade-out and must
         // not be dimmed by the backdrop.
-        if let Some(toast) = &app_state.parse_toast {
+        if let Some(toast) = &app_state.playback.parse_toast {
             ui::draw_parse_toast(
                 &mut d,
                 screen_width,
@@ -2123,13 +1969,13 @@ fn main() {
             );
         }
 
-        if let Some((message, is_error)) = &app_state.audio_banner {
-            app_state.audio_banner_timer += dt;
+        if let Some((message, is_error)) = &app_state.ui.audio_banner {
+            app_state.ui.audio_banner_timer += dt;
             ui::draw_audio_banner(
                 &mut d,
                 screen_width,
                 screen_height,
-                app_state.audio_banner_timer,
+                app_state.ui.audio_banner_timer,
                 message,
                 *is_error,
             );
@@ -2139,7 +1985,7 @@ fn main() {
         ui::draw_pending_tooltip(&mut d, screen_width, screen_height);
 
         if close_requested {
-            app_state.overlay_manager.close();
+            app_state.ui.overlay_manager.close();
         }
     }
 
