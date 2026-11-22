@@ -309,6 +309,10 @@ struct CachedNote {
     /// recording, so a voice's current amplitude is one lookup here times its
     /// own gains -- which is what makes the amplitude-based voice limit cheap.
     loud: Vec<f32>,
+    /// Suffix maximum of `loud`: the loudest the strike still gets from a
+    /// block onward. Once that, times a voice's own gains, is inaudible, the
+    /// voice can never be heard again and is dropped without rendering.
+    loud_suffix: Vec<f32>,
 }
 
 /// All 128 keys at one sample rate.
@@ -379,14 +383,21 @@ fn render_note(note: usize, rate: u32) -> CachedNote {
         .max(f32::EPSILON);
     let to_i16 = i16::MAX as f32 / peak;
     let samples: Vec<i16> = out.iter().map(|s| (s * to_i16).round() as i16).collect();
-    let loud = samples
+    let loud: Vec<f32> = samples
         .chunks(LOUD_BLOCK)
         .map(|block| block.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0) as f32)
         .collect();
+    let mut loud_suffix = vec![0.0f32; loud.len()];
+    let mut rest = 0.0f32;
+    for (i, &level) in loud.iter().enumerate().rev() {
+        rest = rest.max(level);
+        loud_suffix[i] = rest;
+    }
     CachedNote {
         samples,
         scale: peak / i16::MAX as f32,
         loud,
+        loud_suffix,
     }
 }
 
@@ -396,7 +407,7 @@ struct Voice {
     channel: u8,
     note: u8,
     /// Read position in the cached note, in frames.
-    pos: f64,
+    pos: f32,
     /// Velocity loudness, times the note's i16 scale.
     gain: f32,
     /// Velocity brightness: one-pole low-pass coefficient (1 = bypass).
@@ -419,6 +430,30 @@ struct Voice {
     release_at: Option<usize>,
     /// Frame it is cut off (player reset).
     kill_at: Option<usize>,
+}
+
+/// Add `s[index..index + (to - from)]`, scaled by the constant gains
+/// `gl`/`gr`, into `left`/`right` at `from..to`; returns the advanced
+/// index. A plain multiply-accumulate over slices, in the shape the
+/// compiler vectorizes.
+fn mix_flat(
+    left: &mut [f32],
+    right: &mut [f32],
+    s: &[i16],
+    index: usize,
+    from: usize,
+    to: usize,
+    gl: f32,
+    gr: f32,
+) -> usize {
+    let n = to - from;
+    let src = &s[index..index + n];
+    for ((l, r), &v) in left[from..to].iter_mut().zip(&mut right[from..to]).zip(src) {
+        let x = v as f32;
+        *l += x * gl;
+        *r += x * gr;
+    }
+    index + n
 }
 
 impl Voice {
@@ -465,38 +500,119 @@ impl Voice {
         let mut ended = false;
         // A voice cut by the voice limit fades on top of whatever else it does.
         let fade = if self.fading { spec.kill_fade } else { 1.0 };
+        // Peak output this voice can still produce at its own gains: the
+        // strike's remaining loudness times velocity gain, damper envelope
+        // and stereo spread. Channel gains are left out of the death test
+        // (they can change later, and a dropped voice never comes back) but
+        // included in the per-chunk skip test, which every render redoes.
+        let own_peak = self.gain * env * spec.left.max(spec.right) * 1.4142;
+        let block = pos as usize / LOUD_BLOCK;
+        if cached.loud_suffix.get(block).copied().unwrap_or(0.0) * own_peak <= SILENT {
+            // The strike has decayed past audibility for this voice: drop
+            // it without rendering; it will never be heard again.
+            self.dead = true;
+            self.start = 0;
+            self.release_at = None;
+            self.kill_at = None;
+            return;
+        }
         if bends.len() == 1 && bends[0].1 == 1.0 && pos.fract() == 0.0 {
             let mut index = pos as usize;
             let available = s.len().saturating_sub(index.saturating_add(1));
             let frames = (end - start).min(available);
             let sample_end = start + frames;
             let damp_start = damp_from.clamp(start, sample_end);
-            if self.fading {
-                for i in start..damp_start {
-                    y += lp * (s[index] as f32 - y);
-                    left[i] += y * gl * env;
-                    right[i] += y * gr * env;
-                    env *= fade;
-                    index += 1;
+            // Skip the span when even its loudest block is inaudible at
+            // this render's full gains: advance the position and the
+            // envelopes and write nothing.
+            let last_block =
+                ((index + frames) / LOUD_BLOCK).min(cached.loud.len().saturating_sub(1));
+            let span_peak = cached
+                .loud
+                .get(block..=last_block)
+                .map(|b| b.iter().fold(0.0f32, |m, &v| m.max(v)))
+                .unwrap_or(0.0);
+            if frames > 0 && span_peak * own_peak * channel_gain <= SILENT {
+                env *= fade.powi((damp_start - start) as i32)
+                    * (spec.damper * fade).powi((sample_end - damp_start) as i32);
+                y *= (1.0 - lp).powi(frames as i32);
+                index += frames;
+            } else if lp == 1.0 {
+                // Full-velocity strike: the low-pass state is the sample
+                // itself, so a span whose envelope is constant is a plain
+                // multiply-accumulate (see mix_flat).
+                if fade == 1.0 {
+                    index = mix_flat(
+                        left,
+                        right,
+                        s,
+                        index,
+                        start,
+                        damp_start,
+                        gl * env,
+                        gr * env,
+                    );
+                } else {
+                    for i in start..damp_start {
+                        let x = s[index] as f32;
+                        left[i] += x * gl * env;
+                        right[i] += x * gr * env;
+                        env *= fade;
+                        index += 1;
+                    }
+                }
+                let damp = spec.damper * fade;
+                if damp == 1.0 {
+                    index = mix_flat(
+                        left,
+                        right,
+                        s,
+                        index,
+                        damp_start,
+                        sample_end,
+                        gl * env,
+                        gr * env,
+                    );
+                } else {
+                    for i in damp_start..sample_end {
+                        let x = s[index] as f32;
+                        left[i] += x * gl * env;
+                        right[i] += x * gr * env;
+                        env *= damp;
+                        index += 1;
+                    }
+                }
+                if frames > 0 {
+                    y = s[index - 1] as f32;
                 }
             } else {
-                for i in start..damp_start {
+                if self.fading {
+                    for i in start..damp_start {
+                        y += lp * (s[index] as f32 - y);
+                        left[i] += y * gl * env;
+                        right[i] += y * gr * env;
+                        env *= fade;
+                        index += 1;
+                    }
+                } else {
+                    for i in start..damp_start {
+                        y += lp * (s[index] as f32 - y);
+                        left[i] += y * gl * env;
+                        right[i] += y * gr * env;
+                        index += 1;
+                    }
+                }
+                let damp = spec.damper * fade;
+                for i in damp_start..sample_end {
                     y += lp * (s[index] as f32 - y);
                     left[i] += y * gl * env;
                     right[i] += y * gr * env;
+                    env *= damp;
                     index += 1;
                 }
             }
-            let damp = spec.damper * fade;
-            for i in damp_start..sample_end {
-                y += lp * (s[index] as f32 - y);
-                left[i] += y * gl * env;
-                right[i] += y * gr * env;
-                env *= damp;
-                index += 1;
-            }
             ended = sample_end < end;
-            pos = index as f64;
+            pos = index as f32;
         } else {
             'segments: for (si, &(from, ratio)) in bends.iter().enumerate() {
                 let to = bends.get(si + 1).map_or(len, |b| b.0);
@@ -506,20 +622,58 @@ impl Voice {
                 }
                 let mid = damp_from.clamp(lo, hi);
                 for (range, damp) in [(lo..mid, fade), (mid..hi, spec.damper * fade)] {
+                    let n = range.end - range.start;
+                    if n == 0 {
+                        continue;
+                    }
+                    // Skip a span whose loudest covered block is inaudible
+                    // at this render's gains, as in the unbent path. The
+                    // block under the read position is checked first: if it
+                    // alone is audible, the span cannot be skipped and the
+                    // full span maximum is never computed.
+                    let first = pos as usize / LOUD_BLOCK;
+                    if cached.loud.get(first).copied().unwrap_or(0.0) * own_peak * channel_gain
+                        <= SILENT
+                    {
+                        let last = ((pos + ratio * n as f32) as usize / LOUD_BLOCK)
+                            .min(cached.loud.len().saturating_sub(1));
+                        let span_peak = cached
+                            .loud
+                            .get(first..=last)
+                            .map(|b| b.iter().fold(0.0f32, |m, &v| m.max(v)))
+                            .unwrap_or(0.0);
+                        if span_peak * own_peak * channel_gain <= SILENT {
+                            env *= damp.powi(n as i32);
+                            y *= (1.0 - lp).powi(n as i32);
+                            pos += ratio * n as f32;
+                            continue;
+                        }
+                    }
+                    // Step the read position as an integer index plus a
+                    // fractional part instead of one float position: the
+                    // index stays exact however far into the cache the
+                    // voice gets, and the per-sample work loses its
+                    // float-to-int conversion.
+                    let mut idx = pos as usize;
+                    let mut frac = pos - idx as f32;
+                    let step_int = ratio as usize;
+                    let step_frac = ratio - step_int as f32;
                     for i in range {
-                        let idx = pos as usize;
                         if idx + 1 >= s.len() {
                             ended = true;
                             break 'segments;
                         }
-                        let frac = (pos - idx as f64) as f32;
                         let (a, b) = (s[idx] as f32, s[idx + 1] as f32);
                         y += lp * (a + (b - a) * frac - y);
                         left[i] += y * gl * env;
                         right[i] += y * gr * env;
                         env *= damp;
-                        pos += ratio as f64;
+                        frac += step_frac;
+                        let carry = (frac >= 1.0) as usize;
+                        idx += step_int + carry;
+                        frac -= carry as f32;
                     }
+                    pos = idx as f32 + frac;
                 }
             }
         }
@@ -649,7 +803,7 @@ impl PianoPrerender {
     /// key's cached strike, whose loudness over time is tabulated (`loud`), so
     /// it is that table at the voice's position times its velocity gain,
     /// damper envelope, channel volume/expression and stereo spread.
-    fn amplitude(&self, note: u8, channel: u8, pos: f64, gain: f32, env: f32) -> f32 {
+    fn amplitude(&self, note: u8, channel: u8, pos: f32, gain: f32, env: f32) -> f32 {
         let n = note as usize;
         let level = self.cache.notes[n]
             .loud
@@ -1504,5 +1658,129 @@ mod tests {
         assert!(soft.gain < hard.gain);
         assert_eq!(hard.lp, 1.0);
         assert!(soft.lp < 1.0);
+    }
+
+    /// Measurement only: steady-state render cost at extreme polyphony.
+    /// Run with: cargo test --release -- --ignored bench_polyphony_sweep --nocapture
+    #[test]
+    #[ignore]
+    fn bench_polyphony_sweep() {
+        use std::time::Instant;
+
+        const CHUNK: usize = 256;
+        // Audio duration of one chunk at 48 kHz, in milliseconds.
+        const CHUNK_MS: f64 = CHUNK as f64 / 48_000.0 * 1_000.0;
+
+        fn fill(e: &mut PianoPrerender, target: usize) {
+            // Bass and mid keys ring for many seconds, so voices stay alive
+            // for the whole measurement without any note-offs.
+            let mut i = 0u32;
+            while (i as usize) < target {
+                let note = 21 + (i % 30);
+                let channel = (i / 30) % 16;
+                e.send_at(0, ON | channel | note << 8 | 127 << 16);
+                i += 1;
+            }
+        }
+
+        fn measure(e: &mut PianoPrerender, chunks: usize) -> (f64, f64, f64, f64) {
+            let (mut l, mut r) = (vec![0.0; CHUNK], vec![0.0; CHUNK]);
+            let mut times = Vec::with_capacity(chunks);
+            let mut checksum = 0.0f64;
+            for _ in 0..chunks {
+                let t = Instant::now();
+                e.render(&mut l, &mut r);
+                times.push(t.elapsed().as_secs_f64() * 1_000.0);
+                checksum += l.iter().map(|&x| x as f64).sum::<f64>();
+                checksum += r.iter().map(|&x| x as f64).sum::<f64>();
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            let p95 = times[(times.len() as f64 * 0.95) as usize];
+            (mean, p95, *times.last().unwrap(), checksum)
+        }
+
+        fn fill_mixed(e: &mut PianoPrerender, target: usize) {
+            // Whole keyboard, mixed velocities: closer to a real dense song
+            // than the single-velocity bass fill above.
+            let mut i = 0u32;
+            while (i as usize) < target {
+                let note = 21 + (i % 88);
+                let channel = (i / 88) % 16;
+                let vel = 60 + (i % 68);
+                e.send_at(0, ON | channel | note << 8 | vel << 16);
+                i += 1;
+            }
+        }
+
+        for target in [10_000usize, 50_000, 100_000, 200_000, 300_000] {
+            let mut e = PianoPrerender::new(48_000);
+            fill(&mut e, target);
+            let (mut l, mut r) = (vec![0.0; CHUNK], vec![0.0; CHUNK]);
+            let t = Instant::now();
+            e.render(&mut l, &mut r);
+            let burst_ms = t.elapsed().as_secs_f64() * 1_000.0;
+            let alive = e.voices.len();
+            let (mean, p95, max, sum) = measure(&mut e, 100);
+            eprintln!(
+                "polyphony {alive}: burst {burst_ms:.1} ms, chunk mean {mean:.3} ms p95 {p95:.3} ms max {max:.3} ms, realtime x{:.2}, checksum {sum:.4}",
+                CHUNK_MS / mean
+            );
+        }
+
+        // Aged mix: strikes all over the keyboard at mixed velocities,
+        // rendered 2 s before measuring, so most voices sit in their decay
+        // tails like a real dense song.
+        {
+            let mut e = PianoPrerender::new(48_000);
+            fill_mixed(&mut e, 100_000);
+            let (mut l, mut r) = (vec![0.0; CHUNK], vec![0.0; CHUNK]);
+            e.render(&mut l, &mut r);
+            for _ in 0..375 {
+                e.render(&mut l, &mut r);
+            }
+            let (mean, p95, max, sum) = measure(&mut e, 100);
+            eprintln!(
+                "polyphony {} (aged mix): chunk mean {mean:.3} ms p95 {p95:.3} ms max {max:.3} ms, realtime x{:.2}, checksum {sum:.4}",
+                e.voices.len(),
+                CHUNK_MS / mean
+            );
+        }
+
+        // Same, but with a pitch bend held on every channel: every voice
+        // takes the interpolated path.
+        {
+            let mut e = PianoPrerender::new(48_000);
+            fill(&mut e, 100_000);
+            let (mut l, mut r) = (vec![0.0; CHUNK], vec![0.0; CHUNK]);
+            e.render(&mut l, &mut r);
+            for ch in 0..16u32 {
+                // +1 semitone with the default 2-semitone range.
+                e.send_at(0, 0xE0 | ch | 0 << 8 | 80 << 16);
+            }
+            e.render(&mut l, &mut r);
+            let (mean, p95, max, sum) = measure(&mut e, 100);
+            eprintln!(
+                "polyphony {} (bend): chunk mean {mean:.3} ms p95 {p95:.3} ms max {max:.3} ms, realtime x{:.2}, checksum {sum:.4}",
+                e.voices.len(),
+                CHUNK_MS / mean
+            );
+        }
+
+        // Same, but with the voice limit engaged at the current count:
+        // isolates the per-render limit bookkeeping.
+        {
+            let mut e = PianoPrerender::new(48_000);
+            fill(&mut e, 100_000);
+            let (mut l, mut r) = (vec![0.0; CHUNK], vec![0.0; CHUNK]);
+            e.render(&mut l, &mut r);
+            e.set_voice_limit(100_000);
+            let (mean, p95, max, sum) = measure(&mut e, 100);
+            eprintln!(
+                "polyphony {} (limit on): chunk mean {mean:.3} ms p95 {p95:.3} ms max {max:.3} ms, realtime x{:.2}, checksum {sum:.4}",
+                e.voices.len(),
+                CHUNK_MS / mean
+            );
+        }
     }
 }
