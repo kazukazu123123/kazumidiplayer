@@ -1362,6 +1362,12 @@ const THIN_START_SECS: f64 = 2.0;
 /// ...rising linearly to every note at this much.
 const THIN_FULL_SECS: f64 = 0.1;
 
+/// How far ahead the buffer's current drain rate is projected when
+/// choosing the drop velocity: a fast drain reacts as if the buffer
+/// were already this much emptier, so the drop starts before the
+/// buffer is nearly empty instead of after.
+const THIN_LOOKAHEAD_SECS: f64 = 0.75;
+
 /// Highest note-on velocity to drop with `buffered_secs` of audio left:
 /// 0 (none) above [`THIN_START_SECS`], 1 at it, 127 (all) at
 /// [`THIN_FULL_SECS`] and below.
@@ -1426,6 +1432,11 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
     let mut bend_override = BendOverride::new(None);
     let mut skip = SkipFilter::new();
     let mut thin_armed = false;
+    // Last buffer level sample and the smoothed drain rate (seconds of
+    // buffer lost per second), for the projection in `thin_velocity`'s
+    // input below.
+    let mut prev_buffered: Option<(std::time::Instant, f64)> = None;
+    let mut drain_rate = 0.0f64;
     let mut drop_velocity;
     let mut limiter_bypassed;
     let mut left = vec![0.0f32; CHUNK_FRAMES];
@@ -1456,6 +1467,8 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                     bend_override = BendOverride::new(s.bend_override);
                     skip = SkipFilter::new();
                     thin_armed = false;
+                    prev_buffered = None;
+                    drain_rate = 0.0;
                     msgs = reset_messages()
                         .into_iter()
                         .chain(bend_override.initial())
@@ -1477,7 +1490,20 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                 thin_armed = true;
             }
             drop_velocity = if thin_armed && s.playing {
-                thin_velocity(buffered as f64 / rate as f64)
+                let secs = buffered as f64 / rate as f64;
+                // Project the buffer at its current drain rate, so the
+                // drop velocity reacts to how fast the buffer is being
+                // lost, not only to how much is left.
+                let now = std::time::Instant::now();
+                if let Some((prev_at, prev_secs)) = prev_buffered {
+                    let dt = now.duration_since(prev_at).as_secs_f64();
+                    if dt > 0.0 {
+                        let rate_now = ((prev_secs - secs) / dt).clamp(-2.0, 6.0);
+                        drain_rate += (rate_now - drain_rate) * 0.35;
+                    }
+                }
+                prev_buffered = Some((now, secs));
+                thin_velocity((secs - drain_rate * THIN_LOOKAHEAD_SECS).max(0.0))
             } else {
                 0
             };
