@@ -11,7 +11,7 @@
 //!   detuned lanes, a loud fast-decaying "prompt sound" and a quiet slow
 //!   "aftersound", which gives the beating and the long tail of real
 //!   unison strings. Losses grow with frequency, and the fundamental's
-//!   decay time shrinks from ~25 s at A0 to ~0.6 s at C8.
+//!   decay time shrinks from ~35 s at A0 to ~3 s at C8.
 //! - **Soundboard**: weak radiation below ~90 Hz, plus a short low-passed
 //!   noise "knock" at the strike.
 //! - **Dampers**: note-off adds strong damping (none above F#6, like a real
@@ -34,7 +34,7 @@ const MAX_PARTIAL_HZ: f64 = 14_000.0;
 /// Hammer strike point, as a fraction of the speaking length.
 const STRIKE_POINT: f64 = 1.0 / 8.0;
 /// Aftersound share of a paired partial, and how much faster prompt decays.
-const AFTERSOUND: f32 = 0.24;
+const AFTERSOUND: f32 = 0.32;
 const PROMPT_DECAY_RATIO: f64 = 3.0;
 /// Highest damped key (F#6); keys above ring until they die away.
 const LAST_DAMPED: usize = 90;
@@ -69,7 +69,7 @@ fn inharmonicity(note: usize) -> f64 {
 /// 60 dB decay time of a note's aftersound fundamental, in seconds.
 fn decay_secs(note: usize) -> f64 {
     let x = (note as f64 - 21.0).clamp(0.0, 87.0) / 87.0;
-    25.0 * (0.6f64 / 25.0).powf(x)
+    35.0 * (3.0f64 / 35.0).powf(x)
 }
 
 /// Felt low-pass of the hammer at velocity `v` (0-1) for a partial.
@@ -148,10 +148,15 @@ impl NoteSpec {
             // phase reversals between partials that a real strike creates.
             let comb = (std::f64::consts::PI * kf * STRIKE_POINT).sin();
             let radiation = hz * hz / (hz * hz + 90.0 * 90.0);
-            let amp = comb / kf.powf(1.35) * radiation;
+            // Treble partials sit sharp of the harmonic series (stiff short
+            // strings) and read as harsh when they ring at full strength, so
+            // the spectral rolloff steepens toward the top of the keyboard.
+            // The fundamental (k = 1) is untouched at every register.
+            let tilt = 1.35 + 0.5 * ((note as f64 - 60.0) / 48.0).clamp(0.0, 1.0);
+            let amp = comb / kf.powf(tilt) * radiation;
             // Bass strings retain their low modes longer; treble loses upper
             // modes quickly through hammer and soundboard absorption.
-            let loss = sigma0 * (1.0 + 0.11 * (kf - 1.0)) + 6e-7 * hz * hz;
+            let loss = sigma0 * (1.0 + 0.11 * (kf - 1.0)) + 3e-7 * hz * hz;
             let sigma = loss;
             if lanes == 2 {
                 let register = ((note as f64 - 21.0) / 87.0).clamp(0.0, 1.0);
@@ -276,8 +281,10 @@ impl Osc {
     }
 }
 
-/// Length of each cached note.
-const CACHE_SECS: f64 = 15.0;
+/// Length of each cached note. Long enough that even a bass fundamental
+/// (T60 ~35 s, audible for ~25 s) rings out inside the cache instead of
+/// being cut off by the end-of-cache fade.
+const CACHE_SECS: f64 = 30.0;
 /// Fade at the end of notes still sounding when the cache runs out.
 const CACHE_FADE_SECS: f64 = 0.5;
 
@@ -1259,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_shared_trimmed_and_capped_at_15s() {
+    fn cache_is_shared_trimmed_and_capped_at_30s() {
         let a = Cache::get(8_000);
         assert!(std::sync::Arc::ptr_eq(&a, &Cache::get(8_000)));
         let max = (CACHE_SECS * 8_000.0) as usize;
