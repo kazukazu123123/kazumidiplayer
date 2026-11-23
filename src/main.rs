@@ -242,6 +242,14 @@ fn main() {
 
     let mut flip_3d = Flip3D::new();
 
+    // A file named on the command line (an icon drop, Open With, a terminal)
+    // opens through the same path as a window drop's first file.
+    if let Some(path) = std::env::args().nth(1) {
+        if std::path::Path::new(&path).is_file() {
+            app_state.handle_file_drop(&path, &tx_commands_to_player);
+        }
+    }
+
     while !rl.window_should_close() {
         if rl.is_window_resized() {
             render_texture = rl
