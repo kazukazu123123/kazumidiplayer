@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audio_engine::OutputStream;
 use crate::kazumidiparser_cursor::{
@@ -25,6 +25,13 @@ pub enum PlayerState {
 /// prerender engine in one frame, checked every `DISPLAY_BUDGET_CHECK` events.
 const DISPLAY_BUDGET: Duration = Duration::from_millis(12);
 const DISPLAY_BUDGET_CHECK: u32 = 1024;
+
+/// How far the prerender display walk may fall behind the audio before it
+/// gives up catching up and reseeks to the heard position. Below this the
+/// walk resumes where it stopped on the next pass, so a budget overrun on
+/// a dense file costs display lag instead of a reseek (and a stretched
+/// pass) on every frame.
+const DISPLAY_RESEEK_LAG: Duration = Duration::from_millis(500);
 
 pub const DEFAULT_MIDI_EV_BUFFER_SIZE: u32 = 8192;
 pub const MIN_MIDI_EV_BUFFER_SIZE: u32 = 1;
@@ -152,10 +159,28 @@ impl Drop for AliveGuard {
     }
 }
 
+/// A heard-position sample for a prerendered output, taken by the player
+/// thread once per pass. The heard position is exact, but a pass can take
+/// ~100 ms on dense files while it walks display events, so publishing it
+/// as-is made the piano roll scroll in steps even though the app renders
+/// at full frame rate. While playing, [`PlayerHandle::position_ns`]
+/// extrapolates from the latest anchor at the playback speed; the next
+/// pass re-anchors, so the extrapolation horizon is a single pass and
+/// cannot drift away from what is actually heard.
+#[derive(Clone, Copy)]
+pub struct PositionAnchor {
+    pub pos_ns: u64,
+    pub at: Instant,
+    pub speed: f64,
+}
+
 pub struct PlayerHandle {
     tx_command: Sender<PlayerCommand>,
     state: Arc<AtomicU32>,
     position_ns: Arc<AtomicU64>,
+    // Latest heard-position anchor for prerendered outputs; see
+    // `PositionAnchor`. Empty for realtime outputs.
+    position_anchor: Arc<std::sync::Mutex<Option<PositionAnchor>>>,
     duration_ns: Arc<AtomicU64>,
     current_midi_data: Arc<std::sync::Mutex<Option<Arc<kazumidiparser::MIDIPlayerData>>>>,
     active_notes: Arc<std::sync::Mutex<[Option<(u16, u8)>; 128]>>,
@@ -199,6 +224,7 @@ impl Clone for PlayerHandle {
             tx_command: self.tx_command.clone(),
             state: self.state.clone(),
             position_ns: self.position_ns.clone(),
+            position_anchor: self.position_anchor.clone(),
             duration_ns: self.duration_ns.clone(),
             current_midi_data: self.current_midi_data.clone(),
             active_notes: self.active_notes.clone(),
@@ -231,6 +257,7 @@ impl PlayerHandle {
     ) -> Self {
         let state = Arc::new(AtomicU32::new(PlayerState::Stopped as u32));
         let position_ns = Arc::new(AtomicU64::new(0));
+        let position_anchor = Arc::new(std::sync::Mutex::new(None::<PositionAnchor>));
         let duration_ns = Arc::new(AtomicU64::new(1));
         let current_midi_data = Arc::new(std::sync::Mutex::new(
             None::<Arc<kazumidiparser::MIDIPlayerData>>,
@@ -279,6 +306,7 @@ impl PlayerHandle {
 
         let state_for_thread = state.clone();
         let position_ns_for_thread = position_ns.clone();
+        let position_anchor_for_thread = position_anchor.clone();
         let duration_ns_for_thread = duration_ns.clone();
         let tx_main_feedback_for_thread = tx_main_feedback.clone();
         let parser_worker_for_thread = parser_worker.clone();
@@ -303,6 +331,7 @@ impl PlayerHandle {
                 pitch_bend_range_for_thread,
                 state_for_thread,
                 position_ns_for_thread,
+                position_anchor_for_thread,
                 duration_ns_for_thread,
                 tx_main_feedback_for_thread,
                 parser_worker_for_thread,
@@ -332,6 +361,7 @@ impl PlayerHandle {
             tx_command: tx_command_to_thread,
             state,
             position_ns,
+            position_anchor,
             duration_ns,
             current_midi_data,
             active_notes,
@@ -508,6 +538,17 @@ impl PlayerHandle {
     }
 
     pub fn position_ns(&self) -> u64 {
+        if self.get_state() == PlayerState::Playing {
+            if let Some(anchor) = *lock_mutex(&self.position_anchor) {
+                // Cap the extrapolation: if the player thread stalls, the
+                // shown position stops near the last heard position
+                // instead of running away on its own.
+                const MAX_EXTRAPOLATION: Duration = Duration::from_millis(250);
+                let elapsed = anchor.at.elapsed().min(MAX_EXTRAPOLATION);
+                let extra = (elapsed.as_nanos() as f64 * anchor.speed) as u64;
+                return anchor.pos_ns.saturating_add(extra);
+            }
+        }
         self.position_ns.load(Ordering::SeqCst)
     }
 

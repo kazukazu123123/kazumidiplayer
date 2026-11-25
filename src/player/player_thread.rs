@@ -16,9 +16,10 @@ use crate::utils::lock_mutex;
 
 use super::{
     AliveGuard, BufferedMidiEvent, DEFAULT_MIDI_EV_BUFFER_SIZE, DISPLAY_BUDGET,
-    DISPLAY_BUDGET_CHECK, MAX_MIDI_EV_BUFFER_SIZE, MIDIPlayer, MIN_MIDI_EV_BUFFER_SIZE,
-    MIDI_EV_FRAME_DURATION, PlayerCommand, PlayerFeedback, PlayerState, dispatch_midi_event,
-    read_speed,
+    DISPLAY_BUDGET_CHECK, DISPLAY_RESEEK_LAG, MAX_MIDI_EV_BUFFER_SIZE, MIDIPlayer,
+    MIN_MIDI_EV_BUFFER_SIZE,
+    MIDI_EV_FRAME_DURATION, PlayerCommand, PlayerFeedback, PlayerState, PositionAnchor,
+    dispatch_midi_event, read_speed,
 };
 
 /// The player thread's whole life: respond to commands, fold in parser
@@ -32,6 +33,7 @@ pub(super) fn run(
     pitch_bend_range_for_thread: Arc<Mutex<[f32; 16]>>,
     state_for_thread: Arc<AtomicU32>,
     position_ns_for_thread: Arc<AtomicU64>,
+    position_anchor_for_thread: Arc<Mutex<Option<PositionAnchor>>>,
     duration_ns_for_thread: Arc<AtomicU64>,
     tx_main_feedback_for_thread: Sender<PlayerFeedback>,
     parser_worker_for_thread: MIDIParserWorker,
@@ -61,6 +63,7 @@ pub(super) fn run(
     let pitch_bend_range_clone = pitch_bend_range_for_thread;
     let state_clone = state_for_thread;
     let position_clone = position_ns_for_thread;
+    let position_anchor_clone = position_anchor_for_thread;
     let duration_clone = duration_ns_for_thread;
     let current_parse_cancellation_token_clone =
         current_parse_cancellation_token_for_thread;
@@ -128,6 +131,10 @@ pub(super) fn run(
                     if let Some(p) = prerender!(player) {
                         p.play(player.seek_position_ns, applied_speed);
                     }
+                    // A stale anchor from before a pause would extrapolate
+                    // from the old position; the playing pass sets a fresh
+                    // one for prerendered outputs.
+                    *lock_mutex(&position_anchor_clone) = None;
                 }
                 PlayerCommand::Pause => {
                     if let Some(p) = prerender!(player) {
@@ -178,6 +185,8 @@ pub(super) fn run(
                     active_count = [0u16; 128];
                     *lock_mutex(&pitch_bend_clone) = [8192; 16];
 
+                    // The position jumped; drop the extrapolation anchor.
+                    *lock_mutex(&position_anchor_clone) = None;
                     position_clone.store(player.seek_position_ns, Ordering::SeqCst);
                     state_clone.store(player.state as u32, Ordering::SeqCst);
                 }
@@ -314,6 +323,8 @@ pub(super) fn run(
                     player.send_all_notes_off();
                     player.stream = stream;
                     player.reset_playback_state();
+                    // The clock source changed with the output.
+                    *lock_mutex(&position_anchor_clone) = None;
                     // Re-apply S16 Clipping and the engine settings to the new output.
                     if let Some(ref stream) = player.stream {
                         stream.set_limiter_bypassed(s16_clipping);
@@ -477,6 +488,21 @@ pub(super) fn run(
                 // drives the display), so pacing it would just make
                 // the display lag the audio: always go direct.
                 let is_prerender = prerender!(player).is_some();
+                // Anchor the shown position to the heard position: the
+                // walk below can take ~100 ms on dense files, and the UI
+                // extrapolates from this anchor between passes instead of
+                // stepping at the pass rate (see
+                // `PlayerHandle::position_ns`). Realtime outputs follow
+                // the wall clock directly, so they keep it cleared.
+                *lock_mutex(&position_anchor_clone) = if is_prerender {
+                    Some(PositionAnchor {
+                        pos_ns: ideal_position_ns,
+                        at: Instant::now(),
+                        speed: applied_speed as f64,
+                    })
+                } else {
+                    None
+                };
                 let unlimited =
                     player.unlimited_output.load(Ordering::Relaxed) || is_prerender;
                 let mut display_behind = false;
@@ -553,7 +579,7 @@ pub(super) fn run(
                     // tempo/future events), and a future event is kept pending
                     // for the next tight-loop pass.
                     let mut events_processed = 0usize;
-                    for track in &mut player.tracks {
+                    'display_walk: for track in &mut player.tracks {
                         if track.pending && track.pend_tick <= cur_tick {
                             submit_event!(BufferedMidiEvent {
                                 tick: track.pend_tick,
@@ -575,6 +601,17 @@ pub(super) fn run(
                                 break;
                             }
                             events_processed += 1;
+                            // Prerender display walk: the same budget as
+                            // the buffered traversal. The cursors keep
+                            // their place when it trips, so the next pass
+                            // resumes the walk instead of starting over.
+                            if is_prerender
+                                && events_processed % (DISPLAY_BUDGET_CHECK as usize) == 0
+                                && frame_start.elapsed() > DISPLAY_BUDGET
+                            {
+                                display_behind = true;
+                                break 'display_walk;
+                            }
                             if track.cursor.is_tempo {
                                 continue;
                             }
@@ -655,7 +692,25 @@ pub(super) fn run(
                 }
 
                 if display_behind {
-                    display_reseek = Some(ideal_position_ns);
+                    // The walk ran out of budget this pass. Reseek only
+                    // once it has fallen far enough behind the audio that
+                    // catching up is hopeless; below that it resumes where
+                    // it stopped on the next pass, so a dense passage
+                    // costs display lag, not a reseek and a stretched pass
+                    // on every frame.
+                    let oldest_due = player
+                        .tracks
+                        .iter()
+                        .filter(|track| track.pending && track.pend_tick <= cur_tick)
+                        .map(|track| track.pend_tick)
+                        .min();
+                    let lag_ns = oldest_due.map_or(0, |tick| {
+                        ideal_position_ns
+                            .saturating_sub(tick_to_ns(unsafe { &*data.as_ptr() }, tick))
+                    });
+                    if lag_ns > DISPLAY_RESEEK_LAG.as_nanos() as u64 {
+                        display_reseek = Some(ideal_position_ns);
+                    }
                 }
 
                 // A full FIFO only means backpressure when at least one more due
