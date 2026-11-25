@@ -164,14 +164,26 @@ impl AppState {
             }
             PlayerFeedback::Loaded(path, parse_duration) => {
                 self.playback.is_loading = false;
+                // The toast summarizes the finished load, so its rates are the average
+                // over the whole parse, measured by the worker. The live rates are a
+                // recent-window figure and may never have opened on a fast parse,
+                // which would leave the toast showing 0/s.
+                let secs = parse_duration.as_secs_f64();
+                let (final_bps, final_eps) = match self.playback.current_progress {
+                    Some(progress) if secs > 0.0 => (
+                        progress.total_bytes as f64 / secs,
+                        progress.events_done as f64 / secs,
+                    ),
+                    _ => (self.playback.parse_bps, self.playback.parse_eps),
+                };
                 // Snapshot the final numbers before they are cleared: the toast carries the
                 // panel out of the screen still showing them.
                 self.playback.parse_toast = Some(ParseToast {
                     elapsed: 0.0,
                     parse_duration,
                     progress: self.playback.current_progress,
-                    parse_bps: self.playback.parse_bps,
-                    parse_eps: self.playback.parse_eps,
+                    parse_bps: final_bps,
+                    parse_eps: final_eps,
                 });
                 self.reset_parse_progress();
                 self.playback.is_dragging_seek = false;
@@ -233,25 +245,48 @@ impl AppState {
     /// Fold one progress snapshot into the moving-average parse rates. The parser polls
     /// roughly every millisecond, so a ~0.5s window keeps the numbers readable without
     /// lagging far behind the real speed.
+    ///
+    /// Snapshots are stamped when the UI processes them, not when the parser took them,
+    /// and the UI drains every queued snapshot once per frame, so a fast parse arrives
+    /// as a burst of snapshots processed within microseconds of each other. Kept as
+    /// separate samples they would collapse the measured span and send the rates to
+    /// absurd values, so a snapshot landing within MIN_SAMPLE_GAP of the newest sample
+    /// folds into it instead (keeping its timestamp, taking the newest counts), and
+    /// the rates are only recomputed once the samples span at least MIN_RATE_SPAN.
     fn update_parse_rate(&mut self, progress: ParseProgress, now: Instant) {
         const WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+        const MIN_SAMPLE_GAP: std::time::Duration = std::time::Duration::from_millis(10);
+        const MIN_RATE_SPAN: std::time::Duration = std::time::Duration::from_millis(10);
 
-        self.playback.parse_rate_samples
-            .push_back((now, progress.bytes_done, progress.events_done));
-        while let Some(&(t, _, _)) = self.playback.parse_rate_samples.front() {
-            if now.duration_since(t) > WINDOW && self.playback.parse_rate_samples.len() > 2 {
-                self.playback.parse_rate_samples.pop_front();
+        let samples = &mut self.playback.parse_rate_samples;
+        let fold = match samples.back() {
+            Some(&(t, _, _)) => now.duration_since(t) < MIN_SAMPLE_GAP,
+            None => false,
+        };
+        if fold {
+            if let Some(back) = samples.back_mut() {
+                back.1 = progress.bytes_done;
+                back.2 = progress.events_done;
+            }
+        } else {
+            samples.push_back((now, progress.bytes_done, progress.events_done));
+        }
+        while let Some(&(t, _, _)) = samples.front() {
+            if now.duration_since(t) > WINDOW && samples.len() > 2 {
+                samples.pop_front();
             } else {
                 break;
             }
         }
+        let endpoints = match (samples.front(), samples.back()) {
+            (Some(&front), Some(&back)) => Some((front, back)),
+            _ => None,
+        };
 
-        if let (Some(&(t0, b0, e0)), Some(&(t1, b1, e1))) = (
-            self.playback.parse_rate_samples.front(),
-            self.playback.parse_rate_samples.back(),
-        ) {
-            let dt = t1.duration_since(t0).as_secs_f64();
-            if dt > 0.0 {
+        if let Some(((t0, b0, e0), (t1, b1, e1))) = endpoints {
+            let span = t1.duration_since(t0);
+            if span >= MIN_RATE_SPAN {
+                let dt = span.as_secs_f64();
                 self.playback.parse_bps = b1.saturating_sub(b0) as f64 / dt;
                 self.playback.parse_eps = e1.saturating_sub(e0) as f64 / dt;
             }
