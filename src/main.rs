@@ -1288,6 +1288,7 @@ fn main() {
                                         current_tick,
                                         top_tick,
                                         target,
+                                        app_state.playback.is_dragging_seek,
                                     );
 
                                     let roll_area = Rectangle::new(cx, cy, cw, roll_h);

@@ -124,7 +124,7 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
                 return false;
             }
 
-            // Same rules as the parser's own cursor, so events, keyframes and
+            // Same rules as the parser's own cursor, so events and
             // counts agree: running status survives meta / SysEx, and a data byte
             // with no status ever set is desync (stop rather than resync by luck).
             let mut status = *c.p;
@@ -224,49 +224,9 @@ pub unsafe fn cursor_next(c: &mut TrackCursor) -> bool {
     }
 }
 
-/// Jump a cursor to the last keyframe at or before `target_tick`, so the walk to
-/// the target starts near it instead of at the head of the track. Keyframes are in
-/// ascending tick order, so this is a binary search: a linear scan here would cost
-/// (tracks x keyframes) per seek and get slower the later in the file you land.
-///
-/// No-op when the track has no keyframes (the cursor then walks from the start).
-///
-/// # Safety
-/// - `data` must be valid and `track_idx` within bounds.
-/// - `cursor` must belong to `track_idx` and be freshly initialized.
-unsafe fn jump_to_keyframe(data: &KazuMIDIParserData, cursor: &mut TrackCursor, target_tick: u32) {
-    unsafe {
-        let ti = cursor.track_index as usize;
-        let kc = *data.keyframe_counts.add(ti);
-        if kc == 0 {
-            return;
-        }
-        let kf_ptr = *data.keyframes.add(ti);
-
-        // Largest j with keyframes[j].abs_tick <= target_tick. Keyframe 0 sits at
-        // the track start, so when every keyframe is past the target, j = 0 is the
-        // correct (and safe) place to start.
-        let mut lo = 0usize;
-        let mut hi = kc;
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2;
-            if (*kf_ptr.add(mid)).abs_tick <= target_tick {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-
-        let kf = &*kf_ptr.add(lo);
-        let track_start_offset = *data.track_index.add(ti);
-        cursor.p = data.raw.add(track_start_offset + kf.track_offset as usize);
-        cursor.abs_tick = kf.abs_tick;
-        cursor.running_status = kf.running_status;
-        cursor.skip_next_delta = true;
-    }
-}
-
-/// Seek a track cursor to the first event at or after the given tick.
+/// Seek a track cursor to the first event at or after the given tick,
+/// walking from the track start. Playback seeks use the block index
+/// ([`NoteOnIndex::seek_cursor`]) instead; this is the reference walk.
 ///
 /// # Safety
 /// - `data` must be a valid KazuMIDIParserData reference.
@@ -302,8 +262,6 @@ pub unsafe fn seek_track_cursor(
     }
 
     unsafe {
-        jump_to_keyframe(data, &mut cursor, target_tick);
-
         while cursor_next(&mut cursor) {
             if cursor.is_tempo {
                 continue;
@@ -318,6 +276,199 @@ pub unsafe fn seek_track_cursor(
     }
 
     cursor
+}
+
+/// Count note-ons (velocity above zero) with a tick strictly before
+/// `target_tick`, across all tracks, by scanning each track from its
+/// start. This deliberately mirrors the parser's own note-on
+/// definition, so the count at the end of the song equals
+/// `total_note_on_events`.
+///
+/// The played-notes counter normally just counts dispatched events,
+/// which drifts whenever playback teleports: a seek discards or
+/// replays a whole section, a stop rewinds to zero, and the display
+/// reseek in prerender mode skips events the audio still played.
+/// Callers re-derive the counter with this after any of those jumps
+/// so it keeps meaning "note-ons up to the current position".
+///
+/// # Safety
+/// - `data` must be a valid KazuMIDIParserData reference.
+pub unsafe fn count_note_ons_before(data: &KazuMIDIParserData, target_tick: u32) -> u64 {
+    let mut total = 0u64;
+    for t in 0..data.header.tracks {
+        let Some(mut cursor) = (unsafe { init_track_cursor(data, t) }) else {
+            continue;
+        };
+        while unsafe { cursor_next(&mut cursor) } {
+            if cursor.is_tempo {
+                continue;
+            }
+            if cursor.abs_tick >= target_tick {
+                break;
+            }
+            if cursor.status & 0xF0 == 0x90 && cursor.param2 > 0 {
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
+/// A per-track block index over the song's note-ons, built once per
+/// load so recounting them does not rescan from the start of every
+/// track on each seek. Every `BLOCK_EVENTS` events, a block records
+/// the cursor state (byte offset, tick, running status) and the
+/// number of note-ons before it; counting then resumes from the
+/// nearest block below the target and scans about one block of
+/// events per track.
+pub struct NoteOnIndex {
+    tracks: Vec<Vec<NoteBlock>>,
+}
+
+#[derive(Clone, Copy)]
+struct NoteBlock {
+    /// Byte offset of the block's first event within its track.
+    byte_offset: u32,
+    /// Tick of the event just before the block: the cumulative tick
+    /// the block's first event's delta is added to.
+    tick: u32,
+    /// Running status in effect for the block's first event.
+    running_status: u8,
+    /// Note-ons in this track before the block's first event.
+    note_ons_before: u64,
+}
+
+impl NoteOnIndex {
+    // Small blocks: with many-track files the per-track tail scans
+    // add up (measured: 8192-event blocks still cost ~116 ms per
+    // recount on a 100+ track file), so cap the tail at 256.
+    const BLOCK_EVENTS: u32 = 256;
+
+    /// Scan every track once and record the blocks. A pure read over
+    /// the parser's buffer; the player thread runs it as part of
+    /// load completion.
+    ///
+    /// # Safety
+    /// - `data` must be valid parser data whose raw buffer stays
+    ///   alive and immutable for the scan (the owning `Arc` does).
+    pub unsafe fn build(data: &KazuMIDIParserData) -> NoteOnIndex {
+        let mut tracks = Vec::with_capacity(data.header.tracks as usize);
+        for t in 0..data.header.tracks {
+            let mut blocks = Vec::new();
+            let Some(mut cursor) = (unsafe { init_track_cursor(data, t) }) else {
+                tracks.push(blocks);
+                continue;
+            };
+            let track_start = cursor.p;
+            let mut note_ons = 0u64;
+            // The first event opens a block.
+            let mut since_block = Self::BLOCK_EVENTS;
+            loop {
+                if since_block >= Self::BLOCK_EVENTS {
+                    blocks.push(NoteBlock {
+                        byte_offset: (cursor.p as usize - track_start as usize) as u32,
+                        tick: cursor.abs_tick,
+                        running_status: cursor.running_status,
+                        note_ons_before: note_ons,
+                    });
+                    since_block = 0;
+                }
+                if !unsafe { cursor_next(&mut cursor) } {
+                    break;
+                }
+                since_block += 1;
+                if !cursor.is_tempo && cursor.status & 0xF0 == 0x90 && cursor.param2 > 0 {
+                    note_ons += 1;
+                }
+            }
+            tracks.push(blocks);
+        }
+        NoteOnIndex { tracks }
+    }
+
+    /// Seek a cursor to the first event at or after `target_tick`
+    /// on `track`, resuming from this index's nearest block instead
+    /// of walking from the track start. Lands exactly where
+    /// `seek_track_cursor` lands; falls back to it when the track
+    /// has no blocks.
+    ///
+    /// # Safety
+    /// - Same requirements as `seek_track_cursor`, and the index
+    ///   must have been built from this same `data`.
+    pub unsafe fn seek_cursor(
+        &self,
+        data: &KazuMIDIParserData,
+        track_idx: u16,
+        target_tick: u32,
+    ) -> TrackCursor {
+        let Some(blocks) = self.tracks.get(track_idx as usize).filter(|b| !b.is_empty()) else {
+            return unsafe { seek_track_cursor(data, track_idx, target_tick) };
+        };
+        let Some(mut cursor) = (unsafe { init_track_cursor(data, track_idx) }) else {
+            return unsafe { seek_track_cursor(data, track_idx, target_tick) };
+        };
+        // Last block whose pre-tick is at or below the target. Block
+        // 0 is the track head, so targets before the first block use
+        // it too.
+        let past = blocks.partition_point(|b| b.tick <= target_tick);
+        let block = blocks[past.saturating_sub(1)];
+        cursor.p = unsafe { cursor.p.add(block.byte_offset as usize) };
+        cursor.abs_tick = block.tick;
+        cursor.running_status = block.running_status;
+        unsafe {
+            while cursor_next(&mut cursor) {
+                if cursor.is_tempo {
+                    continue;
+                }
+                if cursor.abs_tick >= target_tick {
+                    break;
+                }
+            }
+            if cursor.abs_tick < target_tick {
+                cursor.has_event = false;
+            }
+        }
+        cursor
+    }
+
+    /// Note-ons with a tick strictly before `target_tick`. Agrees
+    /// with `count_note_ons_before`; it is just faster.
+    ///
+    /// # Safety
+    /// - Same requirements as `count_note_ons_before`, and the index
+    ///   must have been built from this same `data`.
+    pub unsafe fn count_before(&self, data: &KazuMIDIParserData, target_tick: u32) -> u64 {
+        let mut total = 0u64;
+        for (t, blocks) in self.tracks.iter().enumerate() {
+            // The last block whose pre-tick is below the target; the
+            // scan from there covers everything up to the target.
+            let past = blocks.partition_point(|b| b.tick < target_tick);
+            if past == 0 {
+                continue;
+            }
+            let block = blocks[past - 1];
+            let Some(mut cursor) = (unsafe { init_track_cursor(data, t as u16) }) else {
+                continue;
+            };
+            cursor.p = unsafe { cursor.p.add(block.byte_offset as usize) };
+            cursor.abs_tick = block.tick;
+            cursor.running_status = block.running_status;
+            let mut count = block.note_ons_before;
+            while unsafe { cursor_next(&mut cursor) } {
+                if cursor.is_tempo {
+                    continue;
+                }
+                if cursor.abs_tick >= target_tick {
+                    break;
+                }
+                if cursor.status & 0xF0 == 0x90 && cursor.param2 > 0 {
+                    count += 1;
+                }
+            }
+            total += count;
+        }
+        total
+    }
 }
 
 /// A note that was still sounding when a seek landed mid-note: the key it is on,
@@ -338,9 +489,10 @@ pub struct HeldNote {
 /// open on its (channel, key), so overlapping notes survive as separate notes
 /// instead of truncating each other.
 ///
-/// This deliberately scans from the track start instead of jumping to a keyframe.
-/// Keyframes do not contain held-note state, so jumping can lose a long note whose
-/// note-on lies before the keyframe and make it disappear after a roll rebuild.
+/// This deliberately scans from the track start instead of resuming from a
+/// checkpoint. Checkpoints do not contain held-note state, so resuming can lose
+/// a long note whose note-on lies before the checkpoint and make it disappear
+/// after a roll rebuild.
 ///
 /// # Safety
 /// Same requirements as `seek_track_cursor`.
@@ -387,7 +539,7 @@ pub unsafe fn seek_track_cursor_with_held(
 
     unsafe {
         // Walk from the track start to the target, tracking note on/off so the
-        // held-note set is complete even when a note spans one or more keyframes.
+        // held-note set is complete even when a note spans one or more checkpoints.
         while cursor_next(&mut cursor) {
             if cursor.is_tempo {
                 continue;
@@ -702,9 +854,144 @@ mod tests {
     use super::*;
     use kazumidiparser::MIDIPlayerData;
 
-    /// Walking every track with `cursor_next` (from the start, and from the last
-    /// keyframe of each track) must agree with the parser's own counts for every
-    /// file in `KZMP_TEST_MIDIS` (a directory). Skipped when it is unset.
+    /// The block index must agree with the plain scan, including
+    /// across block boundaries (the song below has 20,000 note-ons,
+    /// so it spans many 256-event blocks).
+    #[test]
+    fn note_on_index_agrees_with_plain_scan() {
+        const NOTES: u32 = 20_000;
+        let mut track: Vec<u8> = Vec::new();
+        for i in 0..NOTES {
+            // Note-on at tick i * 10, its note-off 5 ticks later.
+            if i == 0 {
+                track.extend_from_slice(&[0x00, 0x90, 60, 100]);
+            } else {
+                track.extend_from_slice(&[0x05, 0x90, 60, 100]);
+            }
+            track.extend_from_slice(&[0x05, 0x80, 60, 0]);
+        }
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut file: Vec<u8> = Vec::new();
+        file.extend_from_slice(b"MThd");
+        file.extend_from_slice(&6u32.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&480u16.to_be_bytes());
+        file.extend_from_slice(b"MTrk");
+        file.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        file.extend_from_slice(&track);
+        let path = std::env::temp_dir().join("kazumidiplayer_cursor_index_test.mid");
+        std::fs::write(&path, &file).unwrap();
+        let data = MIDIPlayerData::parse(&path, 1, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let raw = unsafe { &*data.as_ptr() };
+        let index = unsafe { NoteOnIndex::build(raw) };
+        for target in [0, 1, 5, 10, 50_000, 100_005, 199_995, u32::MAX] {
+            assert_eq!(
+                unsafe { index.count_before(raw, target) },
+                unsafe { count_note_ons_before(raw, target) },
+                "target {target}"
+            );
+        }
+        assert_eq!(unsafe { index.count_before(raw, u32::MAX) }, NOTES as u64);
+    }
+
+    /// Seeking through the block index must land on the same event
+    /// as the plain from-start seek, and the streams must agree
+    /// afterwards. Same song shape as the count test above (40,000
+    /// events, so the targets cross many 256-event blocks).
+    #[test]
+    fn index_seek_lands_where_plain_seek_lands() {
+        const NOTES: u32 = 20_000;
+        let mut track: Vec<u8> = Vec::new();
+        for i in 0..NOTES {
+            if i == 0 {
+                track.extend_from_slice(&[0x00, 0x90, 60, 100]);
+            } else {
+                track.extend_from_slice(&[0x05, 0x90, 60, 100]);
+            }
+            track.extend_from_slice(&[0x05, 0x80, 60, 0]);
+        }
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut file: Vec<u8> = Vec::new();
+        file.extend_from_slice(b"MThd");
+        file.extend_from_slice(&6u32.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&480u16.to_be_bytes());
+        file.extend_from_slice(b"MTrk");
+        file.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        file.extend_from_slice(&track);
+        let path = std::env::temp_dir().join("kazumidiplayer_cursor_seek_test.mid");
+        std::fs::write(&path, &file).unwrap();
+        let data = MIDIPlayerData::parse(&path, 1, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let raw = unsafe { &*data.as_ptr() };
+        let index = unsafe { NoteOnIndex::build(raw) };
+        fn landing(c: &TrackCursor) -> (bool, u32, u8, u8, u8, bool) {
+            (
+                c.has_event,
+                c.abs_tick,
+                c.status,
+                c.param1,
+                c.param2,
+                c.is_tempo,
+            )
+        }
+        for target in [0, 1, 5, 10, 50_000, 100_005, 199_995, u32::MAX] {
+            let walked = unsafe { seek_track_cursor(raw, 0, target) };
+            let indexed = unsafe { index.seek_cursor(raw, 0, target) };
+            assert_eq!(landing(&walked), landing(&indexed), "target {target}");
+            let (mut a, mut b) = (walked, indexed);
+            for _ in 0..8 {
+                let ea = unsafe { cursor_next(&mut a) };
+                let eb = unsafe { cursor_next(&mut b) };
+                assert_eq!(ea, eb, "target {target}");
+                if !ea {
+                    break;
+                }
+                assert_eq!(landing(&a), landing(&b), "target {target}");
+            }
+        }
+    }
+
+    /// `count_note_ons_before` must count exactly the note-ons the
+    /// parser counted, split at the target tick. The velocity-0
+    /// note-on at tick 720 is a note-off in disguise and never counts.
+    #[test]
+    fn count_note_ons_before_splits_at_target_tick() {
+        let track: &[u8] = &[
+            0x00, 0x90, 60, 100, // tick 0: note-on 60
+            0x83, 0x60, 0x80, 60, 0, // tick 480: note-off 60
+            0x81, 0x70, 0x90, 62, 0, // tick 720: note-on 62, velocity 0
+            0x81, 0x70, 0x90, 64, 100, // tick 960: note-on 64
+            0x00, 0xFF, 0x2F, 0x00, // end of track
+        ];
+        let mut file: Vec<u8> = Vec::new();
+        file.extend_from_slice(b"MThd");
+        file.extend_from_slice(&6u32.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&480u16.to_be_bytes());
+        file.extend_from_slice(b"MTrk");
+        file.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        file.extend_from_slice(track);
+        let path = std::env::temp_dir().join("kazumidiplayer_cursor_count_test.mid");
+        std::fs::write(&path, &file).unwrap();
+        let data = MIDIPlayerData::parse(&path, 1, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let raw = unsafe { &*data.as_ptr() };
+        assert_eq!(data.total_note_on_events(), 2);
+        assert_eq!(unsafe { count_note_ons_before(raw, 0) }, 0);
+        assert_eq!(unsafe { count_note_ons_before(raw, 1) }, 1);
+        assert_eq!(unsafe { count_note_ons_before(raw, 960) }, 1);
+        assert_eq!(unsafe { count_note_ons_before(raw, 961) }, 2);
+        assert_eq!(unsafe { count_note_ons_before(raw, u32::MAX) }, 2);
+    }
+
+    /// Walking every track with `cursor_next` from the start must agree with
+    /// the parser's own counts for every file in `KZMP_TEST_MIDIS` (a
+    /// directory). Skipped when it is unset.
     #[test]
     fn cursor_matches_parser_counts() {
         let Ok(dir) = std::env::var("KZMP_TEST_MIDIS") else {
@@ -727,32 +1014,6 @@ mod tests {
                     if c.status & 0xF0 == 0x90 && c.param2 > 0 {
                         note_on += 1;
                     }
-                }
-                // A seek through the last keyframe must land on the same events.
-                let kfs = midi.keyframes(t as usize);
-                if let Some(last) = kfs.last() {
-                    let mut c = unsafe { init_track_cursor(data, t) }.unwrap();
-                    unsafe { jump_to_keyframe(data, &mut c, last.abs_tick) };
-                    let mut from_kf = 0u64;
-                    while unsafe { cursor_next(&mut c) } {
-                        if !c.is_tempo {
-                            from_kf += 1;
-                        }
-                    }
-                    let mut c = unsafe { init_track_cursor(data, t) }.unwrap();
-                    let mut total = 0u64;
-                    while unsafe { cursor_next(&mut c) } {
-                        if !c.is_tempo {
-                            total += 1;
-                        }
-                    }
-                    let expected = total - (kfs.len() as u64 - 1) * 4096;
-                    assert_eq!(
-                        from_kf,
-                        expected,
-                        "{} track {t} keyframe seek",
-                        path.display()
-                    );
                 }
             }
             println!(

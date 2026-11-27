@@ -236,6 +236,9 @@ pub struct PianoRoll {
     /// Generation of the newest rebuild requested.
     generation: u64,
     last_tick: u32,
+    /// A rebuild was asked for during a seek drag and is owed once
+    /// the drag ends (see `update`).
+    rebuild_deferred: bool,
 
     // Render resources, reused across frames.
     texture: Option<raylib::ffi::Texture2D>,
@@ -284,6 +287,7 @@ impl PianoRoll {
             file_id: 0,
             generation: 0,
             last_tick: 0,
+            rebuild_deferred: false,
             texture: None,
             tex_h: 0,
             pixels: Vec::new(),
@@ -318,10 +322,27 @@ impl PianoRoll {
         }
     }
 
+    /// Ask the worker for a fresh window at `current_tick`.
+    fn request_rebuild(&mut self, data: &Arc<MIDIPlayerData>, current_tick: u32, top_tick: u32) {
+        self.generation += 1;
+        self.shared.stats.rebuilds.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Rebuild {
+                data: data.clone(),
+                file_id: self.file_id,
+                generation: self.generation,
+                start_tick: current_tick,
+                priority_tick: top_tick,
+                progressive: self.current.is_none(),
+            });
+        }
+    }
+
     /// Per-frame bookkeeping, before drawing: pick up the newest window, ask
     /// for a rebuild on a new file or a seek, and tell the scan how far ahead
     /// to stay. `top_tick` is the top edge of the view, `target_tick` how far
-    /// the scan must have reached.
+    /// the scan must have reached. While `seek_dragging`, rebuilds are
+    /// deferred to a single one when the drag ends.
     pub fn update(
         &mut self,
         data: &Arc<MIDIPlayerData>,
@@ -329,6 +350,7 @@ impl PianoRoll {
         current_tick: u32,
         top_tick: u32,
         target_tick: u32,
+        seek_dragging: bool,
     ) {
         while let Some(w) = self.shared.mailbox.take() {
             if w.file_id == self.file_id {
@@ -366,18 +388,21 @@ impl PianoRoll {
                 self.data = Some(data.clone());
                 self.replace_current(None);
             }
-            self.generation += 1;
-            self.shared.stats.rebuilds.fetch_add(1, Ordering::Relaxed);
-            if let Some(tx) = &self.tx {
-                let _ = tx.send(Rebuild {
-                    data: data.clone(),
-                    file_id: self.file_id,
-                    generation: self.generation,
-                    start_tick: current_tick,
-                    priority_tick: top_tick,
-                    progressive: self.current.is_none(),
-                });
+            if seek_dragging {
+                // A drag asks for a rebuild per preview step, and the
+                // setup costs hundreds of ms on a dense file, so
+                // nearly every window was discarded unseen (measured:
+                // 21 of 24 rebuilds in one drag). Owe one instead and
+                // pay it at the release position below.
+                self.rebuild_deferred = true;
+            } else {
+                self.rebuild_deferred = false;
+                self.request_rebuild(data, current_tick, top_tick);
             }
+        } else if !seek_dragging && self.rebuild_deferred {
+            // The drag ended: rebuild once at the settled position.
+            self.rebuild_deferred = false;
+            self.request_rebuild(data, current_tick, top_tick);
         }
         self.shared.target_tick.store(target_tick, Ordering::Relaxed);
     }

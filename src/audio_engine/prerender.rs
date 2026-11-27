@@ -29,7 +29,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 
 use crate::kazumidiparser_cursor::{
-    TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, tick_to_ns,
+    NoteOnIndex, TrackCursor, cursor_next, ns_to_tick, seek_track_cursor, tick_to_ns,
 };
 
 /// Frames rendered per step. Events carry their offset within the step.
@@ -170,6 +170,9 @@ fn frames_for_secs(secs: u32, rate: u32) -> usize {
 struct State {
     generation: u64,
     data: Option<MidiData>,
+    /// Block index over `data`, built by the player at load; track
+    /// seeks resume from it instead of walking from the track start.
+    note_index: Option<Arc<NoteOnIndex>>,
     playing: bool,
     /// Song position the current generation started at.
     base_ns: u64,
@@ -933,6 +936,7 @@ impl Session {
             state: Mutex::new(State {
                 generation: 0,
                 data: None,
+                note_index: None,
                 playing: false,
                 base_ns: 0,
                 speed: 1.0,
@@ -991,9 +995,10 @@ impl Session {
     }
 
     /// File to render; `None` while loading.
-    pub fn set_data(&self, data: Option<MidiData>) {
+    pub fn set_data(&self, data: Option<MidiData>, note_index: Option<Arc<NoteOnIndex>>) {
         self.update(|s| {
             s.data = data;
+            s.note_index = note_index;
             restart(s);
         });
     }
@@ -1029,7 +1034,8 @@ impl Session {
         // The player seeks in heard time, which trails `played` by the
         // device latency; aim there so the requested moment is what plays.
         let target = frame_at(s.base_ns, position_ns, s.speed, rate) + s.latency_frames;
-        if position_ns < s.base_ns || !s.skip_to(target) {
+        let restarted = position_ns < s.base_ns || !s.skip_to(target);
+        if restarted {
             s.base_ns = position_ns;
             restart(&mut s);
         }
@@ -1192,17 +1198,27 @@ impl Drop for Session {
 
 struct Tracks {
     data: MidiData,
+    note_index: Option<Arc<NoteOnIndex>>,
     cursors: Vec<TrackCursor>,
 }
 
 impl Tracks {
-    fn seek(data: MidiData, position_ns: u64) -> Self {
+    fn seek(data: MidiData, position_ns: u64, note_index: Option<Arc<NoteOnIndex>>) -> Self {
         let raw = unsafe { &*data.as_ptr() };
         let tick = ns_to_tick(raw, position_ns);
         let cursors = (0..data.header().tracks)
-            .map(|i| unsafe { seek_track_cursor(raw, i, tick) })
+            .map(|i| unsafe {
+                match &note_index {
+                    Some(index) => index.seek_cursor(raw, i, tick),
+                    None => seek_track_cursor(raw, i, tick),
+                }
+            })
             .collect();
-        Self { data, cursors }
+        Self {
+            data,
+            note_index,
+            cursors,
+        }
     }
 
     /// Append every channel message before `end_ns` as `(song ns, message)`,
@@ -1459,7 +1475,10 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                 }
                 if s.generation != generation {
                     generation = s.generation;
-                    tracks = s.data.clone().map(|d| Tracks::seek(d, s.base_ns));
+                    tracks = s
+                        .data
+                        .clone()
+                        .map(|d| Tracks::seek(d, s.base_ns, s.note_index.clone()));
                     rendered = 0;
                     base_ns = s.base_ns;
                     speed = s.speed;
@@ -1530,7 +1549,7 @@ fn render_loop(shared: Arc<Shared>, mut render: RenderFn) {
                 // than it lasts and fall further behind each time. Jump there
                 // and silence what was sounding instead.
                 if let Some(t) = tracks.as_mut() {
-                    *t = Tracks::seek(t.data.clone(), skip_ns);
+                    *t = Tracks::seek(t.data.clone(), skip_ns, t.note_index.clone());
                 }
                 skip = SkipFilter::new();
                 msgs.extend((0..16u32).map(|ch| (0, 0xB0 | ch | 123 << 8)));
@@ -1781,6 +1800,7 @@ mod tests {
         let mut state = State {
             generation: 3,
             data: None,
+            note_index: None,
             playing: true,
             base_ns: 0,
             speed: 1.0,
@@ -1811,6 +1831,7 @@ mod tests {
         State {
             generation: 0,
             data: None,
+            note_index: None,
             playing: true,
             base_ns: 0,
             speed: 1.0,
@@ -2214,7 +2235,7 @@ mod stress {
         .unwrap()
         .unwrap();
         let p = stream.prerender().unwrap();
-        p.set_data(Some(data));
+        p.set_data(Some(data), None);
         let from_ns: u64 =
             std::env::var("STRESS_FROM_SECS").map_or(0, |v| v.parse().unwrap()) * 1_000_000_000;
         let secs: u64 = std::env::var("STRESS_SECS").map_or(20, |v| v.parse().unwrap());

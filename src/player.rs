@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio_engine::OutputStream;
 use crate::kazumidiparser_cursor::{
-    TrackCursor, ns_to_tick, seek_track_cursor, tick_to_ns,
+    NoteOnIndex, TrackCursor, ns_to_tick, seek_track_cursor, tick_to_ns,
 };
 use crate::midi_parser_worker::{MIDIParserWorker, ParserFeedbackCommand};
 use crate::utils::lock_mutex;
@@ -582,6 +582,9 @@ impl PlayerHandle {
 pub struct MIDIPlayer {
     pub stream: Option<OutputStream>,
     pub data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
+    /// Block index over `data`, built at load; seeks and resets
+    /// resume from it instead of walking from the track start.
+    pub note_index: Option<Arc<NoteOnIndex>>,
     pub state: PlayerState,
     pub seek_position_ns: u64,
     pub tracks: Vec<TrackState>,
@@ -681,6 +684,7 @@ impl MIDIPlayer {
         Self {
             stream: kdmapi,
             data: None,
+            note_index: None,
             state: PlayerState::Stopped,
             seek_position_ns: 0,
             tracks: Vec::new(),
@@ -701,8 +705,13 @@ impl MIDIPlayer {
         self.midi_original_pb_range = [2; 16];
     }
 
-    pub fn load_parsed_data(&mut self, data: Option<Arc<kazumidiparser::MIDIPlayerData>>) {
+    pub fn load_parsed_data(
+        &mut self,
+        data: Option<Arc<kazumidiparser::MIDIPlayerData>>,
+        note_index: Option<Arc<NoteOnIndex>>,
+    ) {
         self.data = data;
+        self.note_index = note_index;
         self.state = PlayerState::Stopped;
         self.seek_position_ns = 0;
         self.reset_channel_states();
@@ -730,7 +739,12 @@ impl MIDIPlayer {
             let num_tracks = data.header().tracks as usize;
             for i in 0..num_tracks {
                 // Safety: data.as_ptr() returns a valid C struct pointer
-                let cursor = unsafe { seek_track_cursor(&*data.as_ptr(), i as u16, 0) };
+                let cursor = unsafe {
+                    match &self.note_index {
+                        Some(index) => index.seek_cursor(&*data.as_ptr(), i as u16, 0),
+                        None => seek_track_cursor(&*data.as_ptr(), i as u16, 0),
+                    }
+                };
                 self.tracks.push(TrackState {
                     pending: cursor.has_event && !cursor.is_tempo,
                     exhausted: !cursor.has_event,
@@ -751,7 +765,17 @@ impl MIDIPlayer {
             // Safety: data.as_ptr() valid for the lifetime of this call
             let num_tracks = data.header().tracks as usize;
             for i in 0..num_tracks {
-                let cursor = unsafe { seek_track_cursor(&*data.as_ptr(), i as u16, target_tick) };
+                // The player's own block index resumes each track a
+                // few hundred events from the target; without it,
+                // fall back to walking from the track start.
+                let cursor = unsafe {
+                    match &self.note_index {
+                        Some(index) => {
+                            index.seek_cursor(&*data.as_ptr(), i as u16, target_tick)
+                        }
+                        None => seek_track_cursor(&*data.as_ptr(), i as u16, target_tick),
+                    }
+                };
                 self.tracks.push(TrackState {
                     pending: cursor.has_event && !cursor.is_tempo,
                     exhausted: !cursor.has_event,

@@ -10,7 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::audio_engine::OutputStream;
-use crate::kazumidiparser_cursor::{cursor_next, ns_to_tick, tick_to_ns};
+use crate::kazumidiparser_cursor::{
+    NoteOnIndex, count_note_ons_before, cursor_next, ns_to_tick, tick_to_ns,
+};
 use crate::midi_parser_worker::{MIDIParserWorker, ParserCommand, ParserFeedbackCommand};
 use crate::utils::lock_mutex;
 
@@ -21,6 +23,32 @@ use super::{
     MIDI_EV_FRAME_DURATION, PlayerCommand, PlayerFeedback, PlayerState, PositionAnchor,
     dispatch_midi_event, read_speed,
 };
+
+/// Note-ons before `tick` in `data`: via the block index when it
+/// covers this song, and a full scan otherwise (a safety net; the
+/// index is built during load, so this should not happen).
+fn recount_notes(
+    note_index: &Option<(Arc<kazumidiparser::MIDIPlayerData>, Arc<NoteOnIndex>)>,
+    data: &Arc<kazumidiparser::MIDIPlayerData>,
+    tick: u32,
+) -> u64 {
+    let raw = unsafe { &*data.as_ptr() };
+    match index_for(note_index, data) {
+        Some(index) => unsafe { index.count_before(raw, tick) },
+        None => unsafe { count_note_ons_before(raw, tick) },
+    }
+}
+
+/// The block index, when the one built at load covers `data`.
+fn index_for<'a>(
+    note_index: &'a Option<(Arc<kazumidiparser::MIDIPlayerData>, Arc<NoteOnIndex>)>,
+    data: &Arc<kazumidiparser::MIDIPlayerData>,
+) -> Option<&'a NoteOnIndex> {
+    match note_index {
+        Some((indexed, index)) if Arc::ptr_eq(indexed, data) => Some(&**index),
+        _ => None,
+    }
+}
 
 /// The player thread's whole life: respond to commands, fold in parser
 /// feedback, and keep due MIDI events flowing to the output. Every
@@ -74,6 +102,9 @@ pub(super) fn run(
     let _alive_guard = AliveGuard(alive_for_thread);
     // Running count of every note-on triggered, used to derive NPS.
     let mut notes_played_count: u64 = 0;
+    // Note-on block index for the current song, built synchronously
+    // when a load completes so the recounts on seeks stay cheap.
+    let mut note_index: Option<(Arc<kazumidiparser::MIDIPlayerData>, Arc<NoteOnIndex>)> = None;
     // Song time runs from an anchor: `playback_base_ns` is the position the
     // anchor instant maps to, and time since then is scaled by the speed.
     //
@@ -157,6 +188,8 @@ pub(super) fn run(
                     player.state = PlayerState::Stopped;
                     player.seek_position_ns = 0;
                     player.reset_tracks();
+                    notes_played_count = 0;
+                    notes_played_clone.store(0, Ordering::Relaxed);
                     *lock_mutex(&active_notes_clone) = [None; 128];
                     active_count = [0u16; 128];
                     *lock_mutex(&pitch_bend_clone) = [8192; 16];
@@ -181,6 +214,15 @@ pub(super) fn run(
                         // inside the buffer; follow the audio.
                         player.seek_position_ns = p.seek(latest_pos);
                     }
+                    // The counter counts dispatched note-ons, so a
+                    // jump leaves it describing the old position:
+                    // re-derive it from the new one.
+                    if let Some(data) = &player.data {
+                        let tick =
+                            ns_to_tick(unsafe { &*data.as_ptr() }, player.seek_position_ns);
+                        notes_played_count = recount_notes(&note_index, data, tick);
+                        notes_played_clone.store(notes_played_count, Ordering::Relaxed);
+                    }
                     *lock_mutex(&active_notes_clone) = [None; 128];
                     active_count = [0u16; 128];
                     *lock_mutex(&pitch_bend_clone) = [8192; 16];
@@ -193,7 +235,7 @@ pub(super) fn run(
                 PlayerCommand::LoadFile(path) => {
                     if let Some(p) = prerender!(player) {
                         p.pause();
-                        p.set_data(None);
+                        p.set_data(None, None);
                     }
                     midi_ev_fifo.clear();
                     if let Some(ref stream) = player.stream {
@@ -213,6 +255,7 @@ pub(super) fn run(
                     active_count = [0u16; 128];
                     notes_played_count = 0;
                     notes_played_clone.store(0, Ordering::Relaxed);
+                    note_index = None;
                     *lock_mutex(&pitch_bend_clone) = [8192; 16];
                     // 古い MIDI データを即座に解放
                     *lock_mutex(&current_midi_data_for_thread) = None;
@@ -337,7 +380,7 @@ pub(super) fn run(
                         p.set_max_buffer_secs(audio_buffer_secs);
                         p.set_opus_bitrate(opus_bitrate_kbps);
                         p.set_limiter_bypassed(s16_clipping);
-                        p.set_data(player.data.clone());
+                        p.set_data(player.data.clone(), player.note_index.clone());
                         if player.state == PlayerState::Playing {
                             applied_speed = read_speed(&playback_speed_clone);
                             p.play(player.seek_position_ns, applied_speed);
@@ -383,11 +426,18 @@ pub(super) fn run(
 
                     *lock_mutex(&current_midi_data_for_thread) = Some(data.clone());
 
+                    // Build the note-on block index first: load
+                    // completion blocks on it, so seeks and recounts
+                    // resume from it instead of walking from the
+                    // track start.
+                    let built_index =
+                        Arc::new(unsafe { NoteOnIndex::build(&*data.as_ptr()) });
+                    note_index = Some((data.clone(), built_index.clone()));
                     if let Some(p) = prerender!(player) {
-                        p.set_data(Some(data.clone()));
+                        p.set_data(Some(data.clone()), Some(built_index.clone()));
                         p.seek(0);
                     }
-                    player.load_parsed_data(Some(data));
+                    player.load_parsed_data(Some(data), Some(built_index));
                     duration_clone.store(player.get_duration_ns(), Ordering::SeqCst);
 
                     *lock_mutex(&pitch_bend_clone) = [8192; 16];
@@ -799,6 +849,13 @@ pub(super) fn run(
             player.seek_tracks(position);
             *lock_mutex(&active_notes_clone) = [None; 128];
             active_count = [0u16; 128];
+            // The skipped note-ons were still heard (the prerender
+            // played them), so re-derive the counter from the new
+            // position instead of leaving it behind the song.
+            if let Some(data) = &player.data {
+                let tick = ns_to_tick(unsafe { &*data.as_ptr() }, position);
+                notes_played_count = recount_notes(&note_index, data, tick);
+            }
         }
 
         state_clone.store(player.state as u32, Ordering::SeqCst);
